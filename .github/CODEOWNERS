@@ -1,0 +1,9 @@
+# Code owners for liongard/agent-scripts.
+# Placeholders: replace with real team handles before requiring reviews.
+# Later rules take precedence over earlier ones.
+
+# *            @liongard/TEAM-PLACEHOLDER
+# /windows/    @liongard/WINDOWS-TEAM-PLACEHOLDER
+# /linux/      @liongard/LINUX-TEAM-PLACEHOLDER
+# /macos/      @liongard/MACOS-TEAM-PLACEHOLDER
+# SECURITY.md  @liongard/SECURITY-TEAM-PLACEHOLDER

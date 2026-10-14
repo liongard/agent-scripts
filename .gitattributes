@@ -1,0 +1,8 @@
+# Scripts are stored and checked out with LF, byte-for-byte as authored.
+*.ps1 text eol=lf
+*.sh  text eol=lf
+
+# Binary — never mangle.
+*.exe binary
+*.msi binary
+*.run binary

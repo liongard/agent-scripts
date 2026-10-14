@@ -1,0 +1,66 @@
+name: Bug report
+description: Report a problem with one of the agent deployment scripts.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        > [!WARNING]
+        > **Remove all keys and secrets before you submit.** This includes API token keys and secrets, agent install keys and secrets, proxy credentials (`user:pass@`), and customer names you don't want shared.
+        > Report security vulnerabilities to security.ops@liongard.com, not here.
+  - type: input
+    id: rmm
+    attributes:
+      label: RMM
+      description: The RMM that ran the script, if any (e.g. N-central, NinjaOne, Datto RMM, ConnectWise Automate, manual).
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: OS
+      description: Operating system and version (e.g. Windows Server 2022, Ubuntu 22.04).
+    validations:
+      required: true
+  - type: dropdown
+    id: script
+    attributes:
+      label: Script name
+      options:
+        - windows/LGAgentInstall-MSI-Simple.ps1
+        - windows/LGAgentInstall-MSI-Advanced.ps1
+        - windows/LGAgentInstall-EXE-Simple.ps1
+        - windows/LGAgentInstall-EXE-Advanced.ps1
+        - windows/LGAgentUninstall.ps1
+        - linux/LGAgentInstall-Linux.sh
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Script version
+      description: The "Last updated" date from the script header, or the commit SHA.
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened
+      description: What you expected, what happened instead, and the exit code.
+    validations:
+      required: true
+  - type: textarea
+    id: log
+    attributes:
+      label: Redacted log excerpt
+      description: The relevant part of the transcript or AgentInstall.log. REMOVE KEYS AND SECRETS FIRST.
+      render: text
+    validations:
+      required: true
+  - type: checkboxes
+    id: redacted
+    attributes:
+      label: Confirmation
+      options:
+        - label: I removed all keys, secrets and credentials from this report.
+          required: true
