@@ -16,7 +16,7 @@ These standalone scripts install, upgrade and uninstall the Liongard Agent, and 
 | `windows/LGAgentInstall-EXE-Advanced.ps1` | Windows | EXE bundle (Agent + VC++ + Npcap) | Advanced | Liongard API token **and** agent install token |
 | `windows/LGAgentUninstall.ps1` | Windows | — | Uninstall | None. You need an API token only when `$RemoveAgentFromPlatform = $true` |
 | `linux/LGAgentInstall-Linux.sh` | Linux | `.run` / `.deb` / `.rpm` / `.sh` | Advanced | Liongard API token **and** agent install token |
-| `macos/` | macOS | — | — | Coming soon |
+| `macos/LGAgentInstall-macOS.sh` | macOS | `.pkg` (`Liongard-lts.pkg`, supplied alongside the script) | Simple | Agent install token only (`ACCESS_KEY_ID`, `ACCESS_KEY_SECRET`). See [macos/README.md](macos/README.md) |
 
 - **Simple** scripts make no Liongard API calls. They pass the environment name to the installer exactly as written.
 - **Advanced** scripts use the API to resolve the environment name, check for existing agents and write richer logs. The EXE Advanced script also writes a JSON summary.

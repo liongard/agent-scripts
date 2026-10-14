@@ -10,6 +10,7 @@
 - [ ] windows/LGAgentInstall-EXE-Advanced.ps1
 - [ ] windows/LGAgentUninstall.ps1
 - [ ] linux/LGAgentInstall-Linux.sh
+- [ ] macos/LGAgentInstall-macOS.sh
 
 ## Testing
 
