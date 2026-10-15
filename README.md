@@ -49,23 +49,41 @@ You can skip the environment name if you set `$IncludeEnvironmentValue = $false`
 
 ### Optional
 
-- **All Windows installs:** `$AgentDescription`, `$IncludeEnvironmentValue`, `$Folder` (default `C:\Liongard`), `$InstallerUrl`.
+- **All Windows installs:** `$AgentDescription`, `$IncludeEnvironmentValue`, `$Folder` (default `$env:ProgramData`, see [Working folder](#working-folder)), `$InstallerUrl`.
 - **EXE (Simple and Advanced):** `$EnableNetworkDiscovery`, `$InstallNpcap`, `$EulaAccepted`, `$SuppressRestart`, `$PassiveMode`, `$ProxyUrl`, `$ClearProxyEnvironmentForInstaller`, `$AutoUpdate`.
-- **EXE Advanced only:** `$InstallerFileName`, `$InstallerLogPath`, `$AutoUpdateArgumentName`.
-- **Uninstall:** `$RemoveAgentFromPlatform`, `$MinimumRemoteDeletionScore`, `$LogFolder`.
+- **EXE Advanced only:** `$InstallerFileName` (a file name only), `$AutoUpdateArgumentName`. `$InstallerLogPath` is deprecated and ignored.
+- **Uninstall:** `$RemoveAgentFromPlatform`, `$MinimumRemoteDeletionScore`, `$LogFolder` (default `$env:ProgramData`, same rules as `$Folder`).
 - **Linux (section B):** `INCLUDE_ENVIRONMENT_VALUE`, `ENABLE_ENVIRONMENT_MATCHING`, `ENABLE_PRE_UNINSTALL`, `REMOVE_AGENT_FROM_PLATFORM`, `AGENT_DESCRIPTION`, `LOG_DIRECTORY`, `LINUX_ARCHITECTURE` (`auto`, `x64` or `arm64`; `auto` picks the installer from `uname -m`), `INSTALLER_URL` (leave empty to use the LTS installer for the architecture), `INSTALLER_FILE_NAME`. `DOWNLOAD_DIRECTORY` is deprecated and no longer used: the installer now downloads to a private temporary folder that is deleted when the script exits. If it is set, the script logs a warning and carries on. It will be removed in a later release. Leave section C alone unless Liongard Support asks you to change it. Section C includes `MINIMUM_REMOTE_DELETION_SCORE` (default `50`), the minimum match score a platform record needs before `REMOVE_AGENT_FROM_PLATFORM=true` deletes it.
+
+## Working folder
+
+The Windows scripts always work in a dedicated `LiongardDeploy` subfolder of `$Folder` (`$LogFolder` for Uninstall). With the default, that's `C:\ProgramData\LiongardDeploy`. The scripts never change the permissions of `$Folder` itself, and they never touch `C:\ProgramData\Liongard`, which belongs to the agent.
+
+On every run, before anything is written, each script:
+
+- Requires SYSTEM or an elevated administrator.
+- Refuses to continue if `$Folder` or `LiongardDeploy` is a file or a reparse point (symlink, junction or mount point), if `LiongardDeploy` contains a reparse point, or if `LiongardDeploy` already exists and isn't owned by SYSTEM or Administrators. In that last case, delete the folder as an administrator (for example `rmdir /s /q "C:\ProgramData\LiongardDeploy"`) and rerun.
+- Disables inheritance on `LiongardDeploy`, removes every existing permission entry, grants Full Control only to SYSTEM and Administrators, and sets the owner to Administrators.
+
+Installers are downloaded to `LiongardDeploy\Deploy\<guid>\` and deleted at the end of the run, whether it succeeds or fails.
+
+The scripts also clean up the old `C:\Liongard` folder. They delete only the agent installers and the script's own logs and summaries (`AgentInstall*.log`, `LGAgentSummary_*.json`, `LGAgentScript_*.log`, `LGAgentScript_EXE_*.log`, `StaleUninstall_*.log` and `LGAgentUninstall_*.log`) from its top level, and they remove the folder only if it's then empty.
 
 ## Logs
 
-| Script | Location | Files |
-|---|---|---|
-| Windows install (all) | `$Folder` (default `C:\Liongard`) | `AgentInstall.log` (installer), `StaleUninstall_<ProductCode>.log` |
-| MSI Advanced | `$Folder` | `LGAgentScript_<timestamp>.log` (transcript) |
-| EXE Advanced | `$Folder` | `LGAgentScript_EXE_<timestamp>.log`, `LGAgentSummary_<timestamp>.json` |
-| Uninstall | `$LogFolder` (default `C:\Liongard`) | `LGAgentUninstall_<timestamp>.log` |
-| Linux | `LOG_DIRECTORY` (default `/var/log/liongard-agent`, created root-only) | `LGAgentScript_<timestamp>.log` |
+All Windows logs are written to `LiongardDeploy`. Each run's log names carry a timestamp, and the scripts keep the 5 most recent runs of each log type. Every run ends by printing the full path of each log it wrote.
 
-Logs can contain sensitive details. Check them and remove any keys or secrets before sharing them.
+| Script | Files |
+|---|---|
+| Windows install (all) | `AgentInstall_<timestamp>.log` (installer; the EXE bundle also writes `AgentInstall_<timestamp>_*.log` per package), `StaleUninstall_<ProductCode>_<timestamp>.log` |
+| MSI Advanced | `LGAgentScript_<timestamp>.log` (transcript) |
+| EXE Advanced | `LGAgentScript_EXE_<timestamp>.log`, `LGAgentSummary_<timestamp>.json` |
+| Uninstall | `LGAgentUninstall_<timestamp>.log` |
+| Linux | `LOG_DIRECTORY` (default `/var/log/liongard-agent`, created root-only): `LGAgentScript_<timestamp>.log` |
+
+After the installer exits, the scripts redact the installer logs in place, whether the install succeeded or failed. They mask the access key and secret values and any `ACCESSKEY`/`ACCESSSECRET` property. If a log can't be redacted, the script deletes it and says so.
+
+Logs can still contain sensitive details. Check them before sharing them.
 
 ## Support and security
 

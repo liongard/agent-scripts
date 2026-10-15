@@ -45,14 +45,14 @@ $IncludeEnvironmentValue    = $true                              # Set to $false
 $EnableNetworkDiscovery     = $false
 
 # EXE installer-specific settings
-$Folder                     = "C:\Liongard"
+$Folder                     = $env:ProgramData                 # Parent folder; the script works in <Folder>\LiongardDeploy (SYSTEM/Administrators only)
 $InstallerUrl               = "https://agents.static.liongard.com/LiongardAgent-lts.exe"
-$InstallerFileName          = "LiongardAgent-lts.exe"
+$InstallerFileName          = "LiongardAgent-lts.exe"          # File name only; the installer is staged in LiongardDeploy\Deploy\<guid>
 $InstallNpcap               = $true
 $EulaAccepted               = $true
 $SuppressRestart            = $true
 $PassiveMode                = $false
-$InstallerLogPath           = ""
+$InstallerLogPath           = ""                               # Deprecated and ignored: installer logs are always written to LiongardDeploy
 $ProxyUrl                   = ""
 
 # MSI argument: AUTOUPDATE. Use the public MSI property name so the EXE bundle can
@@ -768,7 +768,8 @@ function Invoke-LiongardStaleCleanup {
             Write-LiongardStateLog INFO "Skipping MSI uninstall for non-MSI entry '$($product.DisplayName)' ($($product.KeyPath))."
             continue
         }
-        $msiLog = if ($LogFolder) { Join-Path -Path $LogFolder -ChildPath ("StaleUninstall_{0}.log" -f $product.ProductCode.Trim('{}')) } else { $null }
+        $msiLog = if ($LogFolder) { Join-Path -Path $LogFolder -ChildPath ("StaleUninstall_{0}_{1}.log" -f $product.ProductCode.Trim('{}'), (Get-Date -Format 'yyyyMMdd_HHmmss')) } else { $null }
+        if ($msiLog) { Register-LiongardDeployLog -Label 'Stale uninstall log' -Path $msiLog -Redact }
         $code = Invoke-LiongardMsiUninstallByCode -ProductCode $product.ProductCode -LogPath $msiLog
         if ($null -eq $code -or ($code -ne 0 -and $code -ne 3010 -and $code -ne 1605)) {
             $issues.Add("msi:$($product.ProductCode)=$code") | Out-Null
@@ -884,6 +885,431 @@ function Write-LiongardIdentityStatus {
 # END SHARED BLOCK
 # ====================================================================
 
+# ====================================================================
+# BEGIN SHARED BLOCK: Liongard deploy-folder functions
+# Keep this block identical across LGAgentInstall-MSI-Simple, LGAgentInstall-MSI-Advanced,
+# LGAgentInstall-EXE-Simple, LGAgentInstall-EXE-Advanced and LGAgentUninstall.
+# Edit one copy, then copy it to the other scripts.
+#
+# Every run works in <Folder>\LiongardDeploy. Before anything is written there, the folder
+# is created (or checked) and locked down to SYSTEM and Administrators. Installers are staged
+# in Deploy\<guid>\ and deleted afterwards, installer logs are redacted in place, the five
+# most recent logs of each type are kept, and leftovers in the legacy C:\Liongard folder are
+# removed. $env:ProgramData\Liongard belongs to the agent and is never touched.
+# ====================================================================
+
+$script:LiongardDeploy = @{
+    Root      = $null
+    Stamp     = (Get-Date -Format 'yyyyMMdd_HHmmss')
+    Stage     = $null
+    Secrets   = @()
+    Pending   = New-Object System.Collections.Generic.List[string]
+    Logs      = New-Object System.Collections.Generic.List[object]
+    Deleted   = @{}
+    Completed = $false
+}
+$script:LiongardSystemSid     = 'S-1-5-18'
+$script:LiongardAdminsSid     = 'S-1-5-32-544'
+$script:LiongardLegacyFolder  = 'C:\Liongard'
+$script:LiongardSecretPattern = '(?i)(ACCESS(KEY|SECRET)\S*\s*[=:]\s*)("[^"]*"|\S+)'
+$script:LiongardLogRetention  = @(
+    '^AgentInstall_(\d{8}_\d{6})(_.+)?\.log$',
+    '^StaleUninstall_[0-9A-Fa-f-]+_(\d{8}_\d{6})\.log$',
+    '^LGAgentScript_(\d{8}_\d{6})\.log$',
+    '^LGAgentScript_EXE_(\d{8}_\d{6})\.log$',
+    '^LGAgentUninstall_(\d{8}_\d{6})\.log$',
+    '^LGAgentSummary_(\d{8}_\d{6})\.json$'
+)
+
+function Write-LiongardDeployLog {
+    param([string]$Message)
+
+    Write-Host "[LiongardDeploy] $Message"
+}
+
+function Hide-LiongardSecretText {
+    # The one masking rule for every script: masks ACCESSKEY/ACCESSSECRET-style values, then any
+    # literal key or secret registered for this run.
+    param(
+        [AllowNull()][string]$Text,
+        [string[]]$Secret = $script:LiongardDeploy.Secrets
+    )
+
+    if ([string]::IsNullOrEmpty($Text)) { return $Text }
+    $result = $Text -replace $script:LiongardSecretPattern, '$1****'
+    foreach ($value in @($Secret)) {
+        if (-not [string]::IsNullOrEmpty($value) -and $value.Length -ge 4) { $result = $result.Replace($value, '****') }
+    }
+    return $result
+}
+
+function Get-LiongardPathAttribute {
+    # Attributes of the path itself (links are not followed), or $null when nothing is there.
+    param([Parameter(Mandatory)][string]$Path)
+
+    try { return [System.IO.File]::GetAttributes($Path) }
+    catch [System.IO.FileNotFoundException], [System.IO.DirectoryNotFoundException] { return $null }
+}
+
+function Assert-LiongardPlainFolder {
+    # $false when the path does not exist; $true for a normal folder; throws for a file or reparse point.
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$Label
+    )
+
+    $attributes = Get-LiongardPathAttribute -Path $Path
+    if ($null -eq $attributes) { return $false }
+    if (($attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { throw "$Label [$Path] is a reparse point (symlink, junction or mount point). Refusing to use it." }
+    if (($attributes -band [System.IO.FileAttributes]::Directory) -eq 0) { throw "$Label [$Path] is a file, not a folder. Refusing to use it." }
+    return $true
+}
+
+function Get-LiongardDeploySecurity {
+    # Inheritance disabled with no inherited rules copied, Full Control for SYSTEM and Administrators
+    # only (this folder, subfolders and files), owner Administrators.
+    $security = New-Object System.Security.AccessControl.DirectorySecurity
+    $security.SetAccessRuleProtection($true, $false)
+    foreach ($sid in $script:LiongardSystemSid, $script:LiongardAdminsSid) {
+        $identity = New-Object System.Security.Principal.SecurityIdentifier($sid)
+        $rule = New-Object System.Security.AccessControl.FileSystemAccessRule($identity, 'FullControl', 'ContainerInherit, ObjectInherit', 'None', 'Allow')
+        $security.AddAccessRule($rule)
+    }
+    $security.SetOwner((New-Object System.Security.Principal.SecurityIdentifier($script:LiongardAdminsSid)))
+    return $security
+}
+
+function Test-LiongardDeploySecurity {
+    # Reads the ACL back: protected, owner Administrators, and only Full Control allow rules for
+    # SYSTEM and Administrators.
+    param([Parameter(Mandatory)][string]$Path)
+
+    $acl   = Get-Acl -LiteralPath $Path
+    $owner = $acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value
+    if (-not $acl.AreAccessRulesProtected -or $owner -ne $script:LiongardAdminsSid) { return $false }
+    $seen = @{}
+    foreach ($rule in $acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])) {
+        $sid = $rule.IdentityReference.Value
+        if ($rule.IsInherited -or $rule.AccessControlType -ne 'Allow' -or $sid -notin $script:LiongardSystemSid, $script:LiongardAdminsSid) { return $false }
+        if (($rule.FileSystemRights -band [System.Security.AccessControl.FileSystemRights]::FullControl) -ne [System.Security.AccessControl.FileSystemRights]::FullControl) { return $false }
+        $seen[$sid] = $true
+    }
+    return ($seen.Count -eq 2)
+}
+
+function Find-LiongardReparsePoint {
+    # Walks a folder without following links and returns the first reparse point inside it.
+    param([Parameter(Mandatory)][string]$Path)
+
+    foreach ($entry in [System.IO.Directory]::GetFileSystemEntries($Path)) {
+        $attributes = [System.IO.File]::GetAttributes($entry)
+        if (($attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { return $entry }
+        if (($attributes -band [System.IO.FileAttributes]::Directory) -ne 0) {
+            $found = Find-LiongardReparsePoint -Path $entry
+            if ($found) { return $found }
+        }
+    }
+    return $null
+}
+
+function Clear-LiongardDeployTree {
+    # Deletes a folder tree. Links inside it are removed without being followed.
+    param([Parameter(Mandatory)][string]$Path)
+
+    $attributes = Get-LiongardPathAttribute -Path $Path
+    if ($null -eq $attributes) { return }
+    if (($attributes -band [System.IO.FileAttributes]::Directory) -eq 0) { [System.IO.File]::Delete($Path); return }
+    if (($attributes -band [System.IO.FileAttributes]::ReparsePoint) -eq 0) {
+        foreach ($entry in [System.IO.Directory]::GetFileSystemEntries($Path)) { Clear-LiongardDeployTree -Path $entry }
+    }
+    [System.IO.Directory]::Delete($Path, $false)
+}
+
+function Initialize-LiongardDeployFolder {
+    # Creates and hardens <Folder>\LiongardDeploy. Throws (fail closed) before anything is written
+    # when the folder cannot be trusted. The ACL of <Folder> itself is never changed.
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Folder,
+        [string[]]$Secret
+    )
+
+    $script:LiongardDeploy.Secrets = @($Secret | Where-Object { -not [string]::IsNullOrEmpty($_) })
+
+    $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+    $isAdmin  = (New-Object System.Security.Principal.WindowsPrincipal($identity)).IsInRole((New-Object System.Security.Principal.SecurityIdentifier($script:LiongardAdminsSid)))
+    if ($identity.User.Value -ne $script:LiongardSystemSid -and -not $isAdmin) {
+        throw "Run this script as SYSTEM or from an elevated administrator session (current identity: $($identity.Name))."
+    }
+
+    $value = "$Folder".Trim()
+    if ($value -notmatch '^[A-Za-z]:\\') { throw "Folder [$Folder] must be an absolute local path such as C:\ProgramData." }
+    $parent = [System.IO.Path]::GetFullPath($value)
+    $root   = [System.IO.Path]::Combine($parent, 'LiongardDeploy')
+
+    $agentData = [System.IO.Path]::GetFullPath([System.IO.Path]::Combine($env:ProgramData, 'Liongard')).TrimEnd('\')
+    $rootCheck = $root.TrimEnd('\')
+    if ($rootCheck.Equals($agentData, [System.StringComparison]::OrdinalIgnoreCase) -or $rootCheck.StartsWith("$agentData\", [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "Folder [$Folder] is inside the agent's own folder [$agentData]. Choose a different folder."
+    }
+
+    if (-not (Assert-LiongardPlainFolder -Path $parent -Label 'Folder')) {
+        New-Item -Path $parent -ItemType Directory -Force -ErrorAction Stop | Out-Null
+        [void](Assert-LiongardPlainFolder -Path $parent -Label 'Folder')
+    }
+
+    $security = Get-LiongardDeploySecurity
+    if (Assert-LiongardPlainFolder -Path $root -Label 'Deploy folder') {
+        $recovery = "To recover, delete the folder as an administrator (for example: rmdir /s /q `"$root`") and rerun the script."
+        try { $owner = (Get-Acl -LiteralPath $root).GetOwner([System.Security.Principal.SecurityIdentifier]).Value }
+        catch { throw "Unable to read the owner of the existing deploy folder [$root]: $($_.Exception.Message). $recovery" }
+        if ($owner -notin $script:LiongardSystemSid, $script:LiongardAdminsSid) {
+            throw "The existing deploy folder [$root] is owned by $owner, not SYSTEM or Administrators, so it may have been created by another user. $recovery"
+        }
+    }
+    else {
+        try { [void][System.IO.Directory]::CreateDirectory($root, $security) }
+        catch { New-Item -Path $root -ItemType Directory -Force -ErrorAction Stop | Out-Null }
+        # CreateDirectory returns an existing folder silently, so check it again.
+        [void](Assert-LiongardPlainFolder -Path $root -Label 'Deploy folder')
+    }
+
+    Set-Acl -LiteralPath $root -AclObject $security -ErrorAction Stop
+    if (-not (Test-LiongardDeploySecurity -Path $root)) { throw "The permissions on [$root] could not be restricted to SYSTEM and Administrators." }
+    $link = Find-LiongardReparsePoint -Path $root
+    if ($link) { throw "The deploy folder contains a reparse point [$link]. Refusing to use it." }
+
+    $script:LiongardDeploy.Root = $root
+    Write-LiongardDeployLog "Deploy folder [$root] is restricted to SYSTEM and Administrators."
+    return $root
+}
+
+function Get-LiongardDeployLogPath {
+    # <deploy folder>\<Prefix>_<run timestamp><Extension>
+    param(
+        [Parameter(Mandatory)][string]$Prefix,
+        [string]$Extension = '.log'
+    )
+
+    return (Join-Path -Path $script:LiongardDeploy.Root -ChildPath ("{0}_{1}{2}" -f $Prefix, $script:LiongardDeploy.Stamp, $Extension))
+}
+
+function Register-LiongardDeployLog {
+    # Records a log for the end-of-run path list. -Redact also queues it (and, for an EXE bundle
+    # log, its per-package logs) for redaction.
+    param(
+        [Parameter(Mandatory)][string]$Label,
+        [Parameter(Mandatory)][string]$Path,
+        [switch]$Redact
+    )
+
+    $script:LiongardDeploy.Logs.Add([pscustomobject]@{ Label = $Label; Path = $Path; Redact = [bool]$Redact })
+    if ($Redact -and -not $script:LiongardDeploy.Pending.Contains($Path)) { $script:LiongardDeploy.Pending.Add($Path) }
+}
+
+function Get-LiongardRelatedLog {
+    # The log itself plus any EXE bundle per-package logs (<name>_*.log) next to it.
+    param([Parameter(Mandatory)][string]$Path)
+
+    $folder = Split-Path -Path $Path -Parent
+    $base   = [System.IO.Path]::GetFileNameWithoutExtension($Path)
+    $files  = @()
+    if ($null -ne (Get-LiongardPathAttribute -Path $Path)) { $files += $Path }
+    if ($null -ne (Get-LiongardPathAttribute -Path $folder)) {
+        $files += @([System.IO.Directory]::GetFiles($folder, "$($base)_*.log") | Sort-Object)
+    }
+    return $files
+}
+
+function Protect-LiongardInstallerLog {
+    # Redacts a log in place (same encoding), then checks that no registered key or secret is left.
+    # If any step fails, the log is deleted instead.
+    param([Parameter(Mandatory)][string]$Path)
+
+    [void]$script:LiongardDeploy.Pending.Remove($Path)
+    foreach ($file in @(Get-LiongardRelatedLog -Path $Path)) {
+        try {
+            $attributes = [System.IO.File]::GetAttributes($file)
+            if (($attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'the log is a reparse point' }
+            $bytes = $null
+            for ($attempt = 1; $attempt -le 5; $attempt++) {
+                try { $bytes = [System.IO.File]::ReadAllBytes($file); break }
+                catch [System.IO.IOException] { if ($attempt -eq 5) { throw }; Start-Sleep -Seconds 2 }
+            }
+
+            $encoding = [System.Text.Encoding]::Default
+            $skip = 0
+            if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) { $encoding = New-Object System.Text.UTF8Encoding($true); $skip = 3 }
+            elseif ($bytes.Length -ge 2 -and $bytes[0] -eq 0xFF -and $bytes[1] -eq 0xFE) { $encoding = New-Object System.Text.UnicodeEncoding($false, $true); $skip = 2 }
+            elseif ($bytes.Length -ge 2 -and $bytes[0] -eq 0xFE -and $bytes[1] -eq 0xFF) { $encoding = New-Object System.Text.UnicodeEncoding($true, $true); $skip = 2 }
+            else {
+                # UTF-16LE without a BOM: most odd bytes are zero.
+                $sample = [Math]::Min($bytes.Length, 4096); $zeros = 0
+                for ($i = 1; $i -lt $sample; $i += 2) { if ($bytes[$i] -eq 0) { $zeros++ } }
+                if ($sample -ge 2 -and $zeros -gt ($sample / 4)) { $encoding = New-Object System.Text.UnicodeEncoding($false, $false) }
+            }
+
+            $text  = $encoding.GetString($bytes, $skip, $bytes.Length - $skip)
+            $clean = Hide-LiongardSecretText -Text $text
+            if (-not [string]::Equals($clean, $text, [System.StringComparison]::Ordinal)) {
+                $body = $encoding.GetBytes($clean)
+                $out  = New-Object byte[] ($skip + $body.Length)
+                [System.Array]::Copy($bytes, 0, $out, 0, $skip)
+                [System.Array]::Copy($body, 0, $out, $skip, $body.Length)
+                [System.IO.File]::WriteAllBytes($file, $out)
+            }
+
+            # Check the raw bytes for each value in UTF-8/ANSI and UTF-16 form, whatever encoding was detected.
+            $latin1 = [System.Text.Encoding]::GetEncoding(28591)
+            $raw = $latin1.GetString([System.IO.File]::ReadAllBytes($file))
+            foreach ($value in $script:LiongardDeploy.Secrets) {
+                if ($value.Length -lt 4) { continue }
+                foreach ($form in [System.Text.Encoding]::UTF8, [System.Text.Encoding]::Unicode, [System.Text.Encoding]::BigEndianUnicode) {
+                    if ($raw.Contains($latin1.GetString($form.GetBytes($value)))) { throw 'a key or secret is still present after redaction' }
+                }
+            }
+            Write-LiongardDeployLog "Redacted installer log [$file]."
+        }
+        catch {
+            Write-LiongardDeployLog "WARNING: could not redact installer log [$file] ($($_.Exception.Message)). Deleting it."
+            try {
+                [System.IO.File]::Delete($file)
+                $script:LiongardDeploy.Deleted[$file] = 'deleted because it could not be redacted'
+                Write-LiongardDeployLog "Deleted unredacted installer log [$file]."
+            }
+            catch {
+                $script:LiongardDeploy.Deleted[$file] = 'COULD NOT BE REDACTED OR DELETED; it may contain the agent secret. Delete it manually'
+                Write-LiongardDeployLog "ERROR: could not delete unredacted installer log [$file]: $($_.Exception.Message). Delete it manually."
+            }
+        }
+    }
+}
+
+function Initialize-LiongardDeployStage {
+    # Creates Deploy\<guid>\ for this run's installer and clears staging folders older than a day.
+    $deploy = Join-Path -Path $script:LiongardDeploy.Root -ChildPath 'Deploy'
+    if (-not (Assert-LiongardPlainFolder -Path $deploy -Label 'Staging folder')) {
+        New-Item -Path $deploy -ItemType Directory -Force -ErrorAction Stop | Out-Null
+        [void](Assert-LiongardPlainFolder -Path $deploy -Label 'Staging folder')
+    }
+    foreach ($old in [System.IO.Directory]::GetFileSystemEntries($deploy)) {
+        try {
+            if ([System.IO.Directory]::GetLastWriteTimeUtc($old) -lt [DateTime]::UtcNow.AddDays(-1)) {
+                Clear-LiongardDeployTree -Path $old
+                Write-LiongardDeployLog "Removed leftover staging folder [$old]."
+            }
+        }
+        catch { Write-LiongardDeployLog "WARNING: could not remove leftover staging folder [$old]: $($_.Exception.Message)" }
+    }
+
+    $stage = Join-Path -Path $deploy -ChildPath ([guid]::NewGuid().ToString())
+    New-Item -Path $stage -ItemType Directory -Force -ErrorAction Stop | Out-Null
+    [void](Assert-LiongardPlainFolder -Path $stage -Label 'Staging folder')
+    $script:LiongardDeploy.Stage = $stage
+    return $stage
+}
+
+function Invoke-LiongardLegacyCleanup {
+    # Removes known script leftovers from the top level of C:\Liongard (never recursively), then
+    # the folder itself only when nothing else is left in it.
+    param([string[]]$InstallerName)
+
+    $legacy = $script:LiongardLegacyFolder
+    try {
+        $attributes = Get-LiongardPathAttribute -Path $legacy
+        if ($null -eq $attributes) { return }
+        if (($attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or ($attributes -band [System.IO.FileAttributes]::Directory) -eq 0) {
+            Write-LiongardDeployLog "Legacy folder [$legacy] is not a plain folder; skipped."
+            return
+        }
+
+        $patterns = @('LiongardAgent*.msi', 'LiongardAgent*.exe', 'AgentInstall*.log', 'LGAgentSummary_*.json', 'LGAgentScript_*.log',
+                      'LGAgentScript_EXE_*.log', 'StaleUninstall_*.log', 'LGAgentUninstall_*.log') + @($InstallerName | Where-Object { $_ })
+        foreach ($file in [System.IO.Directory]::GetFiles($legacy)) {
+            $name = [System.IO.Path]::GetFileName($file)
+            if (-not @($patterns | Where-Object { $name -like $_ }).Count) { continue }
+            try {
+                [System.IO.File]::Delete($file)
+                Write-LiongardDeployLog "Removed legacy file [$file]."
+            }
+            catch { Write-LiongardDeployLog "WARNING: could not remove legacy file [$file]: $($_.Exception.Message)" }
+        }
+
+        $left = @([System.IO.Directory]::GetFileSystemEntries($legacy)).Count
+        if ($left -eq 0) {
+            [System.IO.Directory]::Delete($legacy, $false)
+            Write-LiongardDeployLog "Removed empty legacy folder [$legacy]."
+        }
+        else {
+            Write-LiongardDeployLog "Legacy folder [$legacy] kept: $left other item(s) remain."
+        }
+    }
+    catch { Write-LiongardDeployLog "WARNING: legacy folder cleanup failed: $($_.Exception.Message)" }
+}
+
+function Invoke-LiongardLogRetention {
+    # Keeps the newest $Keep runs of each log type in the deploy folder (by the timestamp in the
+    # name); an EXE bundle log and its per-package logs count as one run.
+    param([int]$Keep = 5)
+
+    if (-not $script:LiongardDeploy.Root) { return }
+    $files = @([System.IO.Directory]::GetFiles($script:LiongardDeploy.Root) | ForEach-Object { [System.IO.Path]::GetFileName($_) })
+    foreach ($pattern in $script:LiongardLogRetention) {
+        $runs = @($files | Where-Object { $_ -match $pattern } | Group-Object { [regex]::Match($_, $pattern).Groups[1].Value } | Sort-Object Name -Descending)
+        foreach ($run in @($runs | Select-Object -Skip $Keep)) {
+            foreach ($name in $run.Group) {
+                $file = Join-Path -Path $script:LiongardDeploy.Root -ChildPath $name
+                try {
+                    [System.IO.File]::Delete($file)
+                    Write-LiongardDeployLog "Removed old log [$file]."
+                }
+                catch { Write-LiongardDeployLog "WARNING: could not remove old log [$file]: $($_.Exception.Message)" }
+            }
+        }
+    }
+}
+
+function Complete-LiongardDeployRun {
+    # Runs once at the end of every run, success or failure: redacts queued installer logs,
+    # deletes this run's staging folder and applies log retention.
+    if ($script:LiongardDeploy.Completed) { return }
+    $script:LiongardDeploy.Completed = $true
+
+    foreach ($log in @($script:LiongardDeploy.Pending)) { Protect-LiongardInstallerLog -Path $log }
+    if ($script:LiongardDeploy.Stage) {
+        try {
+            Clear-LiongardDeployTree -Path $script:LiongardDeploy.Stage
+            Write-LiongardDeployLog "Removed installer staging folder [$($script:LiongardDeploy.Stage)]."
+        }
+        catch { Write-LiongardDeployLog "WARNING: could not remove staging folder [$($script:LiongardDeploy.Stage)]: $($_.Exception.Message)" }
+    }
+    try { Invoke-LiongardLogRetention -Keep 5 }
+    catch { Write-LiongardDeployLog "WARNING: log retention failed: $($_.Exception.Message)" }
+}
+
+function Write-LiongardDeployLogList {
+    # Prints the full path of every log from this run to stdout.
+    $lines = New-Object System.Collections.Generic.List[string]
+    foreach ($log in $script:LiongardDeploy.Logs) {
+        $paths = @($log.Path)
+        if ($log.Redact) {
+            $prefix = Join-Path -Path (Split-Path -Path $log.Path -Parent) -ChildPath ([System.IO.Path]::GetFileNameWithoutExtension($log.Path))
+            $paths += @(Get-LiongardRelatedLog -Path $log.Path)
+            $paths += @($script:LiongardDeploy.Deleted.Keys | Where-Object { $_.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase) })
+        }
+        foreach ($path in @($paths | Sort-Object -Unique)) {
+            if ($script:LiongardDeploy.Deleted.ContainsKey($path)) { $lines.Add(("{0}: {1} ({2})" -f $log.Label, $path, $script:LiongardDeploy.Deleted[$path])) }
+            elseif ($null -ne (Get-LiongardPathAttribute -Path $path)) { $lines.Add(("{0}: {1}" -f $log.Label, $path)) }
+        }
+    }
+    Write-Output '=== Liongard log files ==='
+    if ($lines.Count -eq 0) { Write-Output 'No log files were written.' }
+    foreach ($line in $lines) { Write-Output $line }
+}
+
+# ====================================================================
+# END SHARED BLOCK: Liongard deploy-folder functions
+# ====================================================================
+
 function Get-InstalledAgentVersion {
     # Returns the DisplayVersion of the installed Liongard Agent MSI (found by DisplayName,
     # not a hardcoded ProductCode) as a four-part [version], or $null when none is registered.
@@ -947,6 +1373,7 @@ function Start-LiongardTranscript {
 
     $timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
     $script:TranscriptPath = Join-Path -Path $TargetFolder -ChildPath ("LGAgentScript_EXE_{0}.log" -f $timestamp)
+    Register-LiongardDeployLog -Label 'Script transcript' -Path $script:TranscriptPath
 
     try {
         Start-Transcript -Path $script:TranscriptPath -Force | Out-Null
@@ -960,21 +1387,27 @@ function Start-LiongardTranscript {
 }
 
 function Stop-LiongardTranscript {
-    if (-not $script:TranscriptStarted) { return }
+    # Also the end-of-run hook: redacts installer logs, removes the staging folder, applies log
+    # retention and, after the transcript closes, prints the log paths.
+    Complete-LiongardDeployRun
 
-    try {
-        Stop-Transcript | Out-Null
-        if ($script:TranscriptPath) {
-            Write-Host "Script transcript saved to [$script:TranscriptPath]."
+    if ($script:TranscriptStarted) {
+        try {
+            Stop-Transcript | Out-Null
+            if ($script:TranscriptPath) {
+                Write-Host "Script transcript saved to [$script:TranscriptPath]."
+            }
+        }
+        catch {
+            Write-Warning "Failed to finalize transcript logging: $($_.Exception.Message)"
+        }
+        finally {
+            $script:TranscriptStarted = $false
+            $script:TranscriptPath = $null
         }
     }
-    catch {
-        Write-Warning "Failed to finalize transcript logging: $($_.Exception.Message)"
-    }
-    finally {
-        $script:TranscriptStarted = $false
-        $script:TranscriptPath = $null
-    }
+
+    Write-LiongardDeployLogList
 }
 
 function Write-RegistryLog {
@@ -1699,15 +2132,13 @@ function Start-LiongardInstallerProcess {
 }
 
 function Hide-LiongardLogSecret {
-    # Masks agent access key/secret values in installer log lines before they are printed
-    # or written to the run summary (same pattern as the simple scripts). Covers MSI
-    # property dumps ("LIONGARDACCESSSECRET = x") and command lines ("LiongardAccessKey=x"),
-    # and proxy credentials ("PROXYURL = http://user:pass@host").
+    # Masks installer log lines before they are printed or written to the run summary:
+    # proxy credentials ("PROXYURL = http://user:pass@host"), then the shared
+    # Hide-LiongardSecretText rule (ACCESSKEY/ACCESSSECRET values and the literal key and secret).
     param([AllowNull()][string]$Line)
 
     if ([string]::IsNullOrEmpty($Line)) { return $Line }
-    $Line = Hide-ProxyCredential -Text $Line
-    return ($Line -replace '(?i)(ACCESS(KEY|SECRET)\S*\s*[=:]\s*)("[^"]*"|\S+)', '$1****')
+    return (Hide-LiongardSecretText -Text (Hide-ProxyCredential -Text $Line))
 }
 
 function Read-InstallerLogSummary {
@@ -2431,6 +2862,9 @@ $installStateValue = $null
 $postInstall = $null
 
 try {
+    # Lock down the deploy folder before anything (including the transcript) is written.
+    $deployFolder = Initialize-LiongardDeployFolder -Folder $Folder -Secret $AgentTokenKey, $AgentTokenSecret, $ApiTokenKey, $ApiTokenSecret
+
     Assert-ConfigurationValue -Name 'InstancePrefix' -Value $InstancePrefix
     Assert-ConfigurationValue -Name 'ApiTokenKey' -Value $ApiTokenKey
     Assert-ConfigurationValue -Name 'ApiTokenSecret' -Value $ApiTokenSecret
@@ -2443,11 +2877,15 @@ try {
     if ($InstancePrefix -match '[?*\[\]]') {
         throw "InstancePrefix '$InstancePrefix' contains a placeholder character. Provide a valid instance prefix (e.g. us1, eu2)."
     }
+    if ([string]::IsNullOrWhiteSpace($InstallerFileName) -or $InstallerFileName -ne [System.IO.Path]::GetFileName($InstallerFileName)) {
+        throw "InstallerFileName '$InstallerFileName' must be a file name only, with no folder."
+    }
 
-    Start-LiongardTranscript -TargetFolder $Folder
-    $summaryStamp = Get-Date -Format 'yyyyMMdd_HHmmss'
-    $script:SummaryArtifactPath = Join-Path -Path $Folder -ChildPath ("LGAgentSummary_{0}.json" -f $summaryStamp)
+    Start-LiongardTranscript -TargetFolder $deployFolder
+    $script:SummaryArtifactPath = Get-LiongardDeployLogPath -Prefix 'LGAgentSummary' -Extension '.json'
+    Register-LiongardDeployLog -Label 'Run summary' -Path $script:SummaryArtifactPath
     Write-ConfigurationSnapshot
+    Invoke-LiongardLegacyCleanup -InstallerName $InstallerFileName
 
     Write-Host "Proceeding with Liongard Agent (EXE bundle) installation..."
 
@@ -2521,34 +2959,19 @@ try {
     Complete-LogSection
 
     Start-LogSection -Name 'Installer Download / Path Verification'
-    Write-Host "Checking if folder [$Folder] exists..."
-    if (-not (Test-Path -Path $Folder)) {
-        Write-Host "Path does not exist. Creating directory at [$Folder]..."
-        New-Item -Path $Folder -ItemType Directory -Force | Out-Null
-    }
-
-    if (-not (Test-Path -Path $Folder)) {
-        throw "Failed to create directory [$Folder]. Check permissions and rerun the script."
-    }
-
-    $installerPath = Join-Path -Path $Folder -ChildPath $InstallerFileName
+    # Stage the installer in a per-run folder; it is deleted at the end of the run.
+    $installerPath = Join-Path -Path (Initialize-LiongardDeployStage) -ChildPath $InstallerFileName
     if (-not (Get-LiongardInstaller -Uri $InstallerUrl -DestinationPath $installerPath -MinimumBytes 1048576 -MaxAttempts 3)) {
         throw "Failed to download installer from [$InstallerUrl] after multiple attempts."
     }
     Write-SectionValue -Label 'Installer Path' -Value $installerPath
 
-    $logPath = if ([string]::IsNullOrWhiteSpace($InstallerLogPath)) {
-        Join-Path -Path $Folder -ChildPath 'AgentInstall.log'
+    if (-not [string]::IsNullOrWhiteSpace($InstallerLogPath)) {
+        Add-RunWarning "InstallerLogPath is deprecated and ignored; installer logs are always written to [$deployFolder]."
     }
-    else {
-        $InstallerLogPath
-    }
+    $logPath = Get-LiongardDeployLogPath -Prefix 'AgentInstall'
+    Register-LiongardDeployLog -Label 'Installer log' -Path $logPath -Redact
     Write-SectionValue -Label 'Bootstrapper Log Path' -Value $logPath
-
-    if (Test-Path -LiteralPath $logPath) {
-        Write-Host "Removing existing installer log [$logPath] to capture fresh results..."
-        try { Remove-LiongardPathSafe -LiteralPath $logPath } catch { Add-RunWarning "Unable to remove [$logPath]: $($_.Exception.Message)" }
-    }
     Complete-LogSection
 
     # Classify the existing install. Stale leftovers (folder only, orphaned service, uninstall
@@ -2560,7 +2983,7 @@ try {
     $installStateValue = $installState.State
     Write-LiongardInstallState -State $installState
     if ($installState.State -eq 'Stale') {
-        $staleCleanup = Invoke-LiongardStaleCleanup -State $installState -LogFolder $Folder
+        $staleCleanup = Invoke-LiongardStaleCleanup -State $installState -LogFolder $deployFolder
         foreach ($issue in $staleCleanup.Issues) {
             Add-RunWarning "Stale-install cleanup issue: $issue"
         }
@@ -2641,6 +3064,7 @@ try {
     }
 
     $summary = Read-InstallerLogSummary -Path $logPath -MaxWaitSeconds 30
+    Protect-LiongardInstallerLog -Path $logPath
     if ($summary.Found) {
         if ($summary.StatusLine) {
             Write-SectionValue -Label 'Installer Log Status' -Value $summary.StatusLine
