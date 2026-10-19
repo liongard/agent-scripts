@@ -12,10 +12,12 @@
     (uninstall entries, Windows Installer cache, updater task). The agent identity key
     HKLM\SOFTWARE\WOW6432Node\Liongard is never modified, so a reinstall registers as the same agent.
 
-    Exit codes: 0 = installed and validated, or already up to date; non-zero = failure
-    (the msiexec exit code when msiexec itself failed, otherwise 1).
+    Exit codes: 0 = installed and validated, or already up to date (msiexec 3010/1641 count as success and log a reboot WARN);
+    1618 = another Windows Installer operation was running during cleanup or install, run again later;
+    other non-zero = failure (the msiexec exit code when msiexec itself failed, otherwise 1).
+    Cleanup failures are logged as WARN and do not stop the install: the exit code reflects the install and its validation.
     An agent update runs once a day around midnight local time; a deployment that overlaps it exits 1 without changes and succeeds on the next run.
-    Last updated: 2026-10-16
+    Last updated: 2026-10-19
 #>
 
 # ---- Partner configuration ----
@@ -27,7 +29,7 @@ $AgentDescription        = ""                                 # Optional LIONGAR
 $IncludeEnvironmentValue = $true
 $Folder                  = "C:\Liongard"
 $InstallerUrl            = "https://agents.static.liongard.com/LiongardAgent-lts.msi"
-$CleanupPreviousAgents   = $true                              # Removes outdated, broken, incomplete or corrupt Liongard Agent installs before installing. Set to $false to skip.
+$CleanupPreviousAgents   = $true                              # Removes outdated, broken, incomplete or corrupt Liongard Agent installs before installing. Set to $false to behave like LGAgentInstall-MSI-Simple.ps1 (its install-state rules and lighter cleanup).
 
 # ---- Install-state rules (compact equivalent of the advanced scripts' shared block) ----
 $Roots      = 'C:\Program Files (x86)\LiongardInc', 'C:\Program Files\LiongardInc'
@@ -86,6 +88,11 @@ function Get-LGInstallerCache {   # HKCR\Installer\Products entries whose Produc
         if ($k -and $u -and [string]$k.GetValue('ProductName') -eq 'Liongard Agent') { [pscustomobject]@{ Packed = $name; Code = '{' + $u.Insert(20, '-').Insert(16, '-').Insert(12, '-').Insert(8, '-') + '}' } }
     }
 }
+function Test-LGCachedPackage([string]$Code) {   # Windows Installer's cached copy of the MSI (LocalPackage); without it /x and upgrades fail (1612/1603).
+    $k = [Microsoft.Win32.RegistryKey]::OpenBaseKey('LocalMachine', 'Registry64').OpenSubKey("SOFTWARE\Microsoft\Windows\CurrentVersion\Installer\UserData\S-1-5-18\Products\$(ConvertTo-LGPackedGuid $Code)\InstallProperties")
+    $lp = if ($k) { [string]$k.GetValue('LocalPackage') } else { '' }
+    [bool]($lp -and (Test-Path -LiteralPath $lp -PathType Leaf))
+}
 function Test-LGTask { $null = & schtasks.exe /query /tn $Task 2>&1; $LASTEXITCODE -eq 0 }   # schtasks: Get-ScheduledTask has hung on endpoints.
 function Get-LGServiceInfo {   # Registry registration (visible even when orphaned) plus live status.
     $k = [Microsoft.Win32.RegistryKey]::OpenBaseKey('LocalMachine', 'Registry64').OpenSubKey("SYSTEM\CurrentControlSet\Services\$Service")
@@ -118,9 +125,11 @@ function Get-LGState {   # (b) Healthy = entry + service + binary + Running + MS
     $codes = @($p | Where-Object Code | ForEach-Object Code)   # EXE bundle entries have no code; their hidden MSI entry does.
     $hkcr = [Microsoft.Win32.RegistryKey]::OpenBaseKey('ClassesRoot', 'Registry64')   # Looked up by code, so a different cached ProductName never fails a healthy install.
     $registered = (-not $codes.Count) -or @($codes | Where-Object { $hkcr.OpenSubKey("Installer\Products\$(ConvertTo-LGPackedGuid $_)") }).Count
+    $uncached = @($codes | Where-Object { -not (Test-LGCachedPackage $_) })   # Registered but un-upgradable: an upgrade would fail on every run.
     $missing = @(([ordered]@{ 'no Programs and Features entry' = $p.Count; 'service not registered' = $s.Exists; "service binary missing [$($s.Binary)]" = $s.BinaryExists
                               "service not running$(if ($tried) { ' after a 30-second start attempt' }) (status: $(if ($s.Status) { $s.Status } else { 'none' }))" = ($s.Status -eq 'Running')
-                              "not registered with Windows Installer [$($codes -join ', ')]" = $registered }).GetEnumerator() | Where-Object { -not $_.Value } | ForEach-Object Key)
+                              "not registered with Windows Installer [$($codes -join ', ')]" = $registered
+                              "Windows Installer cached package missing [$($uncached -join ', ')]" = (-not $uncached.Count) }).GetEnumerator() | Where-Object { -not $_.Value } | ForEach-Object Key)
     $found = @(([ordered]@{ 'uninstall entry' = $p.Count; 'service' = $s.Exists; 'install folder' = $f.Count; 'LiongardInc folder' = $r.Count; 'installer cache entry' = $c.Count; 'updater task' = $t }).GetEnumerator() | Where-Object { $_.Value } | ForEach-Object Key)
     $state = if (-not $missing.Count) { 'Healthy' } elseif (-not $found.Count) { 'NotInstalled' } elseif (Test-LGUpdating) { 'Updating' } else { 'Stale' }
     $reason = "found [$($found -join ', ')]; healthy check failed: $($missing -join '; ')"
@@ -131,6 +140,16 @@ function Get-LGState {   # (b) Healthy = entry + service + binary + Running + MS
     Write-LGLog "  folders: $(@($f) + @($r) -join '; ')"
     Write-LGLog "  installer cache: $(@($c | ForEach-Object { "$($_.Packed) $($_.Code)" }) -join '; '); updater task present: $t"
     [pscustomobject]@{ State = $state; Products = $p; Service = $s; Cache = $c; Reason = $reason }
+}
+function Get-LGSimpleState {   # CleanupPreviousAgents = $false: LGAgentInstall-MSI-Simple's rules. Healthy = entry + service + binary; NotInstalled = none of them and no folder; else Stale.
+    $p = @(Get-LGProduct | Sort-Object Key -Unique); $s = Get-LGServiceInfo; $f = @(Get-LGFolder $p)
+    $r = @($Roots | Where-Object { Test-Path -LiteralPath $_ -PathType Container })
+    $state = if ($p.Count -and $s.Exists -and $s.BinaryExists) { 'Healthy' } elseif (-not ($p.Count -or $s.Exists -or $f.Count -or $r.Count)) { 'NotInstalled' } else { 'Stale' }
+    Write-LGLog "Install state: $state (CleanupPreviousAgents is `$false: MSI Simple rules)"
+    Write-LGLog ("  entries: {0}" -f $(if ($p.Count) { ($p | ForEach-Object { "$($_.Key) v$($_.Version) code=$($_.Code) bundle=$($_.Bundle)" }) -join '; ' } else { 'none' }))
+    Write-LGLog "  service: exists=$($s.Exists) status=$($s.Status) binary=$($s.Binary) binaryExists=$($s.BinaryExists)"
+    Write-LGLog "  folders: $(@($f) + @($r) -join '; ')"
+    [pscustomobject]@{ State = $state; Products = $p; Service = $s; Cache = @() }
 }
 function Assert-LGNotProtected([string]$Path) {   # (e) Refuse the identity key, its children, or any parent of it.
     $p = $Path.Trim() -replace '^(?i)(Microsoft\.PowerShell\.Core\\)?Registry::', ''
@@ -158,23 +177,27 @@ function Remove-LGStoredCredential {   # (d) TODO: pending developer confirmatio
     $failed = @($targets | Where-Object { $store::Delete($_) -notin 0, 1168 }).Count
     Write-LGLog "Credential Manager cleanup: found $($targets.Count), removed $($targets.Count - $failed), failed $failed (Generic, UserName 'LiongardAgent\AgentKey')."
 }
-function Invoke-LGStaleCleanup($State) {   # (c) Never for a Healthy install.
+function Invoke-LGStaleCleanup($State, [switch]$Simple) {   # (c) Never for a Healthy install. -Simple: only MSI Simple's steps (service, MSI uninstall entries, folder, credentials).
     if ($State.State -ne 'Stale') { throw "Stale cleanup refused for state '$($State.State)'." }
-    Write-LGLog 'Stale install detected: cleaning up before a fresh install.'
+    Write-LGLog "Stale install detected: cleaning up before a fresh install$(if ($Simple) { ' (MSI Simple cleanup only)' })."
     if ($State.Service.Exists) {
         Stop-LGProcess; Assert-LGNotProtected "HKLM:\SYSTEM\CurrentControlSet\Services\$Service"
-        try { $svc = Get-Service $Service -ErrorAction Stop; if ($svc.Status -ne 'Stopped') { Stop-Service $Service -Force -ErrorAction Stop; $svc.WaitForStatus('Stopped', [TimeSpan]::FromSeconds(30)) } } catch { Write-LGLog "WARN: service stop: $($_.Exception.Message)" }
+        try { $svc = Get-Service $Service -ErrorAction Stop; if ($svc.Status -ne 'Stopped') { if ($svc.Status -ne 'StopPending') { $svc.Stop() }; $svc.WaitForStatus('Stopped', [TimeSpan]::FromSeconds(30)) } } catch { Write-LGLog "WARN: service stop: $($_.Exception.Message)" }   # Not Stop-Service: it blocks with no time limit.
         $null = & sc.exe delete $Service 2>&1; Write-LGLog "sc.exe delete $Service exit $LASTEXITCODE (0, 1060 and 1072 are fine)"
+        $deadline = (Get-Date).AddSeconds(30); while ((Get-LGServiceInfo).Exists -and (Get-Date) -lt $deadline) { Start-Sleep -Seconds 2 }   # A service still marked for deletion fails the install (1603).
+        if ((Get-LGServiceInfo).Exists) { Write-LGLog "WARN: $Service is still registered 30 seconds after sc.exe delete (marked for deletion?); the install can fail until it is gone or the machine restarts." }
     }
     # All uninstall attempts run before any HKCR\Installer key is removed: MSI uninstall entries, codes unpacked from the cache, then EXE bundles.
     foreach ($code in @(@($State.Products | Where-Object Code | ForEach-Object Code) + @($State.Cache | ForEach-Object Code) | Sort-Object -Unique)) {
-        try { $proc = Start-Process msiexec.exe -ArgumentList '/x', $code, '/qn', '/norestart', '/L*V', "`"$Folder\StaleUninstall_$($code.Trim('{}')).log`"" -Wait -PassThru -WindowStyle Hidden -ErrorAction Stop
+        $proc = $null; try { $proc = Start-Process msiexec.exe -ArgumentList '/x', $code, '/qn', '/norestart', '/L*V', "`"$Folder\StaleUninstall_$($code.Trim('{}')).log`"" -Wait -PassThru -WindowStyle Hidden -ErrorAction Stop
               Write-LGLog "msiexec /x $code exit $($proc.ExitCode) (failure tolerated)" } catch { Write-LGLog "WARN: msiexec /x ${code}: $($_.Exception.Message)" }
+        if ($proc.ExitCode -eq 1618) { Exit-LG 1618 "msiexec /x $code returned 1618: another Windows Installer operation is in progress. Cleanup stopped before any installer registration was removed; run the script again later." }
     }
+    if ($Simple) { Stop-LGProcess; Remove-LGStaleFolder $State.Products; Remove-LGStoredCredential; return }
     foreach ($p in @($State.Products | Where-Object Bundle)) {
         if ($p.Quiet -notmatch '^\s*"([^"]+)"\s*(.*)$' -and $p.Quiet -notmatch '^\s*(\S+?\.exe)\s*(.*)$') { Write-LGLog "WARN: bundle $($p.Key) has no usable QuietUninstallString; only its key will be removed."; continue }
-        $run = @{ FilePath = $Matches[1] }; if ($Matches[2]) { $run.ArgumentList = $Matches[2] }
-        try { $proc = Start-Process @run -Wait -PassThru -WindowStyle Hidden -ErrorAction Stop; Write-LGLog "Bundle quiet uninstall $($p.Key) exit $($proc.ExitCode) (failure tolerated)" }
+        $file, $arg = $Matches[1], $Matches[2]; if ($arg -notmatch '(?i)(^|\s)[/-]norestart\b') { $arg = "$arg /norestart".Trim() }   # Burn must never reboot the endpoint.
+        try { $proc = Start-Process -FilePath $file -ArgumentList $arg -Wait -PassThru -WindowStyle Hidden -ErrorAction Stop; Write-LGLog "Bundle quiet uninstall $($p.Key) exit $($proc.ExitCode) (failure tolerated)" }
         catch { Write-LGLog "WARN: bundle quiet uninstall $($p.Key): $($_.Exception.Message)" }
     }
     foreach ($p in @(Get-LGProduct)) {   # (a) Leftover Programs and Features entries, in whichever registry view still holds them.
@@ -188,14 +211,21 @@ function Invoke-LGStaleCleanup($State) {   # (c) Never for a Healthy install.
               else { Assert-LGNotProtected "HKCR\Installer\UpgradeCodes\$name"; $w = [Microsoft.Win32.RegistryKey]::OpenBaseKey('ClassesRoot', 'Registry64').OpenSubKey("Installer\UpgradeCodes\$name", $true); $hits | ForEach-Object { $w.DeleteValue($_, $false) } }
               Write-LGLog "Removed installer upgrade entry $name -> $($hits -join ', ')" } catch { Write-LGLog "WARN: could not clean upgrade entry ${name}: $($_.Exception.Message)" }
     }
-    foreach ($c in $cache) { try { Remove-LGRegKey -Hive 'ClassesRoot' -View 'Registry64' -SubKey "Installer\Products\$($c.Packed)"; Write-LGLog "Removed installer cache entry $($c.Packed) ($($c.Code))" } catch { Write-LGLog "WARN: could not remove installer cache entry $($c.Packed): $($_.Exception.Message)" } }
+    foreach ($c in $cache) {   # Products, Features and the per-machine UserData registration, so a same-ProductCode reinstall is not seen as installed.
+        try { Remove-LGRegKey -Hive 'ClassesRoot' -View 'Registry64' -SubKey "Installer\Products\$($c.Packed)"; Remove-LGRegKey -Hive 'ClassesRoot' -View 'Registry64' -SubKey "Installer\Features\$($c.Packed)"
+              Remove-LGRegKey -Hive 'LocalMachine' -View 'Registry64' -SubKey "SOFTWARE\Microsoft\Windows\CurrentVersion\Installer\UserData\S-1-5-18\Products\$($c.Packed)"
+              Write-LGLog "Removed installer cache entry $($c.Packed) ($($c.Code))" } catch { Write-LGLog "WARN: could not remove installer cache entry $($c.Packed): $($_.Exception.Message)" }
+    }
     if (Test-LGTask) { $null = & schtasks.exe /delete /tn $Task /f 2>&1; Write-LGLog "schtasks /delete $Task exit $LASTEXITCODE$(if ($LASTEXITCODE) { ' (WARN: task may remain)' })" }   # (c)
-    Stop-LGProcess; $stamp = Get-Date -Format 'yyyyMMddHHmmss'
-    foreach ($f in @(Get-LGFolder $State.Products)) {
+    Stop-LGProcess; Remove-LGStaleFolder $State.Products
+    Remove-LGStoredCredential
+}
+function Remove-LGStaleFolder($Products) {   # Rename (or, failing that, delete) each install folder.
+    $stamp = Get-Date -Format 'yyyyMMddHHmmss'
+    foreach ($f in @(Get-LGFolder $Products)) {
         try { Assert-LGNotProtected $f; Rename-Item -LiteralPath $f -NewName "$(Split-Path $f -Leaf).stale-$stamp" -ErrorAction Stop; Write-LGLog "Renamed $f to *.stale-$stamp" }
         catch { Write-LGLog "WARN: rename of $f failed ($($_.Exception.Message)); deleting instead."; try { Remove-LGPath $f; Write-LGLog "Deleted $f" } catch { Write-LGLog "WARN: could not delete ${f}: $($_.Exception.Message)" } }
     }
-    Remove-LGStoredCredential
 }
 function Test-LGInstall {   # (f) Service Running (retry ~60s) and updater task registered.
     $deadline = (Get-Date).AddSeconds(60)
@@ -241,10 +271,9 @@ foreach ($i in 1..3) {
     if ($i -eq 3) { Exit-LG 1 "Installer download from $InstallerUrl failed." }
 }
 
-$state = Get-LGState
+$state = if ($CleanupPreviousAgents) { Get-LGState } else { Get-LGSimpleState }
 if ($state.State -eq 'Updating') { Exit-LG 1 'An agent update is still in progress after waiting 2 minutes. Nothing was changed; run the script again later.' }
-if ($state.State -eq 'Stale' -and $CleanupPreviousAgents) { Invoke-LGStaleCleanup $state }
-elseif ($state.State -eq 'Stale') { Write-LGLog "WARN: previous install is incomplete or broken ($($state.Reason)) but CleanupPreviousAgents is `$false. Attempting the install anyway." }
+if ($state.State -eq 'Stale') { Invoke-LGStaleCleanup $state -Simple:(-not $CleanupPreviousAgents) }
 elseif ($state.State -eq 'Healthy') {   # Normal upgrade path: install only when the MSI is strictly newer.
     $installed = ConvertTo-LGVersion (@($state.Products | Where-Object { -not $_.Bundle }) | Select-Object -First 1).Version
     $new = Get-LGMsiVersion $msi
@@ -260,7 +289,8 @@ if (Test-Path -LiteralPath $log) { Remove-LGPath $log }
 Write-LGLog "Installing Liongard Agent for $LGHost ..."
 $code = (Start-Process msiexec.exe -ArgumentList $msiArgs -Wait -PassThru).ExitCode
 Write-LGLog "msiexec exit code: $code"
-if ($code -ne 0 -and $code -ne 3010) { Exit-LG $code "msiexec returned $code." $log }
+if ($code -in 3010, 1641) { Write-LGLog "WARN: msiexec returned ${code}: a reboot is required to finish the install." }
+if ($code -notin 0, 3010, 1641) { Exit-LG $code "msiexec returned $code.$(@{ 1618 = ' Another Windows Installer operation is in progress; run the script again later.'; 1603 = ' Fatal error during installation; see the installer log below.' }[$code])" $log }
 if (-not (Test-LGInstall)) { Exit-LG 1 'Post-install validation failed (service not Running or updater task missing).' $log }
 try { Remove-LGPath $log; Write-LGLog "Deleted $log after a successful install (it can contain the access secret; it is kept only on failure)." }
 catch { Write-LGLog "WARN: could not delete ${log}: $($_.Exception.Message)" }
