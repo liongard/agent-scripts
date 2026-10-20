@@ -63,8 +63,13 @@ REMOVE_AGENT_FROM_PLATFORM=false
 # Optional free-text description for the agent. Passed only when non-empty.
 AGENT_DESCRIPTION=""
 
-# Local working directory for the downloaded installer and the log transcript.
-DOWNLOAD_DIRECTORY="/tmp/liongard-agent"
+# Directory for the log transcript. Created root-only (0700) when missing.
+LOG_DIRECTORY="/var/log/liongard-agent"
+
+# DEPRECATED: no longer used and will be removed in a later release. The
+# installer now downloads to a private temporary directory that is removed on
+# exit, and the log transcript goes to LOG_DIRECTORY. A WARN is logged if set.
+DOWNLOAD_DIRECTORY=""
 
 # Installer download URL. Package type is inferred from the file extension
 # (.deb / .rpm / .sh / .run). NOTE: the MachineGuid collision override (passed
@@ -167,6 +172,7 @@ _DEVICE_GUID_OVERRIDE=""
 _RESOLVED_ENVIRONMENT=""
 _HTTP_CLIENT=""         # curl | wget
 _INSTALLER_PATH=""      # set by download_installer; avoids stdout-capture pollution
+_WORK_DIR=""            # private mktemp -d directory; removed on exit
 
 # ============================================================
 # LOGGING
@@ -209,19 +215,29 @@ log_ok()    { _log OK    "$@"; }
 log_warn()  { _log WARN  "$@"; }
 log_error() { _log ERROR "$@"; }
 
-# Create the transcript log file inside the download directory.
+# Create the transcript log file inside LOG_DIRECTORY. A missing directory is
+# created 0700 and the log file 0600; an existing directory keeps its mode.
 start_transcript() {
-    local dir="${DOWNLOAD_DIRECTORY}"
-    mkdir -p "${dir}" 2>/dev/null || {
+    local dir="${LOG_DIRECTORY}"
+    ( umask 077 && mkdir -p "${dir}" ) 2>/dev/null || {
         log_warn "Could not create [${dir}]; file logging disabled."
         return
     }
     local ts
     ts="$(date '+%Y%m%d_%H%M%S')"
     _SCRIPT_LOG_FILE="${dir}/LGAgentScript_${ts}.log"
-    : > "${_SCRIPT_LOG_FILE}" 2>/dev/null || { _SCRIPT_LOG_FILE=""; return; }
+    ( umask 077 && : > "${_SCRIPT_LOG_FILE}" ) 2>/dev/null || { _SCRIPT_LOG_FILE=""; return; }
     log_info "Transcript logging started at [${_SCRIPT_LOG_FILE}]."
 }
+
+# Remove the private working directory on every exit path.
+# shellcheck disable=SC2329  # invoked by the EXIT trap below
+_cleanup() {
+    if [[ -n "${_WORK_DIR}" && -d "${_WORK_DIR}" ]]; then
+        rm -rf -- "${_WORK_DIR}"
+    fi
+}
+trap _cleanup EXIT
 
 # ============================================================
 # SECRET MASKING
@@ -249,7 +265,7 @@ print_config_snapshot() {
     log_info "EnablePreUninstall          : ${ENABLE_PRE_UNINSTALL}"
     log_info "RemoveAgentFromPlatform     : ${REMOVE_AGENT_FROM_PLATFORM}"
     log_info "MinimumRemoteDeletionScore  : ${MINIMUM_REMOTE_DELETION_SCORE}"
-    log_info "DownloadDirectory           : ${DOWNLOAD_DIRECTORY}"
+    log_info "LogDirectory                : ${LOG_DIRECTORY}"
     log_info "InstallerUrl                : ${INSTALLER_URL}"
     log_info "ApiFailureBehavior          : ${API_FAILURE_BEHAVIOR}"
     log_step "======================================"
@@ -277,6 +293,9 @@ validate_config() {
     assert_config_value "AGENT_TOKEN_SECRET" "${AGENT_TOKEN_SECRET}"
     if [[ "${INCLUDE_ENVIRONMENT_VALUE}" == true ]]; then
         assert_config_value "ENVIRONMENT"    "${ENVIRONMENT}"
+    fi
+    if [[ -n "${DOWNLOAD_DIRECTORY}" ]]; then
+        log_warn "DOWNLOAD_DIRECTORY is deprecated and no longer used. The installer downloads to a private temporary directory, and the log goes to LOG_DIRECTORY [${LOG_DIRECTORY}]."
     fi
     log_ok "Configuration validated."
 }
@@ -1292,18 +1311,23 @@ invoke_liongard_agent_uninstall() {
 # ============================================================
 
 download_installer() {
-    # Creates the download directory, downloads the installer with retry
+    # Creates a private working directory (mktemp -d: owned by root, mode
+    # 0700, removed on exit by _cleanup), downloads the installer with retry
     # logic and size validation.
     # Result is written to the global _INSTALLER_PATH — NOT stdout — so that
     # callers do not accidentally capture log lines when using $(...).
     local url="${INSTALLER_URL}"
-    local dest_dir="${DOWNLOAD_DIRECTORY}"
+    local dest_dir
     local dest_file
 
-    mkdir -p "${dest_dir}" 2>/dev/null || {
-        log_error "Cannot create download directory [${dest_dir}]."
-        exit 5
-    }
+    if [[ -z "${_WORK_DIR}" ]]; then
+        _WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/liongard-agent.XXXXXXXX" 2>/dev/null)" || {
+            _WORK_DIR=""
+            log_error "Cannot create a private download directory under [${TMPDIR:-/tmp}]."
+            exit 5
+        }
+    fi
+    dest_dir="${_WORK_DIR}"
 
     if [[ -n "${INSTALLER_FILE_NAME}" ]]; then
         dest_file="${dest_dir}/${INSTALLER_FILE_NAME}"

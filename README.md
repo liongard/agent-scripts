@@ -53,7 +53,7 @@ You can skip the environment name if you set `$IncludeEnvironmentValue = $false`
 - **EXE (Simple and Advanced):** `$EnableNetworkDiscovery`, `$InstallNpcap`, `$EulaAccepted`, `$SuppressRestart`, `$PassiveMode`, `$ProxyUrl`, `$ClearProxyEnvironmentForInstaller`, `$AutoUpdate`.
 - **EXE Advanced only:** `$InstallerFileName`, `$InstallerLogPath`, `$AutoUpdateArgumentName`.
 - **Uninstall:** `$RemoveAgentFromPlatform`, `$MinimumRemoteDeletionScore`, `$LogFolder`.
-- **Linux (section B):** `INCLUDE_ENVIRONMENT_VALUE`, `ENABLE_ENVIRONMENT_MATCHING`, `ENABLE_PRE_UNINSTALL`, `REMOVE_AGENT_FROM_PLATFORM`, `AGENT_DESCRIPTION`, `DOWNLOAD_DIRECTORY`, `INSTALLER_URL`, `INSTALLER_FILE_NAME`. Leave section C alone unless Liongard Support asks you to change it. Section C includes `MINIMUM_REMOTE_DELETION_SCORE` (default `50`), the minimum match score a platform record needs before `REMOVE_AGENT_FROM_PLATFORM=true` deletes it.
+- **Linux (section B):** `INCLUDE_ENVIRONMENT_VALUE`, `ENABLE_ENVIRONMENT_MATCHING`, `ENABLE_PRE_UNINSTALL`, `REMOVE_AGENT_FROM_PLATFORM`, `AGENT_DESCRIPTION`, `LOG_DIRECTORY`, `INSTALLER_URL`, `INSTALLER_FILE_NAME`. `DOWNLOAD_DIRECTORY` is deprecated and no longer used: the installer now downloads to a private temporary folder that is deleted when the script exits. If it is set, the script logs a warning and carries on. It will be removed in a later release. Leave section C alone unless Liongard Support asks you to change it. Section C includes `MINIMUM_REMOTE_DELETION_SCORE` (default `50`), the minimum match score a platform record needs before `REMOVE_AGENT_FROM_PLATFORM=true` deletes it.
 
 ## Logs
 
@@ -63,7 +63,7 @@ You can skip the environment name if you set `$IncludeEnvironmentValue = $false`
 | MSI Advanced | `$Folder` | `LGAgentScript_<timestamp>.log` (transcript) |
 | EXE Advanced | `$Folder` | `LGAgentScript_EXE_<timestamp>.log`, `LGAgentSummary_<timestamp>.json` |
 | Uninstall | `$LogFolder` (default `C:\Liongard`) | `LGAgentUninstall_<timestamp>.log` |
-| Linux | `DOWNLOAD_DIRECTORY` (default `/tmp/liongard-agent`) | `LGAgentScript_<timestamp>.log` |
+| Linux | `LOG_DIRECTORY` (default `/var/log/liongard-agent`, created root-only) | `LGAgentScript_<timestamp>.log` |
 
 Logs can contain sensitive details. Check them and remove any keys or secrets before sharing them.
 
