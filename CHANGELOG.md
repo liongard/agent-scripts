@@ -18,6 +18,7 @@ All notable changes to these scripts are documented here.
 - Each run removes the old installers and script logs from the top level of `C:\Liongard`, then removes the folder if it's empty.
 - EXE Advanced: `$InstallerLogPath` is deprecated and ignored, and `$InstallerFileName` must be a file name only.
 - The new code is in a "Liongard deploy-folder functions" shared block that is identical in all five scripts.
+- `LGAgentCleanInstall-MSI-Simple.ps1` now uses the same deploy-folder shared block (six scripts in all): it works in `LiongardDeploy`, stages the installer in `Deploy\<guid>\`, writes timestamped installer and stale-uninstall logs, redacts them in place instead of deleting `AgentInstall.log` after a successful install, cleans up the legacy `C:\Liongard` folder and prints the log paths at the end of every run. `$Folder` defaults to `$env:ProgramData`.
 - EXE Advanced (#5): the JSON summary and installer-log hints no longer include unmasked proxy credentials; `user:pass@` is masked for any scheme or none.
 
 ### Linux
