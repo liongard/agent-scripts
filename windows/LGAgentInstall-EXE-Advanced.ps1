@@ -23,8 +23,8 @@
 
     To remove the agent, use the standalone Liongard Agent uninstall script.
 
-    Written by David Chapman, Manager of Partner Support.
-    Last updated: 2026-10-10
+    Liongard Partner Support
+    Last updated: 2026-10-20
 #>
 
 # ================================
@@ -183,7 +183,7 @@ function Assert-ConfigurationValue {
 
 # ====================================================================
 # BEGIN SHARED BLOCK: Liongard install-state functions
-# Keep this block identical across LGAgentInstall_MSI_Advanced, LGAgentInstall_EXE_Advanced
+# Keep this block identical across LGAgentInstall-MSI-Advanced, LGAgentInstall-EXE-Advanced
 # and LGAgentUninstall. Edit one copy, then copy it to the other scripts.
 # ====================================================================
 
@@ -2581,7 +2581,7 @@ try {
         Write-Host ("Liongard Agent {0} is already installed and the bundle ({1}) is not newer. Skipping installation." -f $installedAgentVersion, $installerBundleVersion)
         Complete-LogSection
         $networkDiscoveryStatus = Invoke-NetworkDiscoveryStep -Enable $EnableNetworkDiscovery
-        return
+        exit 0
     }
     elseif ($installedAgentVersion -and -not $installerBundleVersion) {
         Write-SectionValue -Label 'Decision' -Value 'Bundle version unavailable; proceeding and relying on the installer''s built-in downgrade protection.'
@@ -2695,7 +2695,7 @@ try {
         Write-SectionValue -Label 'Errors' -Value @($script:RunErrors)
         Write-Host "Liongard Agent installation verified successfully."
         Complete-LogSection
-        return
+        exit 0
     }
 
     if (($exitCode -eq 0 -or $exitCode -eq 3010) -and -not $agentDetected) {

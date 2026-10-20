@@ -29,6 +29,7 @@ These standalone scripts install, upgrade and uninstall the Liongard Agent, and 
 3. Deploy it from your RMM:
    - Windows: run as **SYSTEM** in Windows PowerShell 5.1.
    - Linux: run as **root**, e.g. `sudo bash LGAgentInstall-Linux.sh`.
+   - macOS: run as **root** with `Liongard-lts.pkg` in the same folder, e.g. `sudo ./LGAgentInstall-macOS.sh`. See [macos/README.md](macos/README.md).
 4. Check the exit code and the logs.
 
 ## Configuration
@@ -49,10 +50,10 @@ You can skip the environment name if you set `$IncludeEnvironmentValue = $false`
 ### Optional
 
 - **All Windows installs:** `$AgentDescription`, `$IncludeEnvironmentValue`, `$Folder` (default `C:\Liongard`), `$InstallerUrl`.
-- **EXE (Simple and Advanced):** `$EnableNetworkDiscovery`, `$InstallNpcap`, `$EulaAccepted`, `$SuppressRestart`, `$PassiveMode`, `$ProxyUrl`, `$ClearProxyEnvironmentForInstaller`.
-- **EXE Advanced only:** `$InstallerFileName`, `$InstallerLogPath`, `$AutoUpdate`, `$AutoUpdateArgumentName`.
+- **EXE (Simple and Advanced):** `$EnableNetworkDiscovery`, `$InstallNpcap`, `$EulaAccepted`, `$SuppressRestart`, `$PassiveMode`, `$ProxyUrl`, `$ClearProxyEnvironmentForInstaller`, `$AutoUpdate`.
+- **EXE Advanced only:** `$InstallerFileName`, `$InstallerLogPath`, `$AutoUpdateArgumentName`.
 - **Uninstall:** `$RemoveAgentFromPlatform`, `$MinimumRemoteDeletionScore`, `$LogFolder`.
-- **Linux (section B):** `INCLUDE_ENVIRONMENT_VALUE`, `ENABLE_ENVIRONMENT_MATCHING`, `ENABLE_PRE_UNINSTALL`, `REMOVE_AGENT_FROM_PLATFORM`, `AGENT_DESCRIPTION`, `DOWNLOAD_DIRECTORY`, `INSTALLER_URL`, `INSTALLER_FILE_NAME`. Leave section C alone unless Liongard Support asks you to change it.
+- **Linux (section B):** `INCLUDE_ENVIRONMENT_VALUE`, `ENABLE_ENVIRONMENT_MATCHING`, `ENABLE_PRE_UNINSTALL`, `REMOVE_AGENT_FROM_PLATFORM`, `AGENT_DESCRIPTION`, `DOWNLOAD_DIRECTORY`, `INSTALLER_URL`, `INSTALLER_FILE_NAME`. Leave section C alone unless Liongard Support asks you to change it. Section C includes `MINIMUM_REMOTE_DELETION_SCORE` (default `50`), the minimum match score a platform record needs before `REMOVE_AGENT_FROM_PLATFORM=true` deletes it.
 
 ## Logs
 
