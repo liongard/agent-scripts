@@ -4,6 +4,7 @@ These tests check the scripts' masking of keys, secrets and proxy credentials. T
 
 | File | What it tests |
 |---|---|
+| `Test-LogRedaction.ps1` | The shared `Hide-LiongardSecretText` and `Protect-LiongardInstallerLog` in every Windows script that has the deploy-folder shared block. Covers installer-log lines with `ProxyUrl=` values (raw `@` included), access key and secret properties and literal secrets, and redacts real UTF-16 and UTF-8 log files in place. |
 | `Test-ProxyMasking.ps1` | `Hide-ProxyCredential`, `Mask-ProxyValue` and `Hide-LiongardLogSecret` in `LGAgentInstall-EXE-Advanced.ps1`. Covers every proxy scheme, multi-entry values, URL-encoded and raw `@` in passwords, and text that must stay unchanged. |
 
 ## Run them locally
