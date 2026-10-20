@@ -60,7 +60,7 @@ You can skip the environment name if you set `$IncludeEnvironmentValue = $false`
 
 ## Working folder
 
-The Windows scripts always work in a dedicated `LiongardDeploy` subfolder of `$Folder` (`$LogFolder` for Uninstall). **Exception:** `LGAgentCleanInstall-MSI-Simple.ps1` doesn't use `LiongardDeploy` yet. It works directly in `$Folder` (default `C:\Liongard`) until it's aligned with the deploy-folder changes. With the default, that's `C:\ProgramData\LiongardDeploy`. The scripts never change the permissions of `$Folder` itself, and they never touch `C:\ProgramData\Liongard`, which belongs to the agent.
+The Windows scripts always work in a dedicated `LiongardDeploy` subfolder of `$Folder` (`$LogFolder` for Uninstall). With the default, that's `C:\ProgramData\LiongardDeploy`. The scripts never change the permissions of `$Folder` itself, and they never touch `C:\ProgramData\Liongard`, which belongs to the agent.
 
 On every run, before anything is written, each script:
 
@@ -74,7 +74,7 @@ The scripts also clean up the old `C:\Liongard` folder. They delete only the age
 
 ## Logs
 
-All Windows logs are written to `LiongardDeploy`. The exception is `LGAgentCleanInstall-MSI-Simple.ps1`, which writes `AgentInstall.log` and `StaleUninstall_<ProductCode>.log` to `$Folder` (default `C:\Liongard`) and deletes `AgentInstall.log` after a successful install. Each run's log names carry a timestamp, and the scripts keep the 5 most recent runs of each log type. Every run ends by printing the full path of each log it wrote.
+All Windows logs are written to `LiongardDeploy`. Each run's log names carry a timestamp, and the scripts keep the 5 most recent runs of each log type. Every run ends by printing the full path of each log it wrote.
 
 | Script | Files |
 |---|---|
