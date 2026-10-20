@@ -173,6 +173,7 @@ _RESOLVED_ENVIRONMENT=""
 _HTTP_CLIENT=""         # curl | wget
 _INSTALLER_PATH=""      # set by download_installer; avoids stdout-capture pollution
 _WORK_DIR=""            # private mktemp -d directory; removed on exit
+_WGET_CONFIG_FILE=""    # 0600 wgetrc holding the auth header; removed on exit
 
 # ============================================================
 # LOGGING
@@ -230,9 +231,14 @@ start_transcript() {
     log_info "Transcript logging started at [${_SCRIPT_LOG_FILE}]."
 }
 
-# Remove the private working directory on every exit path.
+# Remove the private working directory and the wget auth config on every
+# exit path, including an exit or a TERM/INT/HUP signal in the middle of an
+# API call.
 # shellcheck disable=SC2329  # invoked by the EXIT trap below
 _cleanup() {
+    if [[ -n "${_WGET_CONFIG_FILE}" ]]; then
+        rm -f -- "${_WGET_CONFIG_FILE}"
+    fi
     if [[ -n "${_WORK_DIR}" && -d "${_WORK_DIR}" ]]; then
         rm -rf -- "${_WORK_DIR}"
     fi
@@ -638,9 +644,28 @@ get_local_mac_addresses() {
 
 # Build the base64-encoded auth token (key:secret) and store it in
 # _AUTH_HEADER_VALUE. Never prints the encoded value.
+# The token never goes on a command line, where it would show in the process
+# list: curl reads it from a config on stdin (see _curl_auth_config). wget
+# cannot read headers from stdin, so for wget it is written once to a mktemp
+# file (mode 0600) passed through WGETRC and removed by the EXIT trap.
 build_auth_header() {
     local raw="${API_TOKEN_KEY}:${API_TOKEN_SECRET}"
     _AUTH_HEADER_VALUE="$(printf '%s' "${raw}" | base64 | tr -d '\n')"
+
+    if [[ "${_HTTP_CLIENT}" == "wget" && -z "${_WGET_CONFIG_FILE}" ]]; then
+        _WGET_CONFIG_FILE="$(mktemp "${TMPDIR:-/tmp}/liongard-wgetrc.XXXXXXXX" 2>/dev/null)" || {
+            _WGET_CONFIG_FILE=""
+            log_error "Cannot create a private wget config file under [${TMPDIR:-/tmp}]."
+            exit 4
+        }
+        printf 'header = X-ROAR-API-KEY: %s\n' "${_AUTH_HEADER_VALUE}" > "${_WGET_CONFIG_FILE}"
+    fi
+}
+
+# Print the curl config line that carries the auth header. Pipe it to
+# `curl --config -`; printf is a shell builtin, so no process sees the token.
+_curl_auth_config() {
+    printf 'header = "X-ROAR-API-KEY: %s"\n' "${_AUTH_HEADER_VALUE}"
 }
 
 # Perform an authenticated GET request.
@@ -650,13 +675,13 @@ _api_get() {
     local url="${_INSTANCE_BASE_URL}${path}"
 
     if [[ "${_HTTP_CLIENT}" == "curl" ]]; then
-        curl -sSL --fail \
-            -H "X-ROAR-API-KEY: ${_AUTH_HEADER_VALUE}" \
+        _curl_auth_config | curl -sSL --fail --config - \
             -H "User-Agent: LiongardLinuxAgentInstaller/1.0" \
             "${url}"
     else
-        wget -qO- \
-            --header="X-ROAR-API-KEY: ${_AUTH_HEADER_VALUE}" \
+        # WGETRC replaces only the per-user ~/.wgetrc; the system wgetrc
+        # (proxy settings and so on) is still read.
+        WGETRC="${_WGET_CONFIG_FILE}" wget -qO- \
             --header="User-Agent: LiongardLinuxAgentInstaller/1.0" \
             "${url}"
     fi
@@ -672,9 +697,8 @@ _api_delete() {
         printf '0'; return 1
     fi
 
-    curl -sSL -o /dev/null -w '%{http_code}' \
+    _curl_auth_config | curl -sSL -o /dev/null -w '%{http_code}' --config - \
         -X DELETE \
-        -H "X-ROAR-API-KEY: ${_AUTH_HEADER_VALUE}" \
         -H "User-Agent: LiongardLinuxAgentInstaller/1.0" \
         "${url}"
 }
