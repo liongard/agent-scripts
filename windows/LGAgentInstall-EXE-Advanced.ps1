@@ -1172,16 +1172,21 @@ function Mask-SecretValue {
     return "$prefix****$suffix"
 }
 
+function Hide-ProxyCredential {
+    # Replaces the password in every user:pass@ pair with ****, whatever the scheme
+    # (http, https, socks5) or with no scheme at all (user:pass@host:port).
+    param([AllowNull()][string]$Text)
+
+    if ([string]::IsNullOrEmpty($Text)) { return $Text }
+    return ($Text -replace '(?<user>[^:/@\s,;="]+):[^@/\s,;"]*@', '${user}:****@')
+}
+
 function Mask-ProxyValue {
     param([string]$Value)
 
     if ([string]::IsNullOrWhiteSpace($Value)) { return '<empty>' }
 
-    if ($Value -match '^(?<scheme>https?://)(?<user>[^:/@]+)(:(?<pass>[^@]*))?@(?<host>.+)$') {
-        return ("{0}{1}:****@{2}" -f $Matches['scheme'], $Matches['user'], $Matches['host'])
-    }
-
-    return $Value
+    return (Hide-ProxyCredential -Text $Value)
 }
 
 function Write-ConfigurationSnapshot {
@@ -1641,10 +1646,11 @@ function Get-ProxyEnvironmentSnapshot {
                 $value = [Environment]::GetEnvironmentVariable($name, 'User')
             }
 
+            # Keep only the masked value. This snapshot is written to the JSON
+            # summary, so the raw value (which can hold user:pass) must not be stored.
             if (-not [string]::IsNullOrWhiteSpace($value)) {
                 $entries.Add([pscustomobject]@{
                     Name   = $name
-                    Value  = $value
                     Masked = $(if ($name -match 'proxy') { Mask-ProxyValue -Value $value } else { Mask-SecretValue -Value $value })
                 }) | Out-Null
             }
@@ -1695,10 +1701,12 @@ function Start-LiongardInstallerProcess {
 function Hide-LiongardLogSecret {
     # Masks agent access key/secret values in installer log lines before they are printed
     # or written to the run summary (same pattern as the simple scripts). Covers MSI
-    # property dumps ("LIONGARDACCESSSECRET = x") and command lines ("LiongardAccessKey=x").
+    # property dumps ("LIONGARDACCESSSECRET = x") and command lines ("LiongardAccessKey=x"),
+    # and proxy credentials ("PROXYURL = http://user:pass@host").
     param([AllowNull()][string]$Line)
 
     if ([string]::IsNullOrEmpty($Line)) { return $Line }
+    $Line = Hide-ProxyCredential -Text $Line
     return ($Line -replace '(?i)(ACCESS(KEY|SECRET)\S*\s*[=:]\s*)("[^"]*"|\S+)', '$1****')
 }
 
@@ -2007,13 +2015,7 @@ function Get-InstallerFailureHints {
         )
 
         if (-not [string]::IsNullOrWhiteSpace($proxyValue) -and $looksLikeProxyEndpoint) {
-            $maskedProxy = if ($proxyValue -match '^(?<scheme>https?://)(?<user>[^:/@]+)(:(?<pass>[^@]*))?@(?<host>.+)$') {
-                "{0}{1}:****@{2}" -f $Matches['scheme'], $Matches['user'], $Matches['host']
-            }
-            else {
-                $proxyValue
-            }
-            $hints.Add("MSI runtime proxy value: $maskedProxy") | Out-Null
+            $hints.Add("MSI runtime proxy value: $(Mask-ProxyValue -Value $proxyValue)") | Out-Null
         }
     }
     if ($content -match '(?i)\bRebootPending\s*=\s*1\b' -or $content -match '(?i)\bMsiSystemRebootPending\s*=\s*1\b') {
