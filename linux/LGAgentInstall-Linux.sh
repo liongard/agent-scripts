@@ -71,11 +71,18 @@ LOG_DIRECTORY="/var/log/liongard-agent"
 # exit, and the log transcript goes to LOG_DIRECTORY. A WARN is logged if set.
 DOWNLOAD_DIRECTORY=""
 
-# Installer download URL. Package type is inferred from the file extension
+# CPU architecture of the installer to download. "auto" picks it from
+# uname -m (x86_64 → x64, aarch64 → arm64) and stops with an error on any
+# other machine type. "x64" or "arm64" forces one.
+LINUX_ARCHITECTURE="auto"
+
+# Installer download URL. Leave empty to use the LTS installer for
+# LINUX_ARCHITECTURE. When set, it is used as-is and LINUX_ARCHITECTURE is
+# ignored. Package type is inferred from the file extension
 # (.deb / .rpm / .sh / .run). NOTE: the MachineGuid collision override (passed
 # to the installer via -g) requires an agent installer v5.4.0 or newer; older
 # builds silently ignore it.
-INSTALLER_URL="https://agents.static.liongard.com/LiongardAgent-lts-x64.xz.run"
+INSTALLER_URL=""
 
 # Saved installer filename. Leave empty to infer it from the URL.
 INSTALLER_FILE_NAME=""
@@ -272,6 +279,7 @@ print_config_snapshot() {
     log_info "RemoveAgentFromPlatform     : ${REMOVE_AGENT_FROM_PLATFORM}"
     log_info "MinimumRemoteDeletionScore  : ${MINIMUM_REMOTE_DELETION_SCORE}"
     log_info "LogDirectory                : ${LOG_DIRECTORY}"
+    log_info "LinuxArchitecture           : ${LINUX_ARCHITECTURE}"
     log_info "InstallerUrl                : ${INSTALLER_URL}"
     log_info "ApiFailureBehavior          : ${API_FAILURE_BEHAVIOR}"
     log_step "======================================"
@@ -304,6 +312,46 @@ validate_config() {
         log_warn "DOWNLOAD_DIRECTORY is deprecated and no longer used. The installer downloads to a private temporary directory, and the log goes to LOG_DIRECTORY [${LOG_DIRECTORY}]."
     fi
     log_ok "Configuration validated."
+}
+
+# ============================================================
+# INSTALLER URL (by CPU architecture)
+# Sets INSTALLER_URL from LINUX_ARCHITECTURE unless it was set explicitly.
+# ============================================================
+
+resolve_installer_url() {
+    local arch="${LINUX_ARCHITECTURE,,}"
+    local machine
+
+    case "${arch}" in
+        auto|x64|arm64) ;;
+        *)
+            log_error "LINUX_ARCHITECTURE must be auto, x64 or arm64 (got '${LINUX_ARCHITECTURE}')."
+            exit 2
+            ;;
+    esac
+
+    if [[ -n "${INSTALLER_URL}" ]]; then
+        log_info "Using the configured INSTALLER_URL; LINUX_ARCHITECTURE is ignored."
+        return 0
+    fi
+
+    if [[ "${arch}" == auto ]]; then
+        machine="$(uname -m 2>/dev/null || printf 'unknown')"
+        case "${machine}" in
+            x86_64)  arch="x64" ;;
+            aarch64) arch="arm64" ;;
+            *)
+                log_error "Unsupported CPU architecture '${machine}' (uname -m). The Liongard Agent installer is available for x86_64 and aarch64 only."
+                exit 3
+                ;;
+        esac
+        log_info "CPU architecture: ${machine} → ${arch}"
+    else
+        log_info "CPU architecture forced by LINUX_ARCHITECTURE: ${arch}"
+    fi
+
+    INSTALLER_URL="https://agents.static.liongard.com/LiongardAgent-lts-${arch}.xz.run"
 }
 
 # ============================================================
@@ -1661,6 +1709,7 @@ main() {
     # ── Step 1: Sanity checks ──────────────────────────────────────────
     check_root
     validate_config
+    resolve_installer_url
     check_prerequisites
     print_config_snapshot
 
