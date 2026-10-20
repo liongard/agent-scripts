@@ -11,6 +11,7 @@ These standalone scripts install, upgrade and uninstall the Liongard Agent, and 
 | Script | OS | Installer | Variant | Credentials needed |
 |---|---|---|---|---|
 | `windows/LGAgentInstall-MSI-Simple.ps1` | Windows | MSI | Simple | Agent install token only |
+| `windows/LGAgentCleanInstall-MSI-Simple.ps1` | Windows | MSI | Simple + cleanup | Agent install token only |
 | `windows/LGAgentInstall-MSI-Advanced.ps1` | Windows | MSI | Advanced | Liongard API token **and** agent install token |
 | `windows/LGAgentInstall-EXE-Simple.ps1` | Windows | EXE bundle (Agent + VC++ + Npcap) | Simple | Agent install token only |
 | `windows/LGAgentInstall-EXE-Advanced.ps1` | Windows | EXE bundle (Agent + VC++ + Npcap) | Advanced | Liongard API token **and** agent install token |
@@ -19,6 +20,7 @@ These standalone scripts install, upgrade and uninstall the Liongard Agent, and 
 | `macos/LGAgentInstall-macOS.sh` | macOS | `.pkg` (`Liongard-lts.pkg`, supplied alongside the script) | Simple | Agent install token only (`ACCESS_KEY_ID`, `ACCESS_KEY_SECRET`). See [macos/README.md](macos/README.md) |
 
 - **Simple** scripts make no Liongard API calls. They pass the environment name to the installer exactly as written.
+- **MSI Simple + cleanup** (`LGAgentCleanInstall-MSI-Simple.ps1`) is for endpoints with an old, broken, incomplete or corrupt agent. Before it installs, it removes the previous install: the service, uninstall entries, Windows Installer registration, the updater task and the install folder. It never cleans up a healthy agent; it only upgrades one when the MSI is newer. The identity key `HKLM\SOFTWARE\WOW6432Node\Liongard` is never modified, so the reinstalled agent registers as the same agent. It takes `$LiongardUrl` (for example `us9.app.liongard.com` or `us9`) instead of `$InstancePrefix`. Set `$CleanupPreviousAgents = $false` to make it behave like MSI Simple.
 - **Advanced** scripts use the API to resolve the environment name, check for existing agents and write richer logs. The EXE Advanced script also writes a JSON summary.
 - Pick **EXE** when the host will run the network discovery inspector, because it needs Npcap and VC++. Otherwise use **MSI**.
 
@@ -57,7 +59,7 @@ You can skip the environment name if you set `$IncludeEnvironmentValue = $false`
 
 ## Working folder
 
-The Windows scripts always work in a dedicated `LiongardDeploy` subfolder of `$Folder` (`$LogFolder` for Uninstall). With the default, that's `C:\ProgramData\LiongardDeploy`. The scripts never change the permissions of `$Folder` itself, and they never touch `C:\ProgramData\Liongard`, which belongs to the agent.
+The Windows scripts always work in a dedicated `LiongardDeploy` subfolder of `$Folder` (`$LogFolder` for Uninstall). **Exception:** `LGAgentCleanInstall-MSI-Simple.ps1` doesn't use `LiongardDeploy` yet. It works directly in `$Folder` (default `C:\Liongard`) until it's aligned with the deploy-folder changes. With the default, that's `C:\ProgramData\LiongardDeploy`. The scripts never change the permissions of `$Folder` itself, and they never touch `C:\ProgramData\Liongard`, which belongs to the agent.
 
 On every run, before anything is written, each script:
 
@@ -71,7 +73,7 @@ The scripts also clean up the old `C:\Liongard` folder. They delete only the age
 
 ## Logs
 
-All Windows logs are written to `LiongardDeploy`. Each run's log names carry a timestamp, and the scripts keep the 5 most recent runs of each log type. Every run ends by printing the full path of each log it wrote.
+All Windows logs are written to `LiongardDeploy`. The exception is `LGAgentCleanInstall-MSI-Simple.ps1`, which writes `AgentInstall.log` and `StaleUninstall_<ProductCode>.log` to `$Folder` (default `C:\Liongard`) and deletes `AgentInstall.log` after a successful install. Each run's log names carry a timestamp, and the scripts keep the 5 most recent runs of each log type. Every run ends by printing the full path of each log it wrote.
 
 | Script | Files |
 |---|---|
