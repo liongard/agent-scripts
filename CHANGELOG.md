@@ -33,6 +33,10 @@ All notable changes to these scripts are documented here.
 - `LGAgentInstall-macOS.sh` now downloads the package itself (`LiongardAgent-lts.pkg` for Intel, `LiongardAgent-lts-arm64.pkg` for Apple Silicon), picked by `sysctl -n hw.optional.arm64` or the new `MAC_ARCHITECTURE` setting, or installs a staged package from the new `PKG_PATH` setting. It checks the download size and the package's Liongard signature and architecture, installs Rosetta 2 only when the Intel package is used on Apple Silicon, checks the installer exit code, verifies the agent's LaunchDaemon afterward, and exits 0 without changes if the agent is already installed and running. The new optional `AGENT_DESCRIPTION` setting is written to `/tmp/liongard_description` only when set, and all six handoff files are deleted before every run (#20).
 - `LGAgentInstall-macOS.sh` now requires root and sets `umask 077`. Before writing, it refuses to run if any of the five `/tmp/liongard_*` handoff files is a symlink or isn't owned by root, and otherwise deletes them. Each value is written to a `mktemp` file set to `root:wheel` and `600`, then moved into place with `mv -f`. All five files are deleted on exit, including on INT and TERM, and the script exits with the installer's status (#19). The script no longer matches the docs-site copy.
 
+### Tests and CI
+
+- Added `tests/` with the proxy-masking tests for EXE Advanced (`Test-ProxyMasking.ps1`), a runner (`Run-Tests.ps1`) and a README. A new blocking `tests` job in the lint workflow runs them on every push and pull request.
+
 ## Initial import (Windows scripts dated 2026-10-10, Linux script dated 2026-06-24)
 
 - Imported the Windows MSI/EXE Simple and Advanced install scripts and the Windows uninstall script, all dated 2026-10-10.

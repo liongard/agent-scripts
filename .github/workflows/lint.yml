@@ -31,6 +31,15 @@ jobs:
       - name: Run ShellCheck
         run: shellcheck linux/*.sh
 
+  # Blocking: the masking tests must pass.
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Run masking tests
+        shell: pwsh
+        run: ./tests/Run-Tests.ps1
+
   gitleaks:
     runs-on: ubuntu-latest
     continue-on-error: true
