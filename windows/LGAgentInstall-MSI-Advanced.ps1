@@ -1,20 +1,28 @@
-#requires -Version 5.1
 <#
-    Liongard Agent deployment script that:
-      • Validates partner-supplied config values.
-      • Resolves the target Liongard environment name via the API.
-      • Downloads the MSI installer and compares its version against any currently installed agent.
-      • Classifies any existing install as Healthy / Stale / NotInstalled. Stale leftovers
-        (folder, orphaned service, stored credentials) are cleaned up before a fresh install;
-        the identity key HKLM\SOFTWARE\WOW6432Node\Liongard is never modified.
-      • Installs the agent when no prior installation is found, or upgrades it when the downloaded
-        version is strictly newer than what is installed.
-      • Validates that the roaragent.exe service is Running and the updater task exists.
-      • Summarizes the result using AgentInstall.log plus transcript logging.
+.SYNOPSIS
+    Installs or upgrades the Liongard Agent from the MSI, checking the environment name through the Liongard API.
 
-    Liongard Partner Support
+.DESCRIPTION
+    Installs the Liongard Agent, or upgrades it when the MSI is newer than the installed agent.
+    Set your values in the "Partner configuration" block below. Exit codes, logs and
+    troubleshooting are in the README under .LINK.
+    - Looks up the environment name through the Liongard API, corrects casing or punctuation, and stops if no match is found.
+    - Checks any existing agent (Healthy, Stale or NotInstalled) and removes Stale leftovers before installing.
+    - Downloads the MSI to a folder only SYSTEM and Administrators can access, and deletes it afterwards.
+    - Confirms the agent service is running and the updater task exists.
+    - Writes a full transcript log of the run.
+
+.NOTES
+    Requires:     Windows PowerShell 5.1 (64-bit), run as SYSTEM or an elevated administrator.
+                  Liongard API token and agent install token (key and secret for each).
+    Author:       Liongard Partner Support
     Last updated: 2026-10-20
+
+.LINK
+    https://github.com/liongard/agent-scripts/blob/main/windows/README.md
 #>
+
+#requires -Version 5.1
 
 # ================================
 # Partner Configuration - Update these values

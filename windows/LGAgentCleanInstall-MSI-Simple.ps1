@@ -1,24 +1,28 @@
-#requires -Version 5.1
 <#
-    Liongard Agent MSI clean install - simplified RMM script (Windows PowerShell 5.1, runs as SYSTEM).
-    Cleans up previous, outdated, incomplete or corrupt Liongard Agent installs before installing,
-    for example an agent uninstalled through an RMM or Programs and Features that is still listed
-    or left its service, folder, installer cache entries or updater task behind.
-    A healthy install is never cleaned up: it is upgraded only when the MSI is newer.
-    No Liongard API calls: the Environment value is passed through to the MSI as-is.
-    Check the GitHub repo (https://github.com/liongard/agent-scripts) for updates to this script.
+.SYNOPSIS
+    Cleans up a broken or partly removed Liongard Agent, then installs from the MSI, without Liongard API calls.
 
-    Based on LGAgentInstall-MSI-Simple.ps1 plus the cleanup steps of LGAgentUninstall.ps1
-    (uninstall entries, Windows Installer cache, updater task). The agent identity key
-    HKLM\SOFTWARE\WOW6432Node\Liongard is never modified, so a reinstall registers as the same agent.
+.DESCRIPTION
+    For endpoints with an old, broken, incomplete or corrupt agent. A healthy agent is never cleaned up; it is upgraded only when the MSI is newer.
+    Set your values in the "Partner configuration" block below. Exit codes, logs and
+    troubleshooting are in the README under .LINK.
+    - Removes broken, incomplete or corrupt installs first by default ($CleanupPreviousAgents = $true; set it to $false to behave like MSI Simple).
+    - Never modifies the agent identity key, so the reinstalled agent registers as the same agent.
+    - Downloads the MSI to a folder only SYSTEM and Administrators can access, and deletes it afterwards.
+    - Passes the environment name to the installer exactly as written.
+    - Confirms the agent service is running and the updater task exists.
 
-    Exit codes: 0 = installed and validated, or already up to date (msiexec 3010/1641 count as success and log a reboot WARN);
-    1618 = another Windows Installer operation was running during cleanup or install, run again later;
-    other non-zero = failure (the msiexec exit code when msiexec itself failed, otherwise 1).
-    Cleanup failures are logged as WARN and do not stop the install: the exit code reflects the install and its validation.
-    An agent update runs once a day around midnight local time; a deployment that overlaps it exits 1 without changes and succeeds on the next run.
+.NOTES
+    Requires:     Windows PowerShell 5.1 (64-bit), run as SYSTEM or an elevated administrator.
+                  Liongard agent install token (key and secret).
+    Author:       Liongard Partner Support
     Last updated: 2026-10-20
+
+.LINK
+    https://github.com/liongard/agent-scripts/blob/main/windows/README.md
 #>
+
+#requires -Version 5.1
 
 # ---- Partner configuration ----
 $LiongardUrl             = "REPLACE_WITH_LIONGARD_URL"        # Full address, e.g. us9.app.liongard.com (short form "us9" also accepted)
