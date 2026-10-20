@@ -1,15 +1,28 @@
-#requires -Version 5.1
 <#
-    Standalone Liongard Agent uninstall script.
-    - Removes the local agent (MSI by discovered ProductCode, registry entries, services,
-      processes, folders, and the agent's Credential Manager entries when run as SYSTEM).
-    - Never modifies the identity key HKLM\SOFTWARE\WOW6432Node\Liongard, so a reinstall
-      re-attaches to the existing platform record.
-    - Optionally deletes the matching Liongard agent record via the API.
+.SYNOPSIS
+    Removes the Liongard Agent from a Windows endpoint.
 
-    Liongard Partner Support
+.DESCRIPTION
+    Uninstalls the Liongard Agent and removes what it leaves behind.
+    Set your values in the "Partner configuration" block below. Exit codes, logs and
+    troubleshooting are in the README under .LINK.
+    - Uninstalls the agent and removes its services, processes, folders and uninstall entries.
+    - Removes the agent's Credential Manager entries when run as SYSTEM.
+    - Never modifies the agent identity key, so a later reinstall re-attaches to the same platform record.
+    - Keeps the agent's record on the Liongard platform by default; set $RemoveAgentFromPlatform = $true to delete the matching record through the API.
+    - Writes a full transcript log of the run.
+
+.NOTES
+    Requires:     Windows PowerShell 5.1 (64-bit), run as SYSTEM or an elevated administrator.
+                  Liongard API token only when $RemoveAgentFromPlatform = $true.
+    Author:       Liongard Partner Support
     Last updated: 2026-10-20
+
+.LINK
+    https://github.com/liongard/agent-scripts/blob/main/windows/README.md
 #>
+
+#requires -Version 5.1
 
 # ================================
 # Partner Configuration - Update these values

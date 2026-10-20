@@ -1,31 +1,28 @@
-#requires -Version 5.1
 <#
-    Liongard Agent deployment script for the EXE-based installer bundle.
+.SYNOPSIS
+    Installs or upgrades the Liongard Agent from the EXE bundle (agent, Visual C++ and Npcap), checking the environment name through the Liongard API.
 
-    The EXE bundle wraps the Liongard Agent MSI, the Visual C++ redistributable, and
-    Npcap, making it the right choice for hosts that will run the Liongard network
-    discovery inspector, which depends on those components.
+.DESCRIPTION
+    For hosts that will run network discovery. Installs the agent, or upgrades it when the bundle is newer.
+    Set your values in the "Partner configuration" block below. Exit codes, logs and
+    troubleshooting are in the README under .LINK.
+    - Looks up the environment name through the Liongard API, corrects casing or punctuation, and stops if no match is found.
+    - Checks any existing agent (Healthy, Stale or NotInstalled) and removes Stale leftovers before installing.
+    - Installs Npcap with the bundle by default ($InstallNpcap = $true); enables network discovery only if $EnableNetworkDiscovery = $true (off by default).
+    - Checks proxy settings before installing, then confirms the service, the updater task and each bundle component.
+    - Downloads the bundle to a folder only SYSTEM and Administrators can access, deletes it afterwards, and writes a transcript log and a JSON run summary.
 
-    The script performs:
-      • Partner configuration validation.
-      • Environment-name resolution against the Liongard API.
-      • Install-state classification (Healthy / Stale / NotInstalled). Stale leftovers
-        (folder, orphaned service, stored credentials) are cleaned up before a fresh
-        install; the identity key HKLM\SOFTWARE\WOW6432Node\Liongard is never modified.
-      • A version gate that installs only when the bundle is newer than a healthy agent
-        already present on the host.
-      • Post-install validation: roaragent.exe Running and the updater task present.
-      • Proxy preflight handling for endpoints that route through a proxy.
-      • Structured transcript logging.
-      • Per-component (Agent / Visual C++ / Npcap) post-install validation.
-      • Optional enablement of network discovery after installation.
-      • A JSON run-summary artifact for RMM ingestion.
-
-    To remove the agent, use the standalone Liongard Agent uninstall script.
-
-    Liongard Partner Support
+.NOTES
+    Requires:     Windows PowerShell 5.1 (64-bit), run as SYSTEM or an elevated administrator.
+                  Liongard API token and agent install token (key and secret for each).
+    Author:       Liongard Partner Support
     Last updated: 2026-10-20
+
+.LINK
+    https://github.com/liongard/agent-scripts/blob/main/windows/README.md
 #>
+
+#requires -Version 5.1
 
 # ================================
 # Partner Configuration - Update these values

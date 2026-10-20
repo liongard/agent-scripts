@@ -1,11 +1,27 @@
 #!/bin/bash
 
-####################################################################################################
-#                                 Liongard Agent Install Script                                    #
-####################################################################################################
-
-# Use this script to install the Liongard Agent. This script allows the setting of improtant
-# environment variables before invoking the installer.
+# SYNOPSIS
+#   Installs the Liongard Agent on macOS (Intel or Apple Silicon).
+#
+# DESCRIPTION
+#   Installs the Liongard Agent and registers it with your Liongard instance.
+#   Set your values in the Variables block below. Exit codes, logs and troubleshooting are in
+#   the README under LINK.
+#   - Exits 0 without changes if the agent is already installed and running.
+#   - Downloads the Intel or Apple Silicon package (or uses PKG_PATH) and checks its size and
+#     Liongard signature.
+#   - Installs Rosetta 2 only when the Intel package is used on Apple Silicon.
+#   - Hands the settings to the package in root-only files in /tmp and deletes them on exit.
+#   - Confirms the agent is running after the install.
+#
+# NOTES
+#   Requires:     root, macOS on Intel or Apple Silicon.
+#                 Liongard agent install token (key and secret).
+#   Author:       Liongard Partner Support
+#   Last updated: 2026-10-20
+#
+# LINK
+#   https://github.com/liongard/agent-scripts/blob/main/macos/README.md
 
 ####################################################################################################
 #                                          Variables                                               #

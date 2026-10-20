@@ -1,8 +1,29 @@
 #!/usr/bin/env bash
 #
-# ============================================================
-# Liongard Agent – Linux Deployment Script
-# ============================================================
+# SYNOPSIS
+#   Installs the Liongard Agent on Linux (.deb, .rpm, .run or .sh installer).
+#
+# DESCRIPTION
+#   Installs the Liongard Agent and registers it with your Liongard instance.
+#   Set your values in sections A and B of the configuration block below. Exit codes, logs
+#   and troubleshooting are in the README under LINK.
+#   - Checks prerequisites and picks the x64 or arm64 installer.
+#   - Removes any existing agent first by default (ENABLE_PRE_UNINSTALL=true; set it to false
+#     to skip, and an installed agent is then left as it is). The platform record is kept
+#     unless REMOVE_AGENT_FROM_PLATFORM=true.
+#   - Matches the environment name through the Liongard API by default
+#     (ENABLE_ENVIRONMENT_MATCHING=true) and checks for machine-ID collisions.
+#   - Downloads the installer to a private temporary folder and installs it.
+#   - Confirms the agent service is running.
+#
+# NOTES
+#   Requires:     root, Bash 4+, curl or wget, and jq for environment matching or platform removal.
+#                 Liongard API token and agent install token (key and secret for each).
+#   Author:       Liongard Partner Support
+#   Last updated: 2026-10-20
+#
+# LINK
+#   https://github.com/liongard/agent-scripts/blob/main/linux/README.md
 
 # Abort on unset variables and propagate pipeline failures.
 # Individual functions use explicit || handling for expected non-zero returns.
@@ -112,46 +133,6 @@ MINIMUM_INSTALLER_BYTES=10240   # 10 KB; raise to 1048576 for large packages
 
 # Number of download attempts before giving up.
 MAX_DOWNLOAD_ATTEMPTS=3
-
-# ============================================================
-# USAGE
-#   sudo bash LGAgentInstall-Linux.sh
-#
-# DESCRIPTION
-#   Linux-native equivalent of the Liongard Windows PowerShell
-#   agent deployment script. High-level workflow:
-#     1.  Validate partner configuration.
-#     2.  Check prerequisites and detect the Linux distribution.
-#     3.  Optionally remove any existing Liongard Agent.
-#     4.  Optionally delete the matching platform record via API.
-#     5.  Resolve the environment name against the Liongard API.
-#     6.  Query the Liongard API for machine-ID collisions and
-#         generate a DEVICEID override when needed.
-#     7.  Download and install the appropriate package (deb/rpm/sh).
-#     8.  Validate the installation and report results.
-#
-# PREREQUISITES
-#   - Must run as root (or via sudo).
-#   - curl or wget must be present.
-#   - jq is required when EnableEnvironmentMatching=true or
-#     RemoveAgentFromPlatform=true.
-#   - Tested targets: Ubuntu 20.04+, Debian 10+, RHEL/Rocky/Alma 8+,
-#     CentOS 7+, Amazon Linux 2, SUSE 15+, Fedora 36+.
-#   - Requires Bash 4.0+ (all targets above ship with 4.2+).
-#
-# EXIT CODES
-#   0  – Success (installed, or agent already present + pre-uninstall off)
-#   1  – Generic / unexpected failure
-#   2  – Missing or invalid required configuration
-#   3  – Missing prerequisites
-#   4  – API or environment resolution failure
-#   5  – Installer download failed
-#   6  – Install command failed
-#   7  – Install completed but post-install validation failed
-#   8  – Pre-uninstall failed or agent still detected afterward
-#
-# Liongard Partner Support
-# ============================================================
 
 # ============================================================
 # INSTALLER PARAMETER MAPPING — internal, not partner configuration

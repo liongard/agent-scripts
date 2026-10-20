@@ -1,20 +1,28 @@
-#requires -Version 5.1
 <#
-    Liongard Agent EXE bundle install - simplified RMM script (Windows PowerShell 5.1, runs as SYSTEM).
-    The bundle installs the agent MSI, the Visual C++ redistributable and (optionally) Npcap, and this
-    script can enable network discovery in network_discovery.yml afterwards.
-    No Liongard API calls: the Environment value is passed through to the installer as-is.
+.SYNOPSIS
+    Installs or upgrades the Liongard Agent from the EXE bundle (agent, Visual C++ and Npcap), without Liongard API calls.
 
-    REFERENCE BEHAVIOR: the "Liongard install-state functions" shared block in
-    LGAgentInstall-MSI-Advanced.ps1, LGAgentInstall-EXE-Advanced.ps1 and LGAgentUninstall.ps1.
-    This script re-implements the same rules compactly (product detection by DisplayName,
-    Healthy/Stale/NotInstalled classification, stale cleanup, Credential Manager cleanup,
-    identity-key guard, post-install validation). Update it whenever that block changes.
+.DESCRIPTION
+    For hosts that will run network discovery. Installs the agent, or upgrades it when the bundle is newer.
+    Set your values in the "Partner configuration" block below. Exit codes, logs and
+    troubleshooting are in the README under .LINK.
+    - Checks any existing agent (Healthy, Stale or NotInstalled) and removes Stale leftovers before installing.
+    - Installs Npcap with the bundle by default ($InstallNpcap = $true).
+    - Downloads the bundle to a folder only SYSTEM and Administrators can access, and deletes it afterwards.
+    - Passes the environment name to the installer exactly as written.
+    - Confirms the agent service is running and the updater task exists, then enables network discovery only if $EnableNetworkDiscovery = $true (off by default).
 
-    Exit codes: 0 = installed and validated, or already up to date; non-zero = failure
-    (the installer exit code when the installer itself failed, otherwise 1).
+.NOTES
+    Requires:     Windows PowerShell 5.1 (64-bit), run as SYSTEM or an elevated administrator.
+                  Liongard agent install token (key and secret).
+    Author:       Liongard Partner Support
     Last updated: 2026-10-20
+
+.LINK
+    https://github.com/liongard/agent-scripts/blob/main/windows/README.md
 #>
+
+#requires -Version 5.1
 
 # ---- Partner configuration ----
 $InstancePrefix          = "REPLACE_WITH_INSTANCE_PREFIX"     # e.g. us1, us2, eu1

@@ -6,6 +6,7 @@ All notable changes to these scripts are documented here.
 
 ### All scripts
 
+- Docs: the main README is now an overview with a "Which script do I use?" table, and `windows/README.md`, `linux/README.md` and `macos/README.md` hold the settings, RMM and MDM guidance, exit codes, logs and troubleshooting. Every script header now uses one short layout (synopsis, description, notes, link). In the Windows scripts the help block comes before `#requires -Version 5.1`, so `Get-Help` reads it. No behavior changes (#39).
 - Fixed stale filenames in script comments, replaced the author line with "Liongard Partner Support", made EXE Advanced `exit 0` on success, and corrected the README settings and Quick start (#14).
 
 ### Windows
