@@ -86,7 +86,7 @@ All Windows logs are written to `LiongardDeploy`. Each run's log names carry a t
 | macOS | `/tmp/liongard-agent-installer.log` (the package's log, root-only); `installer` also logs to `/var/log/install.log` |
 | Linux | `LOG_DIRECTORY` (default `/var/log/liongard-agent`, created root-only): `LGAgentScript_<timestamp>.log` |
 
-After the installer exits, the scripts redact the installer logs in place, whether the install succeeded or failed. They mask the access key and secret values and any `ACCESSKEY`/`ACCESSSECRET` property. If a log can't be redacted, the script deletes it and says so.
+After the installer exits, the scripts redact the installer logs in place, whether the install succeeded or failed. They mask the access key and secret values, any `ACCESSKEY`/`ACCESSSECRET` property, and proxy credentials (`user:****@host`, including `ProxyUrl=` values and passwords that contain `@`). If a log can't be redacted, the script deletes it and says so.
 
 Logs can still contain sensitive details. Check them before sharing them.
 

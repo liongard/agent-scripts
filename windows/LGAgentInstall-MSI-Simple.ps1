@@ -11,7 +11,7 @@
 
     Exit codes: 0 = installed and validated, or already up to date; non-zero = failure
     (the msiexec exit code when msiexec itself failed, otherwise 1).
-    Last updated: 2026-10-15
+    Last updated: 2026-10-20
 #>
 
 # ---- Partner configuration ----
@@ -79,6 +79,9 @@ $script:LiongardSystemSid     = 'S-1-5-18'
 $script:LiongardAdminsSid     = 'S-1-5-32-544'
 $script:LiongardLegacyFolder  = 'C:\Liongard'
 $script:LiongardSecretPattern = '(?i)(ACCESS(KEY|SECRET)\S*\s*[=:]\s*)("[^"]*"|\S+)'
+# user:pass@ in proxy values (any scheme or none). The last @ before the host is the separator, so a
+# raw @ in the password is masked too; the password stops at /, whitespace, comma, semicolon or ".
+$script:LiongardProxyCredentialPattern = '(?<user>[^:/@\s,;="]+):[^/\s,;"]*@'
 $script:LiongardLogRetention  = @(
     '^AgentInstall_(\d{8}_\d{6})(_.+)?\.log$',
     '^StaleUninstall_[0-9A-Fa-f-]+_(\d{8}_\d{6})\.log$',
@@ -98,15 +101,15 @@ function Write-LiongardDeployLog {
 }
 
 function Hide-LiongardSecretText {
-    # The one masking rule for every script: masks ACCESSKEY/ACCESSSECRET-style values, then any
-    # literal key or secret registered for this run.
+    # The one masking rule for every script: masks proxy credentials (user:****@host),
+    # ACCESSKEY/ACCESSSECRET-style values, then any literal key or secret registered for this run.
     param(
         [AllowNull()][string]$Text,
         [string[]]$Secret = $script:LiongardDeploy.Secrets
     )
 
     if ([string]::IsNullOrEmpty($Text)) { return $Text }
-    $result = $Text -replace $script:LiongardSecretPattern, '$1****'
+    $result = ($Text -replace $script:LiongardProxyCredentialPattern, '${user}:****@') -replace $script:LiongardSecretPattern, '$1****'
     foreach ($value in @($Secret)) {
         if (-not [string]::IsNullOrEmpty($value) -and $value.Length -ge 4) { $result = $result.Replace($value, '****') }
     }

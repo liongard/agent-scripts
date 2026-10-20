@@ -10,8 +10,10 @@ foreach ($name in 'Hide-ProxyCredential', 'Mask-ProxyValue', 'Hide-LiongardSecre
     if (-not $fn) { throw "Function $name not found in $Script" }
     Invoke-Expression $fn.Extent.Text
 }
-$pattern = $ast.FindAll({ param($a) $a -is [System.Management.Automation.Language.AssignmentStatementAst] -and $a.Left.Extent.Text -eq '$script:LiongardSecretPattern' }, $true) | Select-Object -First 1
-Invoke-Expression $pattern.Extent.Text
+# The masking patterns ($script:LiongardSecretPattern, $script:LiongardProxyCredentialPattern).
+$patterns = @($ast.FindAll({ param($a) $a -is [System.Management.Automation.Language.AssignmentStatementAst] -and $a.Left.Extent.Text -match '^\$script:Liongard\w*Pattern$' }, $true))
+if ($patterns.Count -lt 2) { throw "Masking patterns not found in $Script" }
+foreach ($pattern in $patterns) { Invoke-Expression $pattern.Extent.Text }
 $script:LiongardDeploy = @{ Secrets = @('SuperSecret99', 'AKID1234') }
 
 $cases = @(
