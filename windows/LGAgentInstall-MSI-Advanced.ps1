@@ -791,6 +791,9 @@ $script:LiongardLogRetention  = @(
 )
 
 function Write-LiongardDeployLog {
+    # Write-Host on purpose: RMM consoles capture the host stream, and output here must not
+    # leak into function return values.
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSAvoidUsingWriteHost', '')]
     param([string]$Message)
 
     Write-Host "[LiongardDeploy] $Message"
