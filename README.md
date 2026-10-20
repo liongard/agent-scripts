@@ -17,7 +17,7 @@ These standalone scripts install, upgrade and uninstall the Liongard Agent, and 
 | `windows/LGAgentInstall-EXE-Advanced.ps1` | Windows | EXE bundle (Agent + VC++ + Npcap) | Advanced | Liongard API token **and** agent install token |
 | `windows/LGAgentUninstall.ps1` | Windows | — | Uninstall | None. You need an API token only when `$RemoveAgentFromPlatform = $true` |
 | `linux/LGAgentInstall-Linux.sh` | Linux | `.run` / `.deb` / `.rpm` / `.sh` | Advanced | Liongard API token **and** agent install token |
-| `macos/LGAgentInstall-macOS.sh` | macOS | `.pkg` (`Liongard-lts.pkg`, supplied alongside the script) | Simple | Agent install token only (`ACCESS_KEY_ID`, `ACCESS_KEY_SECRET`). See [macos/README.md](macos/README.md) |
+| `macos/LGAgentInstall-macOS.sh` | macOS | `.pkg` (`LiongardAgent-lts.pkg` for Intel or `LiongardAgent-lts-arm64.pkg` for Apple Silicon, downloaded by the script or staged locally) | Simple | Agent install token only (`ACCESS_KEY_ID`, `ACCESS_KEY_SECRET`). See [macos/README.md](macos/README.md) |
 
 - **Simple** scripts make no Liongard API calls. They pass the environment name to the installer exactly as written.
 - **MSI Simple + cleanup** (`LGAgentCleanInstall-MSI-Simple.ps1`) is for endpoints with an old, broken, incomplete or corrupt agent. Before it installs, it removes the previous install: the service, uninstall entries, Windows Installer registration, the updater task and the install folder. It never cleans up a healthy agent; it only upgrades one when the MSI is newer. The identity key `HKLM\SOFTWARE\WOW6432Node\Liongard` is never modified, so the reinstalled agent registers as the same agent. It takes `$LiongardUrl` (for example `us9.app.liongard.com` or `us9`) instead of `$InstancePrefix`. Set `$CleanupPreviousAgents = $false` to make it behave like MSI Simple.
@@ -31,7 +31,7 @@ These standalone scripts install, upgrade and uninstall the Liongard Agent, and 
 3. Deploy it from your RMM:
    - Windows: run as **SYSTEM** in Windows PowerShell 5.1.
    - Linux: run as **root**, e.g. `sudo bash LGAgentInstall-Linux.sh`.
-   - macOS: run as **root** with `Liongard-lts.pkg` in the same folder, e.g. `sudo ./LGAgentInstall-macOS.sh`. See [macos/README.md](macos/README.md).
+   - macOS: run as **root**, e.g. `sudo ./LGAgentInstall-macOS.sh`. The script downloads the right package for Intel or Apple Silicon. See [macos/README.md](macos/README.md).
 4. Check the exit code and the logs.
 
 ## Configuration
@@ -55,6 +55,7 @@ You can skip the environment name if you set `$IncludeEnvironmentValue = $false`
 - **EXE (Simple and Advanced):** `$EnableNetworkDiscovery`, `$InstallNpcap`, `$EulaAccepted`, `$SuppressRestart`, `$PassiveMode`, `$ProxyUrl`, `$ClearProxyEnvironmentForInstaller`, `$AutoUpdate`.
 - **EXE Advanced only:** `$InstallerFileName` (a file name only), `$AutoUpdateArgumentName`. `$InstallerLogPath` is deprecated and ignored.
 - **Uninstall:** `$RemoveAgentFromPlatform`, `$MinimumRemoteDeletionScore`, `$LogFolder` (default `$env:ProgramData`, same rules as `$Folder`).
+- **macOS:** `NAME`, `ENVIRONMENT`, `AGENT_DESCRIPTION` (new installs only), `MAC_ARCHITECTURE`, `PKG_PATH`. See [macos/README.md](macos/README.md).
 - **Linux (section B):** `INCLUDE_ENVIRONMENT_VALUE`, `ENABLE_ENVIRONMENT_MATCHING`, `ENABLE_PRE_UNINSTALL`, `REMOVE_AGENT_FROM_PLATFORM`, `AGENT_DESCRIPTION`, `LOG_DIRECTORY`, `LINUX_ARCHITECTURE` (`auto`, `x64` or `arm64`; `auto` picks the installer from `uname -m`), `INSTALLER_URL` (leave empty to use the LTS installer for the architecture), `INSTALLER_FILE_NAME`. `DOWNLOAD_DIRECTORY` is deprecated and no longer used: the installer now downloads to a private temporary folder that is deleted when the script exits. If it is set, the script logs a warning and carries on. It will be removed in a later release. Leave section C alone unless Liongard Support asks you to change it. Section C includes `MINIMUM_REMOTE_DELETION_SCORE` (default `50`), the minimum match score a platform record needs before `REMOVE_AGENT_FROM_PLATFORM=true` deletes it.
 
 ## Working folder
@@ -81,6 +82,7 @@ All Windows logs are written to `LiongardDeploy`. The exception is `LGAgentClean
 | MSI Advanced | `LGAgentScript_<timestamp>.log` (transcript) |
 | EXE Advanced | `LGAgentScript_EXE_<timestamp>.log`, `LGAgentSummary_<timestamp>.json` |
 | Uninstall | `LGAgentUninstall_<timestamp>.log` |
+| macOS | `/tmp/liongard-agent-installer.log` (the package's log, root-only); `installer` also logs to `/var/log/install.log` |
 | Linux | `LOG_DIRECTORY` (default `/var/log/liongard-agent`, created root-only): `LGAgentScript_<timestamp>.log` |
 
 After the installer exits, the scripts redact the installer logs in place, whether the install succeeded or failed. They mask the access key and secret values and any `ACCESSKEY`/`ACCESSSECRET` property. If a log can't be redacted, the script deletes it and says so.
