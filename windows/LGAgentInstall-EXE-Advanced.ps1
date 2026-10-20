@@ -1611,11 +1611,13 @@ function Mask-SecretValue {
 
 function Hide-ProxyCredential {
     # Replaces the password in every user:pass@ pair with ****, whatever the scheme
-    # (http, https, socks5) or with no scheme at all (user:pass@host:port).
+    # (http, https, socks5) or with no scheme at all (user:pass@host:port). The last @ before
+    # the host is the separator, so a raw @ in the password (p@ss) is masked too. The password
+    # stops at /, whitespace, comma, semicolon or a double quote.
     param([AllowNull()][string]$Text)
 
     if ([string]::IsNullOrEmpty($Text)) { return $Text }
-    return ($Text -replace '(?<user>[^:/@\s,;="]+):[^@/\s,;"]*@', '${user}:****@')
+    return ($Text -replace '(?<user>[^:/@\s,;="]+):[^/\s,;"]*@', '${user}:****@')
 }
 
 function Mask-ProxyValue {
