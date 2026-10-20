@@ -38,29 +38,103 @@ ENVIRONMENT=
 # will unset these environment variables. DO NOT MODIFY the script beyond this point. If the
 # installation is not working, please contact Liongard support.
 
+# The .pkg postinstall reads these five fixed paths, so every run clears them (refusing
+# symlinks and files not owned by root), writes them root-only, and deletes them on exit.
+LG_FILES=(
+  /tmp/liongard_instance_url
+  /tmp/liongard_access_key_id
+  /tmp/liongard_access_key_secret
+  /tmp/liongard_name
+  /tmp/liongard_environment
+)
+LG_TMP=""
+
+if [ "$EUID" -ne 0 ]
+then
+  echo "ERROR: run this script as root (for example with sudo)." >&2
+  exit 1
+fi
+
+umask 077
+
+for f in "${LG_FILES[@]}"
+do
+  if [ -L "$f" ]
+  then
+    echo "ERROR: $f is a symlink. Refusing to continue; investigate and remove it as root." >&2
+    exit 1
+  fi
+  if [ -e "$f" ] && [ ! -O "$f" ]
+  then
+    echo "ERROR: $f exists and is not owned by root. Refusing to continue; investigate and remove it as root." >&2
+    exit 1
+  fi
+  if ! rm -f "$f" || [ -e "$f" ]
+  then
+    echo "ERROR: could not remove existing $f." >&2
+    exit 1
+  fi
+done
+
+# shellcheck disable=SC2329 # Invoked from the traps below.
+lg_cleanup() {
+  if [ -n "$LG_TMP" ]
+  then
+    rm -f "$LG_TMP"
+  fi
+  rm -f "${LG_FILES[@]}"
+}
+trap 'lg_cleanup' EXIT
+trap 'lg_cleanup; trap - EXIT; exit 130' INT
+trap 'lg_cleanup; trap - EXIT; exit 143' TERM
+
+# Writes $1 to a new root-only temp file, then renames it onto $2. rename(2) replaces a
+# planted symlink instead of following it.
+lg_write() {
+  if [ -e "$2" ] || [ -L "$2" ]
+  then
+    echo "ERROR: $2 appeared after the pre-run cleanup. Refusing to continue." >&2
+    exit 1
+  fi
+  LG_TMP=$(mktemp /tmp/liongard.XXXXXXXX) || { echo "ERROR: mktemp failed." >&2; exit 1; }
+  if ! echo "$1" > "$LG_TMP" || ! chown root:wheel "$LG_TMP" || ! chmod 600 "$LG_TMP" || ! mv -f "$LG_TMP" "$2"
+  then
+    echo "ERROR: could not write $2." >&2
+    exit 1
+  fi
+  LG_TMP=""
+  if [ -L "$2" ] || [ ! -f "$2" ] || [ ! -O "$2" ]
+  then
+    echo "ERROR: $2 is not a root-owned regular file after writing." >&2
+    exit 1
+  fi
+}
+
 if [ -n "$INSTANCE_URL" ]
 then
-  echo "${INSTANCE_URL}" > /tmp/liongard_instance_url
+  lg_write "${INSTANCE_URL}" /tmp/liongard_instance_url
 fi
 
 if [ -n "$ACCESS_KEY_ID" ]
 then
-  echo "${ACCESS_KEY_ID}" > /tmp/liongard_access_key_id
+  lg_write "${ACCESS_KEY_ID}" /tmp/liongard_access_key_id
 fi
 
 if [ -n "$ACCESS_KEY_SECRET" ]
 then
-  echo "${ACCESS_KEY_SECRET}" > /tmp/liongard_access_key_secret
+  lg_write "${ACCESS_KEY_SECRET}" /tmp/liongard_access_key_secret
 fi
 
 if [ -n "$NAME" ]
 then
-  echo "${NAME}" > /tmp/liongard_name
+  lg_write "${NAME}" /tmp/liongard_name
 fi
 
 if [ -n "$ENVIRONMENT" ]
 then
-  echo "${ENVIRONMENT}" > /tmp/liongard_environment
+  lg_write "${ENVIRONMENT}" /tmp/liongard_environment
 fi
 
 installer -pkg Liongard-lts.pkg -target /
+status=$?
+exit "$status"
