@@ -4,7 +4,7 @@
     No Liongard API calls: the Environment value is passed through to the MSI as-is.
 
     REFERENCE BEHAVIOR: the "Liongard install-state functions" shared block in
-    LGAgentInstall_MSI_Advanced_20261010.ps1, LGAgentInstall_EXE_Advanced_20261010.ps1 and LGAgentUninstall_20261010.ps1.
+    LGAgentInstall-MSI-Advanced.ps1, LGAgentInstall-EXE-Advanced.ps1 and LGAgentUninstall.ps1.
     This script re-implements the same rules compactly (product detection by DisplayName,
     Healthy/Stale/NotInstalled classification, stale cleanup, Credential Manager cleanup,
     identity-key guard, post-install validation). Update it whenever that block changes.

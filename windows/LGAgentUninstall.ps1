@@ -7,7 +7,7 @@
       re-attaches to the existing platform record.
     - Optionally deletes the matching Liongard agent record via the API.
 
-    Written by David Chapman, Manager of Partner Support.
+    Liongard Partner Support
     Last updated: 2026-10-10
 #>
 
@@ -34,7 +34,7 @@ function Assert-ConfigurationValue {
 
 # ====================================================================
 # BEGIN SHARED BLOCK: Liongard install-state functions
-# Keep this block identical across LGAgentInstall_MSI_Advanced, LGAgentInstall_EXE_Advanced
+# Keep this block identical across LGAgentInstall-MSI-Advanced, LGAgentInstall-EXE-Advanced
 # and LGAgentUninstall. Edit one copy, then copy it to the other scripts.
 # ====================================================================
 

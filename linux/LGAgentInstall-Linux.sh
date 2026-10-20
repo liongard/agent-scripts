@@ -103,7 +103,7 @@ MAX_DOWNLOAD_ATTEMPTS=3
 
 # ============================================================
 # USAGE
-#   sudo bash LGAgentScript_linux_20260624.sh
+#   sudo bash LGAgentInstall-Linux.sh
 #
 # DESCRIPTION
 #   Linux-native equivalent of the Liongard Windows PowerShell
@@ -138,7 +138,7 @@ MAX_DOWNLOAD_ATTEMPTS=3
 #   7  – Install completed but post-install validation failed
 #   8  – Pre-uninstall failed or agent still detected afterward
 #
-# Written by David Chapman, Manager of Partner Support.
+# Liongard Partner Support
 # ============================================================
 
 # ============================================================
