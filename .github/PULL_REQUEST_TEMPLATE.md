@@ -5,6 +5,7 @@
 ## Scripts affected
 
 - [ ] windows/LGAgentInstall-MSI-Simple.ps1
+- [ ] windows/LGAgentCleanInstall-MSI-Simple.ps1
 - [ ] windows/LGAgentInstall-MSI-Advanced.ps1
 - [ ] windows/LGAgentInstall-EXE-Simple.ps1
 - [ ] windows/LGAgentInstall-EXE-Advanced.ps1
