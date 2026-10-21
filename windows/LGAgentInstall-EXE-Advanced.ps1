@@ -1901,11 +1901,14 @@ function Resolve-LiongardEnvironmentName {
 function New-LiongardEnvironment {
     # Creates an environment (POST /api/v1/environments, body {"Name": ...}). Returns the created
     # environment's name, or $null on failure. The API token needs permission to create environments.
+    [CmdletBinding(SupportsShouldProcess)]
     param(
         [Parameter(Mandatory)][string]$InstancePrefix,
         [Parameter(Mandatory)][hashtable]$Headers,
         [Parameter(Mandatory)][string]$Name
     )
+
+    if (-not $PSCmdlet.ShouldProcess($InstancePrefix, "Create environment '$Name'")) { return $null }
 
     $uri  = "https://$InstancePrefix.app.liongard.com/api/v1/environments"
     $body = [System.Text.Encoding]::UTF8.GetBytes((@{ Name = $Name } | ConvertTo-Json -Compress))
@@ -3057,12 +3060,12 @@ try {
             else {
                 $createdEnvironment = $null
                 if ($CreateEnvironmentIfMissing) {
-                    Write-Host ("Environment '{0}' was not found in Liongard (Reason: {1}). Creating it (CreateEnvironmentIfMissing)." -f $Environment, $reasonLabel)
+                    Write-Output ("Environment '{0}' was not found in Liongard (Reason: {1}). Creating it (CreateEnvironmentIfMissing)." -f $Environment, $reasonLabel)
                     $createdEnvironment = New-LiongardEnvironment -InstancePrefix $instancePrefix -Headers $headers -Name $Environment.Trim()
                 }
 
                 if ($createdEnvironment) {
-                    Write-Host ("Created environment in Liongard: '{0}'." -f $createdEnvironment)
+                    Write-Output ("Created environment in Liongard: '{0}'." -f $createdEnvironment)
                     $script:EnvironmentResolutionReason = 'Created'
                     $environmentCreated = $true
                     $Environment = $createdEnvironment
