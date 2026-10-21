@@ -6,8 +6,7 @@
     For endpoints with an old, broken, incomplete or corrupt agent. A healthy agent is never cleaned up; it is upgraded only when the MSI is newer.
     Set your values in the "Partner configuration" block below. Exit codes, logs and
     troubleshooting are in the README under .LINK.
-    - Removes broken, incomplete or corrupt installs first by default ($CleanupPreviousAgents = $true; set it to $false to behave like MSI Simple).
-    - Reinstalls an agent whose last 3 heartbeats the platform refused (HTTP 401, for example after it was deleted in the Liongard UI); network errors never count.
+    - Removes broken, incomplete or corrupt installs first by default ($CleanupPreviousAgents = $true; set it to $false to behave like MSI Simple). This includes an agent whose last 3 heartbeats the platform refused (HTTP 401, for example after it was deleted in the Liongard UI); network errors never count.
     - Never modifies the agent identity key, so the reinstalled agent registers as the same agent.
     - Downloads the MSI to a folder only SYSTEM and Administrators can access, and deletes it afterwards.
     - Passes the environment name to the installer exactly as written.
