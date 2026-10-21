@@ -48,11 +48,11 @@ These are the install script's settings. The uninstall script has none. Set them
 
 ### Required
 
-For a new install, the script stops if any of these is blank.
+The script ships with `REPLACE_WITH_*` placeholders for these. For a new install, it stops with exit code `1` if any of them is blank or still a placeholder, and names the missing values. If `/Library/Liongard/.config.json` already exists, they aren't needed.
 
 | Setting | Notes |
 |---|---|
-| `INSTANCE_URL` | Your instance address, for example `us1.app.liongard.com`. |
+| `INSTANCE_URL` | Your instance: `us1`, `us1.app.liongard.com` or `https://us1.app.liongard.com` (any case; `http://`, a trailing slash or path and surrounding spaces are fine). The script passes it to the package as `us1.app.liongard.com`. It stops with exit code `1` if the value contains `?`, `*`, `[` or `]`, or isn't a Liongard instance. |
 | `ACCESS_KEY_ID`, `ACCESS_KEY_SECRET` | Agent install token. |
 
 ### Optional
@@ -65,7 +65,7 @@ For a new install, the script stops if any of these is blank.
 | `MAC_ARCHITECTURE` | `auto` | `auto` picks the package for the Mac's CPU. `x64` or `arm64` forces one. Ignored when `PKG_PATH` is set, because the package's own architecture is used. |
 | `PKG_PATH` | None | Full path to a `.pkg` already on the Mac, for example one your MDM staged. The script installs it instead of downloading. |
 
-`NAME`, `ENVIRONMENT` and `AGENT_DESCRIPTION` apply only to a new install. The package skips registration when `/Library/Liongard/.config.json` already exists, so changing them and running the script again doesn't change an existing agent.
+`NAME`, `ENVIRONMENT` and `AGENT_DESCRIPTION` are blank by default. Leave them blank if you don't use them: the script stops with exit code `1` if one starts with `REPLACE_WITH_`. They apply only to a new install. The package skips registration when `/Library/Liongard/.config.json` already exists, so changing them and running the script again doesn't change an existing agent.
 
 ## Running through an RMM or MDM
 
@@ -113,7 +113,9 @@ Logs can contain sensitive details, so check them before you share them.
 | Message or symptom | What to do |
 |---|---|
 | `run this script as root` | Run it as root. |
-| `INSTANCE_URL, ACCESS_KEY_ID and ACCESS_KEY_SECRET are required for a new install` | Fill in the required settings. |
+| `<settings> must be set for a new install` | Fill in the named settings, replacing the `REPLACE_WITH_*` placeholders. |
+| `INSTANCE_URL '<value>' contains a placeholder character` or `is not a Liongard instance` | Set `INSTANCE_URL` to your instance, for example `us1.app.liongard.com`. |
+| `<setting> is still set to a REPLACE_WITH_* placeholder` | Set a value for that optional setting or leave it blank. |
 | The script exits `0`, but the name, environment or description didn't change | Expected. Settings apply only to a new install. See [Settings](#settings). |
 | The download or the size, signature or architecture check fails | Check HTTPS access to `agents.static.liongard.com`, or check the package at `PKG_PATH`. Don't install a package that fails the signature check. |
 | Rosetta 2 install fails on Apple Silicon | Leave `MAC_ARCHITECTURE=auto` to use the Apple Silicon package, which doesn't need Rosetta. |
