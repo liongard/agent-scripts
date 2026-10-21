@@ -7,6 +7,7 @@
     Set your values in the "Partner configuration" block below. Exit codes, logs and
     troubleshooting are in the README under .LINK.
     - Removes broken, incomplete or corrupt installs first by default ($CleanupPreviousAgents = $true; set it to $false to behave like MSI Simple).
+    - Reinstalls an agent whose last 3 heartbeats the platform refused (HTTP 401, for example after it was deleted in the Liongard UI); network errors never count.
     - Never modifies the agent identity key, so the reinstalled agent registers as the same agent.
     - Downloads the MSI to a folder only SYSTEM and Administrators can access, and deletes it afterwards.
     - Passes the environment name to the installer exactly as written.
@@ -16,7 +17,7 @@
     Requires:     Windows PowerShell 5.1 (64-bit), run as SYSTEM or an elevated administrator.
                   Liongard agent install token (key and secret).
     Author:       Liongard Partner Support
-    Last updated: 2026-10-20
+    Last updated: 2026-10-21
 
 .LINK
     https://github.com/liongard/agent-scripts/blob/main/windows/README.md
@@ -545,7 +546,17 @@ function Test-LGUpdating {   # Agent self-update in progress: updater process, o
     if (Get-Process LiongardAgentUpdater -ErrorAction SilentlyContinue) { return $true }
     try { $ts = New-Object -ComObject Schedule.Service; $ts.Connect(); $ts.GetFolder('\').GetTask($Task).State -eq 4 } catch { $false }
 }
-function Get-LGState {   # (b) Healthy = entry + service + binary + Running + MSI registration; NotInstalled = no remnant at all; Updating = mid-update; else Stale.
+function Test-LGHeartbeatRejected($Folders) {   # Platform refuses this agent (e.g. deleted in the UI): its last 3 heartbeat results in AgentSVCLog.txt are all HTTP 401. Network errors have no status code and never match; a missing or unreadable log counts as not rejected.
+    foreach ($dir in @($Folders)) {
+        $log = Join-Path $dir 'AgentSVCLog.txt'
+        if (-not (Test-Path -LiteralPath $log -PathType Leaf)) { continue }
+        try { $lines = @(Get-Content -LiteralPath $log -Tail 500 -ErrorAction Stop) } catch { continue }
+        $hb = @($lines | Where-Object { $_ -match '"caller":"http/heartbeat\.go' } | Select-Object -Last 3)
+        if ($hb.Count -eq 3 -and @($hb | Where-Object { $_ -match '"status_code":401\b' }).Count -eq 3) { return $true }
+    }
+    $false
+}
+function Get-LGState {   # (b) Healthy = entry + service + binary + Running + MSI registration + heartbeats not rejected (401); NotInstalled = no remnant at all; Updating = mid-update; else Stale.
     if ((Get-LGServiceInfo).Status -ne 'Running' -and (Test-LGUpdating)) {   # Never classify (or clean up) an install that is mid-update.
         Write-LGLog 'Agent service is not running and an agent update is in progress; waiting up to 2 minutes.'
         $deadline = (Get-Date).AddMinutes(2); do { Start-Sleep -Seconds 10 } while ((Test-LGUpdating) -and (Get-Date) -lt $deadline)
@@ -565,7 +576,8 @@ function Get-LGState {   # (b) Healthy = entry + service + binary + Running + MS
     $missing = @(([ordered]@{ 'no Programs and Features entry' = $p.Count; 'service not registered' = $s.Exists; "service binary missing [$($s.Binary)]" = $s.BinaryExists
                               "service not running$(if ($tried) { ' after a 30-second start attempt' }) (status: $(if ($s.Status) { $s.Status } else { 'none' }))" = ($s.Status -eq 'Running')
                               "not registered with Windows Installer [$($codes -join ', ')]" = $registered
-                              "Windows Installer cached package missing [$($uncached -join ', ')]" = (-not $uncached.Count) }).GetEnumerator() | Where-Object { -not $_.Value } | ForEach-Object Key)
+                              "Windows Installer cached package missing [$($uncached -join ', ')]" = (-not $uncached.Count)
+                              'platform rejected the last 3 heartbeats (HTTP 401 in AgentSVCLog.txt)' = (-not (Test-LGHeartbeatRejected $f)) }).GetEnumerator() | Where-Object { -not $_.Value } | ForEach-Object Key)
     $found = @(([ordered]@{ 'uninstall entry' = $p.Count; 'service' = $s.Exists; 'install folder' = $f.Count; 'LiongardInc folder' = $r.Count; 'installer cache entry' = $c.Count; 'updater task' = $t }).GetEnumerator() | Where-Object { $_.Value } | ForEach-Object Key)
     $state = if (-not $missing.Count) { 'Healthy' } elseif (-not $found.Count) { 'NotInstalled' } elseif (Test-LGUpdating) { 'Updating' } else { 'Stale' }
     $reason = "found [$($found -join ', ')]; healthy check failed: $($missing -join '; ')"
