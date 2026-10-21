@@ -49,7 +49,7 @@ These are the install script's settings. The uninstall script has none. The conf
 
 | Setting | Notes |
 |---|---|
-| `INSTANCE_PREFIX` | Your instance: `us1`, `us1.app.liongard.com` or `https://us1.app.liongard.com`. Replace the `us?` placeholder. |
+| `INSTANCE_PREFIX` | Your instance: `us1`, `us1.app.liongard.com` or `https://us1.app.liongard.com` (any case; `http://`, a trailing slash or path and surrounding spaces are fine). Replace the `REPLACE_WITH_INSTANCE_PREFIX` placeholder. The script stops with exit code `2` if the value contains `?`, `*`, `[` or `]`, or if the prefix isn't letters, digits and hyphens only. |
 | `API_TOKEN_KEY`, `API_TOKEN_SECRET` | Liongard API token, used for environment matching and collision checks. |
 | `AGENT_TOKEN_KEY`, `AGENT_TOKEN_SECRET` | Agent install token. |
 | `ENVIRONMENT` | Environment name. Required only when `INCLUDE_ENVIRONMENT_VALUE=true`. |

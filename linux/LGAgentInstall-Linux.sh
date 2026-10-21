@@ -20,7 +20,7 @@
 #   Requires:     root, Bash 4+, curl or wget, and jq for environment matching or platform removal.
 #                 Liongard API token and agent install token (key and secret for each).
 #   Author:       Liongard Partner Support
-#   Last updated: 2026-10-20
+#   Last updated: 2026-10-21
 #
 # LINK
 #   https://github.com/liongard/agent-scripts/blob/main/linux/README.md
@@ -46,7 +46,7 @@ set -euo pipefail
 #   us1                          → prefix: us1
 #   us1.app.liongard.com         → prefix: us1
 #   https://us1.app.liongard.com → prefix: us1
-INSTANCE_PREFIX="us?"                                  # e.g. us1, us2, eu1
+INSTANCE_PREFIX="REPLACE_WITH_INSTANCE_PREFIX"         # e.g. us1, us2, eu1
 
 # API token (key + secret): used for environment lookup and collision detection.
 API_TOKEN_KEY="REPLACE_WITH_API_TOKEN_KEY"
@@ -282,6 +282,11 @@ assert_config_value() {
 validate_config() {
     log_step "Validating configuration..."
     assert_config_value "INSTANCE_PREFIX"    "${INSTANCE_PREFIX}"
+    # Catch placeholder-style wildcard characters (for example the old "us?" default).
+    if [[ "${INSTANCE_PREFIX}" == *[?*[\]]* ]]; then
+        log_error "INSTANCE_PREFIX '${INSTANCE_PREFIX}' contains a placeholder character. Provide a valid instance prefix (e.g. us1, eu2)."
+        exit 2
+    fi
     assert_config_value "API_TOKEN_KEY"      "${API_TOKEN_KEY}"
     assert_config_value "API_TOKEN_SECRET"   "${API_TOKEN_SECRET}"
     assert_config_value "AGENT_TOKEN_KEY"    "${AGENT_TOKEN_KEY}"
@@ -338,6 +343,8 @@ resolve_installer_url() {
 # ============================================================
 # INSTANCE PREFIX NORMALIZATION
 # Accepts: us1 | us1.app.liongard.com | https://us1.app.liongard.com
+#          (any case, http:// or https://, surrounding spaces, trailing slash or path)
+# Exits 2 unless the result is letters, digits and hyphens only.
 # Sets:    _INSTANCE_HOST, _INSTANCE_BASE_URL
 # ============================================================
 
@@ -345,15 +352,24 @@ resolve_instance_prefix() {
     local raw="${INSTANCE_PREFIX}"
     local sanitized
 
+    # Trim surrounding whitespace and lowercase.
+    sanitized="${raw#"${raw%%[![:space:]]*}"}"
+    sanitized="${sanitized%"${sanitized##*[![:space:]]}"}"
+    sanitized="${sanitized,,}"
     # Strip URL scheme if present.
-    sanitized="${raw#https://}"
+    sanitized="${sanitized#https://}"
     sanitized="${sanitized#http://}"
-    # Strip trailing slashes.
-    sanitized="${sanitized%/}"
+    # Strip any path (and trailing slash) after the host.
+    sanitized="${sanitized%%/*}"
 
     # If it looks like a full hostname, extract only the first label.
     if [[ "${sanitized}" == *".app.liongard.com" ]]; then
         sanitized="${sanitized%%.*}"
+    fi
+
+    if [[ ! "${sanitized}" =~ ^[A-Za-z0-9-]+$ ]]; then
+        log_error "INSTANCE_PREFIX '${raw}' is not a Liongard instance such as us1, us1.app.liongard.com or https://us1.app.liongard.com."
+        exit 2
     fi
 
     INSTANCE_PREFIX="${sanitized}"
@@ -1690,12 +1706,12 @@ main() {
     # ── Step 1: Sanity checks ──────────────────────────────────────────
     check_root
     validate_config
+    resolve_instance_prefix
     resolve_installer_url
     check_prerequisites
     print_config_snapshot
 
-    # ── Step 2: Resolve instance and detect distro ─────────────────────
-    resolve_instance_prefix
+    # ── Step 2: Detect distro ──────────────────────────────────────────
     detect_distro
 
     # ── Step 3: Build API auth header ──────────────────────────────────
