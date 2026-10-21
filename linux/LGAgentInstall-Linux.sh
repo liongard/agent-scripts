@@ -10,7 +10,8 @@
 #   - Checks prerequisites and picks the x64 or arm64 installer.
 #   - Removes any existing agent first by default (ENABLE_PRE_UNINSTALL=true; set it to false
 #     to skip, and an installed agent is then left as it is). The platform record is kept
-#     unless REMOVE_AGENT_FROM_PLATFORM=true.
+#     unless REMOVE_AGENT_FROM_PLATFORM=true, and is then deleted only when exactly one
+#     agent has the same environment and hostname.
 #   - Matches the environment name through the Liongard API by default
 #     (ENABLE_ENVIRONMENT_MATCHING=true) and checks for machine-ID collisions.
 #   - Downloads the installer to a private temporary folder and installs it.
@@ -114,7 +115,9 @@ INSTALLER_FILE_NAME=""
 # by Liongard Support.
 # ------------------------------------------------------------
 
-# Minimum confidence score (0–185) required before deleting a remote record.
+# DEPRECATED: no longer used and will be removed in a later release. Remote
+# deletion now needs exactly one agent with the same environment and hostname
+# (see the README). A WARN is logged if this is changed from 50.
 MINIMUM_REMOTE_DELETION_SCORE=50
 
 # Candidate service names to check for, in priority order.
@@ -258,7 +261,6 @@ print_config_snapshot() {
     log_info "EnableEnvironmentMatching   : ${ENABLE_ENVIRONMENT_MATCHING}"
     log_info "EnablePreUninstall          : ${ENABLE_PRE_UNINSTALL}"
     log_info "RemoveAgentFromPlatform     : ${REMOVE_AGENT_FROM_PLATFORM}"
-    log_info "MinimumRemoteDeletionScore  : ${MINIMUM_REMOTE_DELETION_SCORE}"
     log_info "LogDirectory                : ${LOG_DIRECTORY}"
     log_info "LinuxArchitecture           : ${LINUX_ARCHITECTURE}"
     log_info "InstallerUrl                : ${INSTALLER_URL}"
@@ -296,6 +298,9 @@ validate_config() {
     fi
     if [[ -n "${DOWNLOAD_DIRECTORY}" ]]; then
         log_warn "DOWNLOAD_DIRECTORY is deprecated and no longer used. The installer downloads to a private temporary directory, and the log goes to LOG_DIRECTORY [${LOG_DIRECTORY}]."
+    fi
+    if [[ "${MINIMUM_REMOTE_DELETION_SCORE}" != "50" ]]; then
+        log_warn "MINIMUM_REMOTE_DELETION_SCORE is deprecated and ignored. Remote deletion now needs exactly one agent with the same environment and hostname."
     fi
     log_ok "Configuration validated."
 }
@@ -419,12 +424,7 @@ check_prerequisites() {
         exit 3
     fi
 
-    # MAC collection utilities — warn only, script continues.
-    if ! _has_cmd ip && ! _has_cmd ifconfig; then
-        log_warn "Neither 'ip' nor 'ifconfig' found; MAC address collection will use /sys/class/net only."
-    fi
-
-    # jq is required when environment matching or scored remote deletion is on.
+    # jq is required when environment matching or remote deletion is on.
     local need_jq=false
     [[ "${INCLUDE_ENVIRONMENT_VALUE}" == true && "${ENABLE_ENVIRONMENT_MATCHING}" == true ]] && need_jq=true
     [[ "${REMOVE_AGENT_FROM_PLATFORM}" == true ]] && need_jq=true
@@ -623,63 +623,6 @@ get_local_hostnames() {
     done
 
     [[ "${#names[@]}" -gt 0 ]] && printf '%s\n' "${names[@]}"
-    return 0
-}
-
-# ============================================================
-# MAC ADDRESS COLLECTION
-# ============================================================
-
-_normalize_mac() {
-    local raw="$1"
-    local clean
-    # Keep only hex-digit characters, stripping all separators.
-    # Avoid tr ranges that cross ASCII order (e.g. ':- ' → descending range error).
-    clean="$(printf '%s' "${raw}" | tr -cd '0-9a-fA-F')"
-    if [[ "${#clean}" -lt 12 ]]; then
-        return 1
-    fi
-    printf '%s' "${clean:0:12}" | tr '[:lower:]' '[:upper:]'
-}
-
-get_local_mac_addresses() {
-    # Returns normalized (no-separator, uppercase) MAC addresses for all
-    # active non-loopback interfaces, one per line, deduplicated.
-    local -A mac_set=()
-    local mac
-
-    # ip link show (preferred).
-    if _has_cmd ip; then
-        while IFS= read -r line; do
-            if [[ "${line}" =~ link/ether[[:space:]]([0-9a-fA-F:]{17}) ]]; then
-                mac="$(_normalize_mac "${BASH_REMATCH[1]}")" && mac_set["${mac}"]=1 || true
-            fi
-        done < <(ip link show 2>/dev/null | grep -v 'link/loopback')
-    fi
-
-    # ifconfig fallback.
-    if [[ "${#mac_set[@]}" -eq 0 ]] && _has_cmd ifconfig; then
-        while IFS= read -r line; do
-            if [[ "${line}" =~ ([Hh][Ww][Aa][Dd][Dd][Rr]|ether)[[:space:]]+([0-9a-fA-F:]{17}) ]]; then
-                mac="$(_normalize_mac "${BASH_REMATCH[2]}")" && mac_set["${mac}"]=1 || true
-            fi
-        done < <(ifconfig 2>/dev/null)
-    fi
-
-    # /sys/class/net/*/address last resort.
-    if [[ "${#mac_set[@]}" -eq 0 ]]; then
-        local iface addr_file
-        for addr_file in /sys/class/net/*/address; do
-            iface="${addr_file%/address}"; iface="${iface##*/}"
-            [[ "${iface}" == lo ]] && continue
-            local raw_mac
-            raw_mac="$(cat "${addr_file}" 2>/dev/null)"
-            [[ -z "${raw_mac}" || "${raw_mac}" == "00:00:00:00:00:00" ]] && continue
-            mac="$(_normalize_mac "${raw_mac}")" && mac_set["${mac}"]=1 || true
-        done
-    fi
-
-    [[ "${#mac_set[@]}" -gt 0 ]] && printf '%s\n' "${!mac_set[@]}"
     return 0
 }
 
@@ -1018,122 +961,175 @@ resolve_device_guid_override() {
 
 # ============================================================
 # REMOTE PLATFORM AGENT DELETION
+#
+# A platform record is deleted only when exactly one agent matches both:
+#   - environment: the agent's environment equals the resolved environment
+#     (case-insensitive), or neither has one;
+#   - hostname: the agent's Hostname, Name or Data.FQDN equals one of the
+#     names from get_deletion_hostnames (case-insensitive, whole string).
+# The machine ID and MAC addresses are not used. With zero or several matches
+# the deletion is skipped and every candidate is logged.
 # ============================================================
 
-# Confidence scoring mirrors the Windows script model:
-#   MachineGuid exact match  → +100
-#   Hostname match           → +30 (+5 per additional, max +15 bonus)
-#   MAC address match        → +40 (+5 per additional, max +10 bonus)
-_score_agent() {
-    local agent_json="$1"
-    local local_machine_id="$2"
-    shift 2
-    local -a local_hostnames=("$@")
-
-    local score=0
-
-    # MachineGuid match.
-    local agent_guid
-    agent_guid="$(printf '%s' "${agent_json}" | jq -r '(.MachineGuid // "") | ascii_downcase' 2>/dev/null)"
-    if [[ -n "${agent_guid}" && "${agent_guid}" == "${local_machine_id}" ]]; then
-        (( score += 100 ))
-    fi
-
-    # Hostname match.
-    local agent_hostname h h_lower
-    agent_hostname="$(printf '%s' "${agent_json}" | jq -r '(.Hostname // .Name // "") | ascii_downcase' 2>/dev/null)"
-    local host_hits=0
-    for h in "${local_hostnames[@]}"; do
-        h_lower="$(printf '%s' "${h}" | tr '[:upper:]' '[:lower:]')"
-        if [[ -n "${agent_hostname}" && "${h_lower}" == "${agent_hostname}" ]]; then
-            (( ++host_hits ))
-        fi
+# Names this machine can be registered under, one per line: `hostname` (the
+# name run_installer registers as LIONGARDAGENTNAME), the short host name and
+# the FQDN. No truncated variants; "localhost" is never used.
+get_deletion_hostnames() {
+    local -A seen=()
+    local n lc
+    for n in "$(hostname 2>/dev/null || true)" "$(hostname -s 2>/dev/null || true)" "$(hostname -f 2>/dev/null || true)"; do
+        n="${n%.}"
+        if [[ -z "${n}" ]]; then continue; fi
+        lc="$(printf '%s' "${n}" | tr '[:upper:]' '[:lower:]')"
+        if [[ "${lc}" == "localhost" || "${lc}" == "localhost.localdomain" || -n "${seen[${lc}]+_}" ]]; then continue; fi
+        seen["${lc}"]=1
+        printf '%s\n' "${n}"
     done
-    if [[ "${host_hits}" -gt 0 ]]; then
-        local hbonus=$(( 5 * (host_hits - 1) ))
-        [[ "${hbonus}" -gt 15 ]] && hbonus=15
-        (( score += 30 + hbonus ))
-    fi
+    return 0
+}
 
-    # MAC address match.
-    local -a local_macs
-    mapfile -t local_macs < <(get_local_mac_addresses)
-    local agent_macs_raw mac_entry clean_agent_mac lm
-    agent_macs_raw="$(printf '%s' "${agent_json}" | jq -r '
-        (.MACAddress // .MacAddress // .Data.MACAddress // "") |
-        if type == "array" then join(",") else . end
-    ' 2>/dev/null)"
-
-    local mac_hits=0
-    local OLD_IFS="${IFS}"; IFS=",; "
-    for mac_entry in ${agent_macs_raw}; do
-        clean_agent_mac="$(_normalize_mac "${mac_entry}")" || continue
-        for lm in "${local_macs[@]}"; do
-            if [[ "${clean_agent_mac}" == "${lm}" ]]; then
-                (( ++mac_hits ))
-                break
-            fi
+# Prints a JSON array of the agents whose Hostname or Name equals one of the
+# given names, deduplicated by ID. The API filter only narrows the list;
+# invoke_remote_agent_removal checks every candidate again, exactly.
+# Returns 1 if any lookup fails, so a partial list never leads to a deletion.
+get_deletion_candidates() {
+    local all="[]" n escaped field batch
+    for n in "$@"; do
+        escaped="${n//\'/\'\'}"
+        for field in Hostname Name; do
+            batch="$(get_agents_filtered "${field} = '${escaped}'")" || return 1
+            all="$(jq -c --argjson b "${batch}" '. + $b' <<< "${all}" 2>/dev/null)" || return 1
         done
     done
-    IFS="${OLD_IFS}"
+    jq -c 'unique_by(.ID // .id // tostring)' <<< "${all}" 2>/dev/null || return 1
+}
 
-    if [[ "${mac_hits}" -gt 0 ]]; then
-        local mbonus=$(( 5 * (mac_hits - 1) ))
-        [[ "${mbonus}" -gt 10 ]] && mbonus=10
-        (( score += 40 + mbonus ))
+# Prints the IDs of the environments named exactly $1 (case-insensitive), one
+# per line. Only needed when an agent reports an environment ID without a name.
+get_environment_ids() {
+    local response
+    if ! response="$(_api_get "/environments" 2>/dev/null)"; then
+        log_warn "Could not retrieve Liongard environments from API."
+        return 0
     fi
-
-    printf '%d' "${score}"
+    printf '%s' "${response}" | jq -r --arg n "$1" '
+        (if   type == "array" then .
+         elif .data    then .data
+         elif .items   then .items
+         elif .results then .results
+         elif .value   then .value
+         else [.]
+         end)
+        | .[]
+        | select(((.Name // .name // "") | ascii_downcase) == ($n | ascii_downcase))
+        | (.ID // .id // empty) | tostring
+    ' 2>/dev/null || true
 }
 
 invoke_remote_agent_removal() {
-    local agents_json="$1"
-    local local_machine_id="$2"
-    shift 2
+    if [[ "$#" -eq 0 ]]; then
+        log_warn "Remote deletion skipped: no local hostname could be determined."
+        return 0
+    fi
     local -a local_hostnames=("$@")
 
-    if [[ -z "${agents_json}" || "${agents_json}" == "[]" || "${agents_json}" == "null" ]]; then
-        log_info "No agents returned; remote deletion skipped."
-        return 0
-    fi
-
     if ! _has_cmd jq; then
-        log_warn "jq required for remote deletion scoring. Skipping."
+        log_warn "jq required for remote deletion matching. Skipping."
         return 0
     fi
 
-    local best_score=0 best_agent_id=""
-    local agent_json agent_id score
+    local wanted="${_RESOLVED_ENVIRONMENT}"
+    local wanted_lc
+    wanted_lc="$(printf '%s' "${wanted}" | tr '[:upper:]' '[:lower:]')"
+    log_info "Remote deletion matches environment [${wanted:-(none)}] and hostname [$(IFS=', '; printf '%s' "${local_hostnames[*]}")]."
 
-    while IFS= read -r agent_json; do
-        [[ -z "${agent_json}" || "${agent_json}" == "null" ]] && continue
-        score="$(_score_agent "${agent_json}" "${local_machine_id}" "${local_hostnames[@]}")"
-        agent_id="$(printf '%s' "${agent_json}" | jq -r '.ID // .id // ""' 2>/dev/null)"
+    local agents_json
+    if ! agents_json="$(get_deletion_candidates "${local_hostnames[@]}")"; then
+        log_warn "Remote deletion skipped: the Liongard agent lookup failed."
+        return 0
+    fi
 
-        if [[ "${score}" -gt "${best_score}" && -n "${agent_id}" ]]; then
-            best_score="${score}"
-            best_agent_id="${agent_id}"
+    # One row per candidate: ID, names, environment and the first name that
+    # equals a local name. The environment is an object with Name and ID (null
+    # when the agent has none); EnvironmentName, a plain Environment string and
+    # EnvironmentID are also read in case the shape differs.
+    local local_json rows
+    local_json="$(printf '%s\n' "${local_hostnames[@]}" | jq -R . | jq -sc 'map(ascii_downcase)')"
+    rows="$(jq -c --argjson local "${local_json}" '
+        .[] | select(type == "object")
+        | (.Environment | type) as $et
+        | {
+            id:       ((.ID // .id // "") | tostring),
+            names:    ([.Hostname, .Name, (.Data.FQDN? // null)] | map(select(type == "string" and length > 0))),
+            env_name: ((if $et == "object" then .Environment.Name elif $et == "string" then .Environment else null end) // .EnvironmentName // ""),
+            env_id:   (((if $et == "object" then .Environment.ID else null end) // .EnvironmentID // "") | tostring)
+          }
+        | .name_hit = (first(.names[] | select(ascii_downcase as $n | any($local[]; . == $n)))? // "")
+    ' <<< "${agents_json}" 2>/dev/null)" || rows=""
+
+    local row id names env_name env_id name_hit env_label env_ok reason
+    local env_ids="" env_ids_loaded=false count=0
+    local -a matched_ids=()
+    while IFS= read -r row; do
+        if [[ -z "${row}" ]]; then continue; fi
+        count=$(( count + 1 ))
+        id="$(jq -r '.id' <<< "${row}")"
+        names="$(jq -r '.names | join(", ")' <<< "${row}")"
+        env_name="$(jq -r '.env_name | tostring' <<< "${row}")"
+        env_id="$(jq -r '.env_id' <<< "${row}")"
+        name_hit="$(jq -r '.name_hit' <<< "${row}")"
+        if [[ "${env_id}" == "0" ]]; then env_id=""; fi
+
+        if [[ -n "${env_name}" ]]; then env_label="${env_name}"
+        elif [[ -n "${env_id}" ]]; then env_label="ID ${env_id}"
+        else env_label="(none)"
         fi
-    done < <(printf '%s' "${agents_json}" | jq -c '.[]' 2>/dev/null)
 
-    if [[ -z "${best_agent_id}" ]]; then
-        log_info "No Liongard agent record matched the local host identity; remote deletion skipped."
+        env_ok=false
+        if [[ -z "${wanted}" ]]; then
+            if [[ -z "${env_name}" && -z "${env_id}" ]]; then env_ok=true; fi
+        elif [[ -n "${env_name}" ]]; then
+            if [[ "$(printf '%s' "${env_name}" | tr '[:upper:]' '[:lower:]')" == "${wanted_lc}" ]]; then env_ok=true; fi
+        elif [[ -n "${env_id}" ]]; then
+            if [[ "${env_ids_loaded}" == false ]]; then
+                env_ids="$(get_environment_ids "${wanted}")"
+                env_ids_loaded=true
+            fi
+            if grep -Fxq -- "${env_id}" <<< "${env_ids}"; then env_ok=true; fi
+        fi
+
+        reason=""
+        if [[ -z "${name_hit}" ]]; then reason="no Hostname, Name or FQDN equals a local name"; fi
+        if [[ "${env_ok}" != true ]]; then reason="${reason:+${reason}; }environment differs"; fi
+
+        if [[ -z "${reason}" ]]; then
+            matched_ids+=("${id}")
+            log_info "  Agent ID ${id}: names [${names}], environment [${env_label}] -> match: hostname [${name_hit}] and environment match"
+        else
+            log_info "  Agent ID ${id}: names [${names}], environment [${env_label}] -> no match: ${reason}"
+        fi
+    done <<< "${rows}"
+    log_info "Liongard agent candidates found: ${count}"
+
+    if [[ "${#matched_ids[@]}" -ne 1 ]]; then
+        log_warn "Remote deletion skipped: ${#matched_ids[@]} agent records match this environment and hostname, and exactly one is required. See the candidates above."
         return 0
     fi
 
-    if [[ "${best_score}" -lt "${MINIMUM_REMOTE_DELETION_SCORE}" ]]; then
-        log_warn "Remote deletion skipped: match score ${best_score} is below threshold ${MINIMUM_REMOTE_DELETION_SCORE}."
+    local agent_id="${matched_ids[0]}"
+    if [[ -z "${agent_id}" ]]; then
+        log_warn "Matched Liongard agent record is missing an ID; remote deletion skipped."
         return 0
     fi
 
-    log_info "Deleting Liongard agent ID ${best_agent_id} (match score: ${best_score})..."
+    log_info "Deleting Liongard agent ID ${agent_id}..."
     local http_status
-    http_status="$(_api_delete "/agents/${best_agent_id}")" || { log_warn "DELETE request failed."; return 0; }
+    http_status="$(_api_delete "/agents/${agent_id}")" || { log_warn "DELETE request failed."; return 0; }
 
     if [[ "${http_status}" == "204" || "${http_status}" == "200" ]]; then
-        log_ok "Remote agent ID ${best_agent_id} deleted (HTTP ${http_status})."
+        log_ok "Remote agent ID ${agent_id} deleted (HTTP ${http_status})."
     else
-        log_warn "Unexpected HTTP ${http_status} while deleting agent ID ${best_agent_id}."
+        log_warn "Unexpected HTTP ${http_status} while deleting agent ID ${agent_id}."
     fi
 }
 
@@ -1730,10 +1726,6 @@ main() {
     mapfile -t local_hostnames < <(get_local_hostnames)
     log_info "Local host identifiers: $(IFS=', '; printf '%s' "${local_hostnames[*]}")"
 
-    local -a local_macs
-    mapfile -t local_macs < <(get_local_mac_addresses)
-    log_info "Local MAC addresses: $(IFS=', '; printf '%s' "${local_macs[*]}")"
-
     # ── Step 5: Pre-uninstall ──────────────────────────────────────────
     local do_remote_deletion=false
 
@@ -1800,9 +1792,12 @@ main() {
     fi
 
     # ── Step 8: Optional remote platform agent deletion ────────────────
-    if [[ "${do_remote_deletion}" == true && "${api_ok}" == true ]]; then
+    # Matches by environment and exact hostname only (see invoke_remote_agent_removal).
+    if [[ "${do_remote_deletion}" == true ]]; then
         log_step "Attempting remote platform agent deletion..."
-        invoke_remote_agent_removal "${agents_json}" "${local_machine_id}" "${local_hostnames[@]}"
+        local -a deletion_hostnames=()
+        mapfile -t deletion_hostnames < <(get_deletion_hostnames)
+        invoke_remote_agent_removal "${deletion_hostnames[@]}"
     fi
 
     # ── Step 9: Collision detection → DEVICEID override ────────────────

@@ -12,7 +12,7 @@
 What the install script does, in order:
 
 1. Checks the configuration and prerequisites, and picks the x64 or arm64 installer from `uname -m`.
-2. **Removes any existing Liongard Agent by default** (`ENABLE_PRE_UNINSTALL=true`), including leftover install folders and config files. With `ENABLE_PRE_UNINSTALL=false`, an installed agent is left as it is, and the script exits `0`. The agent's platform record is kept unless `REMOVE_AGENT_FROM_PLATFORM=true`.
+2. **Removes any existing Liongard Agent by default** (`ENABLE_PRE_UNINSTALL=true`), including leftover install folders and config files. With `ENABLE_PRE_UNINSTALL=false`, an installed agent is left as it is, and the script exits `0`. The agent's platform record is kept unless `REMOVE_AGENT_FROM_PLATFORM=true` (see [How remote deletion picks the agent](#how-remote-deletion-picks-the-agent)).
 3. Matches the environment name against your instance (`ENABLE_ENVIRONMENT_MATCHING=true` by default) and stops if no environment matches.
 4. Looks up the machine ID in Liongard. If it's already registered under a different hostname, the script gives the new agent its own device ID, so it doesn't overwrite the other record.
 5. Downloads the installer to a private temporary folder, which is deleted when the script exits, and installs it with the package manager (`.deb`, `.rpm`) or the installer itself (`.run`, `.sh`).
@@ -61,7 +61,7 @@ These are the install script's settings. The uninstall script has none. The conf
 | `INCLUDE_ENVIRONMENT_VALUE` | `true` | `false` registers the agent without an environment, and `ENVIRONMENT` isn't needed. |
 | `ENABLE_ENVIRONMENT_MATCHING` | `true` | Matches `ENVIRONMENT` against your instance and corrects casing or punctuation. `false` uses the value exactly as written. |
 | `ENABLE_PRE_UNINSTALL` | `true` | Removes any existing agent before installing. `false` leaves an installed agent as it is. |
-| `REMOVE_AGENT_FROM_PLATFORM` | `false` | After a successful pre-uninstall, also deletes the matching agent record from Liongard. Ignored when `ENABLE_PRE_UNINSTALL=false`. |
+| `REMOVE_AGENT_FROM_PLATFORM` | `false` | After a successful pre-uninstall, also deletes the agent's record from Liongard, but only when exactly one record matches. See [How remote deletion picks the agent](#how-remote-deletion-picks-the-agent). Ignored when `ENABLE_PRE_UNINSTALL=false`. |
 | `AGENT_DESCRIPTION` | `""` | Agent description, passed only when set. |
 | `LOG_DIRECTORY` | `/var/log/liongard-agent` | Where the script log goes. Created root-only when missing. |
 | `LINUX_ARCHITECTURE` | `auto` | `auto` picks the installer from `uname -m` (`x86_64` → x64, `aarch64` → arm64). `x64` or `arm64` forces one. |
@@ -75,12 +75,21 @@ Leave these alone unless Liongard Support asks you to change them.
 
 | Setting | Default | What it does |
 |---|---|---|
-| `MINIMUM_REMOTE_DELETION_SCORE` | `50` | Minimum match score a platform record needs before `REMOVE_AGENT_FROM_PLATFORM=true` deletes it. |
+| `MINIMUM_REMOTE_DELETION_SCORE` | `50` | Deprecated and ignored. If it's changed, the script logs a warning and carries on. It will be removed in a later release. |
 | `SERVICE_NAMES` | `roaragent liongard-agent liongardagent LiongardAgent` | Service names the script looks for. |
 | `DEVICE_ID_OVERRIDE_ARG_NAME` | `DEVICEID` | Installer property for the device ID override. |
 | `API_FAILURE_BEHAVIOR` | `conservative` | When the collision check's API call fails: `conservative` stops (exit `4`), `permissive` continues without it. |
 | `MINIMUM_INSTALLER_BYTES` | `10240` | Smallest download the script accepts as an installer. |
 | `MAX_DOWNLOAD_ATTEMPTS` | `3` | Download attempts before the script gives up. |
+
+## How remote deletion picks the agent
+
+With `REMOVE_AGENT_FROM_PLATFORM=true`, the script deletes a record only when exactly one agent matches both of these:
+
+- **Environment:** the agent's environment has the same name as the environment this run installs into (not case-sensitive). That's the name found by environment matching, or `ENVIRONMENT` as written when matching is off. With `INCLUDE_ENVIRONMENT_VALUE=false`, only agents with no environment match.
+- **Hostname:** the agent's Hostname, Name or FQDN is the same as one of this machine's names: `hostname` (the name the script registers the agent under), `hostname -s` or `hostname -f`. The whole name must match (not case-sensitive); a partial or prefix match doesn't count.
+
+The machine ID and MAC addresses aren't used. If no agent matches, or more than one does, nothing is deleted: the script logs a warning and lists every candidate with its ID, names, environment and why it did or didn't match. If the agent lookup fails, nothing is deleted. The install carries on either way.
 
 ## Running through an RMM or MDM
 
@@ -140,6 +149,7 @@ Logs can contain sensitive details, so check them before you share them.
 | `Run this script as root` (uninstall, exit `1`) | Run it as root. |
 | `The Liongard Agent is still detected` (uninstall, exit `1`) | The lines after it list what's left. Check that nothing else (a configuration management tool, for example) reinstalls the agent, remove the items by hand, and run the script again. |
 | `/etc/liongard was left in place ...` (uninstall) | Not an error. Remove `/etc/liongard` by hand if you don't need it. Never remove `/etc/liongard-agent` unless you want the next install to register as a new agent. |
+| `Remote deletion skipped: <n> agent records match this environment and hostname` | Nothing was deleted from Liongard, and the install carried on. Check the candidates listed above the warning, and delete the old record in Liongard yourself if needed. |
 | `Liongard Agent is still detected after uninstall` (exit `8`) | Remove the existing agent by hand, then run the script again. |
 
 For anything else, contact Liongard Partner Support with the script log.
