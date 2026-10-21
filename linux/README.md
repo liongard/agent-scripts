@@ -13,7 +13,7 @@ What the install script does, in order:
 
 1. Checks the configuration and prerequisites, and picks the x64 or arm64 installer from `uname -m`.
 2. **Removes any existing Liongard Agent by default** (`ENABLE_PRE_UNINSTALL=true`), including leftover install folders and config files. With `ENABLE_PRE_UNINSTALL=false`, an installed agent is left as it is, and the script exits `0`. The agent's platform record is kept unless `REMOVE_AGENT_FROM_PLATFORM=true` (see [How remote deletion picks the agent](#how-remote-deletion-picks-the-agent)).
-3. Matches the environment name against your instance (`ENABLE_ENVIRONMENT_MATCHING=true` by default) and stops if no environment matches.
+3. Matches the environment name against your instance (`ENABLE_ENVIRONMENT_MATCHING=true` by default). If no environment matches, the agent is installed without one and a WARN is logged. See [Missing environment](#missing-environment).
 4. Looks up the machine ID in Liongard. If it's already registered under a different hostname, the script gives the new agent its own device ID, so it doesn't overwrite the other record.
 5. Downloads the installer to a private temporary folder, which is deleted when the script exits, and installs it with the package manager (`.deb`, `.rpm`) or the installer itself (`.run`, `.sh`).
 6. Confirms the agent service is running.
@@ -59,7 +59,8 @@ These are the install script's settings. The uninstall script has none. The conf
 | Setting | Default | What it does |
 |---|---|---|
 | `INCLUDE_ENVIRONMENT_VALUE` | `true` | `false` registers the agent without an environment, and `ENVIRONMENT` isn't needed. |
-| `ENABLE_ENVIRONMENT_MATCHING` | `true` | Matches `ENVIRONMENT` against your instance and corrects casing or punctuation. `false` uses the value exactly as written. |
+| `ENABLE_ENVIRONMENT_MATCHING` | `true` | Matches `ENVIRONMENT` against your instance and corrects casing or punctuation. `false` uses the value exactly as written, without checking it. |
+| `CREATE_ENVIRONMENT_IF_MISSING` | `false` | `true` creates the environment in Liongard when it doesn't exist, using `ENVIRONMENT` as written. Only an exact name match (ignoring case) counts as existing. Needs `ENABLE_ENVIRONMENT_MATCHING=true` and an API token that is allowed to create environments. If creating fails, the agent is installed without an environment. |
 | `ENABLE_PRE_UNINSTALL` | `true` | Removes any existing agent before installing. `false` leaves an installed agent as it is. |
 | `REMOVE_AGENT_FROM_PLATFORM` | `false` | After a successful pre-uninstall, also deletes the agent's record from Liongard, but only when exactly one record matches. See [How remote deletion picks the agent](#how-remote-deletion-picks-the-agent). Ignored when `ENABLE_PRE_UNINSTALL=false`. |
 | `AGENT_DESCRIPTION` | `""` | Agent description, passed only when set. |
@@ -81,6 +82,16 @@ Leave these alone unless Liongard Support asks you to change them.
 | `API_FAILURE_BEHAVIOR` | `conservative` | When the collision check's API call fails: `conservative` stops (exit `4`), `permissive` continues without it. |
 | `MINIMUM_INSTALLER_BYTES` | `10240` | Smallest download the script accepts as an installer. |
 | `MAX_DOWNLOAD_ATTEMPTS` | `3` | Download attempts before the script gives up. |
+
+### Missing environment
+
+If `ENVIRONMENT` names an environment that doesn't exist in Liongard, the install fails. With environment matching on, the script checks first:
+
+- No match (including a name too short to match loosely): the agent is installed without an environment. The script logs a WARN before the install and again at the end: `Environment '<name>' was not found in Liongard. The agent was installed without an environment; assign it in Liongard.`
+- With `CREATE_ENVIRONMENT_IF_MISSING=true`: only an exact match counts. A missing environment is created and used; if creating fails, the agent is installed without an environment.
+- The name matches more than one environment, or the API call fails: the script stops with exit `4`.
+
+With `ENABLE_ENVIRONMENT_MATCHING=false`, `ENVIRONMENT` is passed as written and isn't checked, so a name that doesn't exist makes the install fail.
 
 ## How remote deletion picks the agent
 
@@ -119,7 +130,7 @@ Current behavior. Standard exit codes across all scripts are planned in [#11](ht
 | `1` | Unexpected failure. |
 | `2` | A required setting is missing or invalid. |
 | `3` | A prerequisite is missing (not root, no `curl` or `wget`, no `jq` when needed, unsupported architecture or installer type). |
-| `4` | The environment couldn't be matched, or the collision check's API call failed with `API_FAILURE_BEHAVIOR=conservative`. |
+| `4` | The environment name matches more than one environment, the environment API call failed, or the collision check's API call failed with `API_FAILURE_BEHAVIOR=conservative`. |
 | `5` | The installer download failed. |
 | `6` | The install command failed. |
 | `7` | The install finished, but validation failed: the agent service isn't running. |
@@ -142,7 +153,10 @@ Logs can contain sensitive details, so check them before you share them.
 | `This script must be run as root or via sudo` (exit `3`) | Run it as root. |
 | `Neither curl nor wget is available` or `jq is required ...` (exit `3`) | Install the missing tool, or turn off environment matching and platform removal if you don't need them. |
 | `Unsupported CPU architecture` (exit `3`) | Installers exist for x86_64 and aarch64 only. |
-| `Environment '<name>' ... could not be resolved in Liongard` (exit `4`) | Check the name and that the environment exists in your instance. Or set `ENABLE_ENVIRONMENT_MATCHING=false` to pass it as written, or `INCLUDE_ENVIRONMENT_VALUE=false` to skip it. |
+| `Environment '<name>' was not found in Liongard. The agent was installed without an environment` | The agent is installed. Assign it to its environment in Liongard, and fix `ENVIRONMENT` for future installs. |
+| `Environment '<name>' ... matches more than one Liongard environment` (exit `4`) | Set `ENVIRONMENT` to the exact name of the environment in Liongard. |
+| `Environment '<name>' could not be checked because the Liongard API call failed` (exit `4`) | Check the API token and HTTPS access to your instance. Or set `ENABLE_ENVIRONMENT_MATCHING=false` to pass the name as written, or `INCLUDE_ENVIRONMENT_VALUE=false` to skip it. |
+| `Could not create environment '<name>' in Liongard` | The API token may not be allowed to create environments. Create the environment in Liongard, or use a token that can. The agent was installed without an environment. |
 | `API_FAILURE_BEHAVIOR=conservative. Cannot continue without collision detection` (exit `4`) | The API call failed. Check the API token and HTTPS access to your instance. |
 | `Installer download failed` (exit `5`) | Check HTTPS access to `agents.static.liongard.com`, or to your `INSTALLER_URL`. |
 | `Installation failed` (exit `6`) | Read the installer output in the script log. On Debian and Ubuntu the script runs `apt-get install -f` after a `dpkg` failure. |

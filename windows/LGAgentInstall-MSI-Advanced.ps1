@@ -6,7 +6,9 @@
     Installs the Liongard Agent, or upgrades it when the MSI is newer than the installed agent.
     Set your values in the "Partner configuration" block below. Exit codes, logs and
     troubleshooting are in the README under .LINK.
-    - Looks up the environment name through the Liongard API, corrects casing or punctuation, and stops if no match is found.
+    - Looks up the environment name through the Liongard API and corrects casing or punctuation. If the environment
+      does not exist, installs without it and logs a WARN (or creates it when $CreateEnvironmentIfMissing = $true).
+      Stops only when the name matches more than one environment.
     - Checks any existing agent (Healthy, Stale or NotInstalled) and removes Stale leftovers before installing.
     - Downloads the MSI to a folder only SYSTEM and Administrators can access, and deletes it afterwards.
     - Confirms the agent service is running and the updater task exists.
@@ -37,6 +39,10 @@ $AgentTokenSecret        = "REPLACE_WITH_AGENT_TOKEN_SECRET"  # Liongard agent i
 $Environment             = "REPLACE_WITH_ENVIRONMENT_NAME"    # Environment name (can be an RMM variable)
 $AgentDescription        = ""                                 # Optional agent description; when set, passed as LIONGARDDESCRIPTION
 $IncludeEnvironmentValue = $true                              # Set to $false to omit the LIONGARDENVIRONMENT MSI property
+# Off by default. When $true, only an exact (case-insensitive) environment name match counts, and an
+# environment that does not exist is created through the API with the name as written. Needs an API
+# token that is allowed to create environments. If creating fails, the agent is installed without one.
+$CreateEnvironmentIfMissing = $false
 
 # Optional: adjust installation path or installer URL if required.
 # These rarely change but are exposed here for completeness.
@@ -1348,6 +1354,12 @@ $script:TranscriptStarted = $false
 $script:TranscriptPath    = $null
 $script:EnvironmentResolutionReason = $null
 
+# Missing-environment retry, used only when the environment lookup API call itself failed.
+# UNCONFIRMED: the installer's exact error text for an environment that does not exist in Liongard
+# is not known yet; this pattern is a best guess and will be tightened once QA captures the real
+# message. Only a failed install whose log matches it is retried (once, without the environment).
+$script:MissingEnvironmentPattern = '(?i)environment.{0,80}(does\s*not|doesn''?t|not)\s+exist'
+
 function Start-LiongardTranscript {
     param([Parameter(Mandatory)][string]$TargetFolder)
 
@@ -1437,6 +1449,7 @@ function Write-ConfigurationSnapshot {
     Write-Host ("Environment             : {0}" -f $Environment)
     Write-Host ("AgentDescription        : {0}" -f $AgentDescription)
     Write-Host ("IncludeEnvironmentValue : {0}" -f $IncludeEnvironmentValue)
+    Write-Host ("CreateEnvironmentIfMissing: {0}" -f $CreateEnvironmentIfMissing)
     Write-Host ("Folder                  : {0}" -f $Folder)
     Write-Host ("InstallerUrl            : {0}" -f $InstallerUrl)
     Write-Host "======================================"
@@ -1488,12 +1501,12 @@ function Get-LiongardEnvironments {
 
     $uri = "https://$InstancePrefix.app.liongard.com/api/v1/environments"
 
+    # A failed call throws, so the caller can tell it apart from an empty list.
     try {
         $response = Invoke-RestMethod -Uri $uri -Headers $Headers -ErrorAction Stop
     }
     catch {
-        Write-Warning "Unable to retrieve Liongard environments: $($_.Exception.Message)"
-        return @()
+        throw "Unable to retrieve Liongard environments: $($_.Exception.Message)"
     }
 
     # The /environments endpoint returns a bare JSON array; the envelope-unwrap
@@ -1504,26 +1517,30 @@ function Get-LiongardEnvironments {
 }
 
 function Resolve-LiongardEnvironmentName {
+    # Returns the matching environment name, or $null with $script:EnvironmentResolutionReason set:
+    # LookupFailed (API call failed), NoEnvironmentsReturned, TooShort, NoMatch or Ambiguous*.
+    # -ExactOnly skips the normalized, prefix and contains passes.
     param(
         [Parameter(Mandatory)][string]$InputName,
         [Parameter(Mandatory)][string]$InstancePrefix,
-        [Parameter(Mandatory)][hashtable]$Headers
+        [Parameter(Mandatory)][hashtable]$Headers,
+        [switch]$ExactOnly
     )
 
     $script:EnvironmentResolutionReason = 'Unknown'
     $minNormalizedLength = 4
 
     $inputNormalized = Normalize-EnvironmentName -Value $InputName
-    if (-not $inputNormalized) { return $null }
 
-    if ($inputNormalized.Length -lt $minNormalizedLength) {
-        $script:EnvironmentResolutionReason = 'TooShort'
-        Write-Warning ("Provided environment value '{0}' normalized to '{1}', which is too short to match reliably (min {2})." -f $InputName, $inputNormalized, $minNormalizedLength)
+    try {
+        $environments = @(Get-LiongardEnvironments -InstancePrefix $InstancePrefix -Headers $Headers)
+    }
+    catch {
+        $script:EnvironmentResolutionReason = 'LookupFailed'
+        Write-Warning $_.Exception.Message
         return $null
     }
-
-    $environments = Get-LiongardEnvironments -InstancePrefix $InstancePrefix -Headers $Headers
-    if (-not $environments -or $environments.Count -eq 0) {
+    if ($environments.Count -eq 0) {
         $script:EnvironmentResolutionReason = 'NoEnvironmentsReturned'
         return $null
     }
@@ -1532,7 +1549,7 @@ function Resolve-LiongardEnvironmentName {
     $exact = $environments |
         Where-Object {
             $name = Get-LiongardEnvironmentNameValue -Environment $_
-            [string]::Equals($name, $InputName, [System.StringComparison]::InvariantCultureIgnoreCase)
+            [string]::Equals($name, $InputName.Trim(), [System.StringComparison]::InvariantCultureIgnoreCase)
         } |
         Select-Object -First 1
 
@@ -1540,6 +1557,19 @@ function Resolve-LiongardEnvironmentName {
         $script:EnvironmentResolutionReason = 'ExactMatch'
         $exactName = Get-LiongardEnvironmentNameValue -Environment $exact
         if (-not [string]::IsNullOrWhiteSpace($exactName)) { return $exactName }
+    }
+
+    if ($ExactOnly) {
+        $script:EnvironmentResolutionReason = 'NoMatch'
+        Write-Warning ("No Liongard environment is named exactly '{0}' (exact match only because CreateEnvironmentIfMissing is on)." -f $InputName)
+        return $null
+    }
+
+    # The remaining passes need a normalized name long enough to match reliably.
+    if (-not $inputNormalized -or $inputNormalized.Length -lt $minNormalizedLength) {
+        $script:EnvironmentResolutionReason = 'TooShort'
+        Write-Warning ("Provided environment value '{0}' normalized to '{1}', which is too short to match reliably (min {2})." -f $InputName, $inputNormalized, $minNormalizedLength)
+        return $null
     }
 
     # Pre-compute normalized candidates for the remaining passes.
@@ -1621,6 +1651,63 @@ function Resolve-LiongardEnvironmentName {
     $sampleNames = ($knownNames | Select-Object -First 5) -join '; '
     Write-Warning ("No Liongard environment matched provided name '{0}' (normalized '{1}'). Known environments: {2}" -f $InputName, $inputNormalized, $sampleNames)
     return $null
+}
+
+function New-LiongardEnvironment {
+    # Creates an environment (POST /api/v1/environments, body {"Name": ...}). Returns the created
+    # environment's name, or $null on failure. The API token needs permission to create environments.
+    param(
+        [Parameter(Mandatory)][string]$InstancePrefix,
+        [Parameter(Mandatory)][hashtable]$Headers,
+        [Parameter(Mandatory)][string]$Name
+    )
+
+    $uri  = "https://$InstancePrefix.app.liongard.com/api/v1/environments"
+    $body = [System.Text.Encoding]::UTF8.GetBytes((@{ Name = $Name } | ConvertTo-Json -Compress))
+
+    try {
+        $response = Invoke-RestMethod -Uri $uri -Method Post -Headers $Headers -Body $body -ContentType 'application/json; charset=utf-8' -ErrorAction Stop
+    }
+    catch {
+        Write-Warning "Unable to create Liongard environment '$Name': $($_.Exception.Message)"
+        return $null
+    }
+
+    $created = if ($null -ne $response) { Get-LiongardEnvironmentNameValue -Environment @($response)[0] } else { $null }
+    if ([string]::IsNullOrWhiteSpace($created)) { return $Name }
+    return $created
+}
+
+function Find-LiongardMissingEnvironmentError {
+    # First line of the (already redacted) installer log(s) that matches $script:MissingEnvironmentPattern,
+    # masked; $null if none. Reads UTF-16 (MSI) and UTF-8/ANSI (bundle) logs.
+    param([Parameter(Mandatory)][string]$LogPath)
+
+    foreach ($file in @(Get-LiongardRelatedLog -Path $LogPath)) {
+        try { $bytes = [System.IO.File]::ReadAllBytes($file) }
+        catch { Write-Warning "Could not read installer log [$file]: $($_.Exception.Message)"; continue }
+
+        $encoding = if ($bytes.Length -ge 2 -and $bytes[0] -eq 0xFF -and $bytes[1] -eq 0xFE) { [System.Text.Encoding]::Unicode }
+                    elseif ($bytes.Length -ge 2 -and $bytes[0] -eq 0xFE -and $bytes[1] -eq 0xFF) { [System.Text.Encoding]::BigEndianUnicode }
+                    elseif ($bytes.Length -ge 4 -and $bytes[1] -eq 0 -and $bytes[3] -eq 0) { [System.Text.Encoding]::Unicode }
+                    else { [System.Text.Encoding]::UTF8 }
+
+        foreach ($line in ($encoding.GetString($bytes) -split '\r?\n')) {
+            if ($line -match $script:MissingEnvironmentPattern) { return (Hide-LiongardSecretText -Text $line.Trim()) }
+        }
+    }
+
+    return $null
+}
+
+function Get-LiongardRetryLogPath {
+    # A new AgentInstall_<timestamp>.log for the retry; log retention counts it as its own run.
+    while ($true) {
+        $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+        $path  = Join-Path -Path $script:LiongardDeploy.Root -ChildPath "AgentInstall_$stamp.log"
+        if ($stamp -ne $script:LiongardDeploy.Stamp -and -not (Test-Path -LiteralPath $path)) { return $path }
+        Start-Sleep -Seconds 1
+    }
 }
 
 function Resolve-InstancePrefix {
@@ -1739,9 +1826,14 @@ $headers = Get-LiongardAuthHeader -ApiTokenKey $ApiTokenKey -ApiTokenSecret $Api
 
 # Resolve the environment name against the Liongard API to catch casing or
 # punctuation differences before they are baked into the agent record.
-if ($IncludeEnvironmentValue -and -not [string]::IsNullOrWhiteSpace($Environment)) {
+# An environment that does not exist is left out (the install fails otherwise), or
+# created when $CreateEnvironmentIfMissing is on.
+$includeEnvironment = $IncludeEnvironmentValue -and -not [string]::IsNullOrWhiteSpace($Environment)
+$environmentWarning = $null     # Repeated in the final summary when set.
+$environmentRetryAllowed = $false   # Only when the lookup failed: retry once without the environment if the installer says it does not exist.
+if ($includeEnvironment) {
     $script:EnvironmentResolutionReason = $null
-    $resolvedEnvironment = Resolve-LiongardEnvironmentName -InputName $Environment -InstancePrefix $instancePrefix -Headers $headers
+    $resolvedEnvironment = Resolve-LiongardEnvironmentName -InputName $Environment -InstancePrefix $instancePrefix -Headers $headers -ExactOnly:$CreateEnvironmentIfMissing
 
     if ($resolvedEnvironment -and -not [string]::Equals($resolvedEnvironment, $Environment, [System.StringComparison]::Ordinal)) {
         Write-Host ("Matched provided environment to Liongard: '{0}' -> '{1}' (Reason: {2})" -f $Environment, $resolvedEnvironment, $script:EnvironmentResolutionReason)
@@ -1754,13 +1846,32 @@ if ($IncludeEnvironmentValue -and -not [string]::IsNullOrWhiteSpace($Environment
         $normalizedEnv = Normalize-EnvironmentName -Value $Environment
         $reasonLabel   = if ($script:EnvironmentResolutionReason) { $script:EnvironmentResolutionReason } else { 'Unknown' }
 
-        if ($reasonLabel -eq 'NoEnvironmentsReturned') {
-            Write-Warning ("Environment lookup API returned no environments for host '{0}'. Continuing with the supplied LIONGARDENVIRONMENT value '{1}' without API confirmation." -f $liongardHost, $Environment)
-        }
-        else {
-            Write-Error ("Environment '{0}' (normalized '{1}') could not be resolved in Liongard. Reason: {2}. Aborting installation because LIONGARDENVIRONMENT is required." -f $Environment, $normalizedEnv, $reasonLabel)
+        if ($reasonLabel -like 'Ambiguous*') {
+            Write-Error ("Environment '{0}' (normalized '{1}') matches more than one Liongard environment. Reason: {2}. Aborting installation; set Environment to the exact name." -f $Environment, $normalizedEnv, $reasonLabel)
             Stop-LiongardTranscript
             exit 1
+        }
+        elseif ($reasonLabel -eq 'LookupFailed') {
+            $environmentRetryAllowed = $true
+            Write-Warning ("Could not check environment '{0}' in Liongard for host '{1}'. Continuing with the value as typed; if the installer reports that it does not exist, the install is retried once without an environment." -f $Environment, $liongardHost)
+        }
+        else {
+            $createdEnvironment = $null
+            if ($CreateEnvironmentIfMissing) {
+                Write-Host ("Environment '{0}' was not found in Liongard (Reason: {1}). Creating it (CreateEnvironmentIfMissing)." -f $Environment, $reasonLabel)
+                $createdEnvironment = New-LiongardEnvironment -InstancePrefix $instancePrefix -Headers $headers -Name $Environment.Trim()
+            }
+
+            if ($createdEnvironment) {
+                Write-Host ("Created environment in Liongard: '{0}'." -f $createdEnvironment)
+                $script:EnvironmentResolutionReason = 'Created'
+                $Environment = $createdEnvironment
+            }
+            else {
+                $environmentWarning = "Environment '$Environment' was not found in Liongard$(if ($CreateEnvironmentIfMissing) { ' and could not be created' }). The agent was installed without an environment; assign it in Liongard."
+                Write-Warning ("Environment '{0}' was not found in Liongard$(if ($CreateEnvironmentIfMissing) { ' and could not be created' }) (Reason: {1}). The agent will be installed without an environment; assign it in Liongard." -f $Environment, $reasonLabel)
+                $includeEnvironment = $false
+            }
         }
     }
 }
@@ -1808,55 +1919,71 @@ elseif ($installState.State -eq 'Healthy') {
     }
 }
 
-Write-Host "Installing the Liongard Agent..."
-
 $logPath = Get-LiongardDeployLogPath -Prefix 'AgentInstall'
-Register-LiongardDeployLog -Label 'Installer log' -Path $logPath -Redact
+$logLabel = 'Installer log'
 
-$msiArguments = @(
-    "/i", "`"$installerPath`"",
-    "LIONGARDURL=$liongardHost",
-    "LIONGARDACCESSKEY=$AgentTokenKey",
-    "LIONGARDACCESSSECRET=$AgentTokenSecret",
-    "LIONGARDAGENTNAME=`"$localHostname`""
-)
+# A second attempt runs only after a failed environment lookup, when the first install failed
+# and its log says the environment does not exist.
+for ($installAttempt = 1; $installAttempt -le 2; $installAttempt++) {
+    Write-Host "Installing the Liongard Agent$(if (-not $includeEnvironment -and $installAttempt -gt 1) { ' without an environment' })..."
+    Register-LiongardDeployLog -Label $logLabel -Path $logPath -Redact
 
-if ($IncludeEnvironmentValue -and -not [string]::IsNullOrWhiteSpace($Environment)) {
-    $msiArguments += "LIONGARDENVIRONMENT=`"$Environment`""
-}
+    $msiArguments = @(
+        "/i", "`"$installerPath`"",
+        "LIONGARDURL=$liongardHost",
+        "LIONGARDACCESSKEY=$AgentTokenKey",
+        "LIONGARDACCESSSECRET=$AgentTokenSecret",
+        "LIONGARDAGENTNAME=`"$localHostname`""
+    )
 
-if (-not [string]::IsNullOrWhiteSpace($AgentDescription)) {
-    $msiArguments += "LIONGARDDESCRIPTION=`"$AgentDescription`""
-}
+    if ($includeEnvironment) {
+        $msiArguments += "LIONGARDENVIRONMENT=`"$Environment`""
+    }
 
-$msiArguments += @("/qn", "/norestart", "/L*V", "`"$logPath`"")
+    if (-not [string]::IsNullOrWhiteSpace($AgentDescription)) {
+        $msiArguments += "LIONGARDDESCRIPTION=`"$AgentDescription`""
+    }
 
-$process  = Start-Process -FilePath "msiexec.exe" -ArgumentList $msiArguments -Wait -PassThru
-$exitCode = if ($process) { $process.ExitCode } else { $LASTEXITCODE }
-Write-Host "Installation command completed. Evaluating results..."
+    $msiArguments += @("/qn", "/norestart", "/L*V", "`"$logPath`"")
 
-$summary = Read-MsiLogSummary -Path $logPath -MaxWaitSeconds 60
-Protect-LiongardInstallerLog -Path $logPath
-if ($summary.Found) {
-    $resultText = Get-MsiResultText -Code $summary.Code
-    if ($summary.InvalidMsg) {
-        Write-Host ("MSI status: {0} ({1})`nReason: {2}" -f $summary.Code, $resultText, $summary.InvalidMsg)
+    $process  = Start-Process -FilePath "msiexec.exe" -ArgumentList $msiArguments -Wait -PassThru
+    $exitCode = if ($process) { $process.ExitCode } else { $LASTEXITCODE }
+    Write-Host "Installation command completed. Evaluating results..."
+
+    $summary = Read-MsiLogSummary -Path $logPath -MaxWaitSeconds 60
+    Protect-LiongardInstallerLog -Path $logPath
+    if ($summary.Found) {
+        $resultText = Get-MsiResultText -Code $summary.Code
+        if ($summary.InvalidMsg) {
+            Write-Host ("MSI status: {0} ({1})`nReason: {2}" -f $summary.Code, $resultText, $summary.InvalidMsg)
+        }
+        else {
+            Write-Host ("MSI status: {0} ({1})`nLog line: {2}" -f $summary.Code, $resultText, $summary.Line)
+        }
     }
     else {
-        Write-Host ("MSI status: {0} ({1})`nLog line: {2}" -f $summary.Code, $resultText, $summary.Line)
+        if (Test-Path -LiteralPath $logPath) {
+            Write-Host "MSI log available at [$logPath], but no summary pattern was found."
+        }
+        else {
+            Write-Warning "MSI log file [$logPath] was not found."
+        }
     }
-}
-else {
-    if (Test-Path -LiteralPath $logPath) {
-        Write-Host "MSI log available at [$logPath], but no summary pattern was found."
-    }
-    else {
-        Write-Warning "MSI log file [$logPath] was not found."
-    }
-}
 
-$msiExitCode        = if ($summary.Found) { $summary.Code } else { $exitCode }
-$installerSucceeded = ($msiExitCode -eq 0 -or $msiExitCode -eq 3010)
+    $msiExitCode        = if ($summary.Found) { $summary.Code } else { $exitCode }
+    $installerSucceeded = ($msiExitCode -eq 0 -or $msiExitCode -eq 3010)
+
+    if ($installerSucceeded -or -not $includeEnvironment -or -not $environmentRetryAllowed) { break }
+    $missingEnvironmentLine = Find-LiongardMissingEnvironmentError -LogPath $logPath
+    if (-not $missingEnvironmentLine) { break }
+
+    Write-Warning ("Environment '{0}' was not found in Liongard (installer log: {1}). Installing again without an environment; assign it in Liongard afterwards." -f $Environment, $missingEnvironmentLine)
+    $environmentWarning = "Environment '$Environment' was not found in Liongard. The agent was installed without an environment; assign it in Liongard."
+    $script:EnvironmentResolutionReason = 'RetriedWithoutEnvironment'
+    $includeEnvironment = $false
+    $logPath  = Get-LiongardRetryLogPath
+    $logLabel = 'Installer log (retry without environment)'
+}
 
 # Post-install validation: roaragent.exe Running (retried ~60s) and the updater task registered.
 $validation = $null
@@ -1866,6 +1993,7 @@ if ($installerSucceeded) {
 
 if ($installerSucceeded -and $validation.Healthy) {
     Write-Host "Liongard Agent installation verified successfully (process=$exitCode, msi=$msiExitCode)."
+    if ($environmentWarning) { Write-Warning $environmentWarning }
     Write-LiongardIdentityStatus
     Write-Host "Exiting script..."
     Stop-LiongardTranscript
@@ -1878,6 +2006,9 @@ if ($summary.InvalidMsg) {
 }
 if ($validation -and -not $validation.Healthy) {
     Write-Warning ("Post-install validation failed: service '{0}' status [{1}], updater task present [{2}]." -f $script:LiongardServiceName, $validation.ServiceStatus, $validation.TaskPresent)
+}
+if ($environmentWarning) {
+    Write-Warning ("Environment '{0}' was not found in Liongard; this attempt ran without an environment." -f $Environment)
 }
 Write-LiongardIdentityStatus
 

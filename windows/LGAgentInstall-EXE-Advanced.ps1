@@ -6,7 +6,9 @@
     For hosts that will run network discovery. Installs the agent, or upgrades it when the bundle is newer.
     Set your values in the "Partner configuration" block below. Exit codes, logs and
     troubleshooting are in the README under .LINK.
-    - Looks up the environment name through the Liongard API, corrects casing or punctuation, and stops if no match is found.
+    - Looks up the environment name through the Liongard API and corrects casing or punctuation. If the environment
+      does not exist, installs without it and logs a WARN (or creates it when $CreateEnvironmentIfMissing = $true).
+      Stops only when the name matches more than one environment.
     - Checks any existing agent (Healthy, Stale or NotInstalled) and removes Stale leftovers before installing.
     - Installs Npcap with the bundle by default ($InstallNpcap = $true); enables network discovery only if $EnableNetworkDiscovery = $true (off by default).
     - Checks proxy settings before installing, then confirms the service, the updater task and each bundle component.
@@ -35,6 +37,10 @@ $AgentTokenSecret           = "REPLACE_WITH_AGENT_TOKEN_SECRET"  # Liongard agen
 $Environment                = "REPLACE_WITH_ENVIRONMENT_NAME"    # Environment name (can be an RMM variable)
 $AgentDescription           = ""                                 # Optional agent description; passed as LiongardDescription when set
 $IncludeEnvironmentValue    = $true                              # Set to $false to omit the LiongardEnvironment value
+# Off by default. When $true, only an exact (case-insensitive) environment name match counts, and an
+# environment that does not exist is created through the API with the name as written. Needs an API
+# token that is allowed to create environments. If creating fails, the agent is installed without one.
+$CreateEnvironmentIfMissing = $false
 
 # Network discovery: when $true, after a successful install (or when the agent is
 # already present and up to date) the script flips the network discovery 'enabled'
@@ -61,6 +67,13 @@ $ClearProxyEnvironmentForInstaller = $true
 $script:TranscriptStarted = $false
 $script:TranscriptPath = $null
 $script:EnvironmentResolutionReason = $null
+
+# Missing-environment retry, used only when the environment lookup API call itself failed.
+# UNCONFIRMED: the installer's exact error text for an environment that does not exist in Liongard
+# is not known yet; this pattern is a best guess and will be tightened once QA captures the real
+# message. Only a failed install whose log matches it is retried (once, without the environment).
+$script:MissingEnvironmentPattern = '(?i)environment.{0,80}(does\s*not|doesn''?t|not)\s+exist'
+
 $script:RunWarnings = New-Object System.Collections.Generic.List[string]
 $script:RunErrors = New-Object System.Collections.Generic.List[string]
 $script:SummaryArtifactPath = $null
@@ -1640,6 +1653,7 @@ function Write-ConfigurationSnapshot {
     Write-SectionValue -Label 'Environment' -Value $Environment
     Write-SectionValue -Label 'AgentDescription' -Value $AgentDescription
     Write-SectionValue -Label 'IncludeEnvironmentValue' -Value $IncludeEnvironmentValue
+    Write-SectionValue -Label 'CreateEnvironmentIfMissing' -Value $CreateEnvironmentIfMissing
     Write-SectionValue -Label 'Folder' -Value $Folder
     Write-SectionValue -Label 'InstallerUrl' -Value $InstallerUrl
     Write-SectionValue -Label 'InstallerFileName' -Value $InstallerFileName
@@ -1729,18 +1743,16 @@ function Get-LiongardEnvironments {
 
     $uri = "https://$InstancePrefix.app.liongard.com/api/v1/environments"
 
+    # A failed call throws, so the caller can tell it apart from an empty list.
     try {
         $response = Invoke-RestMethod -Uri $uri -Headers $Headers -ErrorAction Stop
     }
     catch {
         $detail = Get-HttpErrorDetail -Exception $_.Exception
         if ($detail) {
-            Write-Warning "Unable to retrieve Liongard environments: $($_.Exception.Message) | Response: $detail"
+            throw "Unable to retrieve Liongard environments: $($_.Exception.Message) | Response: $detail"
         }
-        else {
-            Write-Warning "Unable to retrieve Liongard environments: $($_.Exception.Message)"
-        }
-        return @()
+        throw "Unable to retrieve Liongard environments: $($_.Exception.Message)"
     }
 
     # The /environments endpoint returns a bare JSON array; the fallback below is
@@ -1751,25 +1763,29 @@ function Get-LiongardEnvironments {
 }
 
 function Resolve-LiongardEnvironmentName {
+    # Returns the matching environment name, or $null with $script:EnvironmentResolutionReason set:
+    # LookupFailed (API call failed), NoEnvironmentsReturned, TooShort, NoMatch or Ambiguous*.
+    # -ExactOnly skips the normalized, prefix and contains passes.
     param(
         [Parameter(Mandatory)][string]$InputName,
         [Parameter(Mandatory)][string]$InstancePrefix,
-        [Parameter(Mandatory)][hashtable]$Headers
+        [Parameter(Mandatory)][hashtable]$Headers,
+        [switch]$ExactOnly
     )
 
     $script:EnvironmentResolutionReason = 'Unknown'
     $minNormalizedLength = 4
     $inputNormalized = Normalize-EnvironmentName -Value $InputName
-    if (-not $inputNormalized) { return $null }
 
-    if ($inputNormalized.Length -lt $minNormalizedLength) {
-        $script:EnvironmentResolutionReason = 'TooShort'
-        Write-Warning ("Provided environment value '{0}' normalized to '{1}', which is too short to match reliably (min {2})." -f $InputName, $inputNormalized, $minNormalizedLength)
+    try {
+        $environments = @(Get-LiongardEnvironments -InstancePrefix $InstancePrefix -Headers $Headers)
+    }
+    catch {
+        $script:EnvironmentResolutionReason = 'LookupFailed'
+        Write-Warning $_.Exception.Message
         return $null
     }
-
-    $environments = Get-LiongardEnvironments -InstancePrefix $InstancePrefix -Headers $Headers
-    if (-not $environments -or $environments.Count -eq 0) {
+    if ($environments.Count -eq 0) {
         $script:EnvironmentResolutionReason = 'NoEnvironmentsReturned'
         return $null
     }
@@ -1777,7 +1793,7 @@ function Resolve-LiongardEnvironmentName {
     $exact = $environments |
         Where-Object {
             $name = Get-LiongardEnvironmentNameValue -Environment $_
-            [string]::Equals($name, $InputName, [System.StringComparison]::InvariantCultureIgnoreCase)
+            [string]::Equals($name, $InputName.Trim(), [System.StringComparison]::InvariantCultureIgnoreCase)
         } |
         Select-Object -First 1
 
@@ -1787,6 +1803,19 @@ function Resolve-LiongardEnvironmentName {
         if (-not [string]::IsNullOrWhiteSpace($exactName)) {
             return $exactName
         }
+    }
+
+    if ($ExactOnly) {
+        $script:EnvironmentResolutionReason = 'NoMatch'
+        Write-Warning ("No Liongard environment is named exactly '{0}' (exact match only because CreateEnvironmentIfMissing is on)." -f $InputName)
+        return $null
+    }
+
+    # The remaining passes need a normalized name long enough to match reliably.
+    if (-not $inputNormalized -or $inputNormalized.Length -lt $minNormalizedLength) {
+        $script:EnvironmentResolutionReason = 'TooShort'
+        Write-Warning ("Provided environment value '{0}' normalized to '{1}', which is too short to match reliably (min {2})." -f $InputName, $inputNormalized, $minNormalizedLength)
+        return $null
     }
 
     $normalizedCandidates = @()
@@ -1867,6 +1896,63 @@ function Resolve-LiongardEnvironmentName {
     $sampleNames = ($knownNames | Select-Object -First 5) -join '; '
     Write-Warning ("No Liongard environment matched provided name '{0}' (normalized '{1}'). Known environments: {2}" -f $InputName, $inputNormalized, $sampleNames)
     return $null
+}
+
+function New-LiongardEnvironment {
+    # Creates an environment (POST /api/v1/environments, body {"Name": ...}). Returns the created
+    # environment's name, or $null on failure. The API token needs permission to create environments.
+    param(
+        [Parameter(Mandatory)][string]$InstancePrefix,
+        [Parameter(Mandatory)][hashtable]$Headers,
+        [Parameter(Mandatory)][string]$Name
+    )
+
+    $uri  = "https://$InstancePrefix.app.liongard.com/api/v1/environments"
+    $body = [System.Text.Encoding]::UTF8.GetBytes((@{ Name = $Name } | ConvertTo-Json -Compress))
+
+    try {
+        $response = Invoke-RestMethod -Uri $uri -Method Post -Headers $Headers -Body $body -ContentType 'application/json; charset=utf-8' -ErrorAction Stop
+    }
+    catch {
+        Write-Warning "Unable to create Liongard environment '$Name': $($_.Exception.Message)"
+        return $null
+    }
+
+    $created = if ($null -ne $response) { Get-LiongardEnvironmentNameValue -Environment @($response)[0] } else { $null }
+    if ([string]::IsNullOrWhiteSpace($created)) { return $Name }
+    return $created
+}
+
+function Find-LiongardMissingEnvironmentError {
+    # First line of the (already redacted) installer log(s) that matches $script:MissingEnvironmentPattern,
+    # masked; $null if none. Reads UTF-16 (MSI) and UTF-8/ANSI (bundle) logs.
+    param([Parameter(Mandatory)][string]$LogPath)
+
+    foreach ($file in @(Get-LiongardRelatedLog -Path $LogPath)) {
+        try { $bytes = [System.IO.File]::ReadAllBytes($file) }
+        catch { Write-Warning "Could not read installer log [$file]: $($_.Exception.Message)"; continue }
+
+        $encoding = if ($bytes.Length -ge 2 -and $bytes[0] -eq 0xFF -and $bytes[1] -eq 0xFE) { [System.Text.Encoding]::Unicode }
+                    elseif ($bytes.Length -ge 2 -and $bytes[0] -eq 0xFE -and $bytes[1] -eq 0xFF) { [System.Text.Encoding]::BigEndianUnicode }
+                    elseif ($bytes.Length -ge 4 -and $bytes[1] -eq 0 -and $bytes[3] -eq 0) { [System.Text.Encoding]::Unicode }
+                    else { [System.Text.Encoding]::UTF8 }
+
+        foreach ($line in ($encoding.GetString($bytes) -split '\r?\n')) {
+            if ($line -match $script:MissingEnvironmentPattern) { return (Hide-LiongardSecretText -Text $line.Trim()) }
+        }
+    }
+
+    return $null
+}
+
+function Get-LiongardRetryLogPath {
+    # A new AgentInstall_<timestamp>.log for the retry; log retention counts it as its own run.
+    while ($true) {
+        $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+        $path  = Join-Path -Path $script:LiongardDeploy.Root -ChildPath "AgentInstall_$stamp.log"
+        if ($stamp -ne $script:LiongardDeploy.Stamp -and -not (Test-Path -LiteralPath $path)) { return $path }
+        Start-Sleep -Seconds 1
+    }
 }
 
 function Resolve-InstancePrefix {
@@ -2861,6 +2947,12 @@ $logPath = $null
 $environmentInput = $Environment
 $environmentNormalized = Normalize-EnvironmentName -Value $Environment
 $resolvedEnvironmentValue = $null
+$includeEnvironment = $IncludeEnvironmentValue -and -not [string]::IsNullOrWhiteSpace($Environment)
+$environmentWarning = $null          # Repeated in the final outcome when set.
+$environmentRetryAllowed = $false    # Only when the lookup failed: retry once without the environment if the installer says it does not exist.
+$environmentOmitted = $false
+$environmentCreated = $false
+$retriedWithoutEnvironment = $false
 $localFqdn = $null
 $proxyEnvironmentSnapshot = @()
 $installedAgentVersion = $null
@@ -2940,9 +3032,11 @@ try {
     Start-LogSection -Name 'Environment Resolution'
     Write-SectionValue -Label 'Environment Input' -Value $environmentInput
     Write-SectionValue -Label 'Environment Input Normalized' -Value $environmentNormalized
-    if ($IncludeEnvironmentValue -and -not [string]::IsNullOrWhiteSpace($Environment)) {
+    # An environment that does not exist is left out (the install fails otherwise), or
+    # created when $CreateEnvironmentIfMissing is on.
+    if ($includeEnvironment) {
         $script:EnvironmentResolutionReason = $null
-        $resolvedEnvironment = Resolve-LiongardEnvironmentName -InputName $Environment -InstancePrefix $instancePrefix -Headers $headers
+        $resolvedEnvironment = Resolve-LiongardEnvironmentName -InputName $Environment -InstancePrefix $instancePrefix -Headers $headers -ExactOnly:$CreateEnvironmentIfMissing
         if ($resolvedEnvironment -and -not [string]::Equals($resolvedEnvironment, $Environment, [System.StringComparison]::Ordinal)) {
             Write-Host ("Matched provided environment to Liongard: '{0}' -> '{1}' (Reason: {2})" -f $Environment, $resolvedEnvironment, $script:EnvironmentResolutionReason)
             $Environment = $resolvedEnvironment
@@ -2953,15 +3047,36 @@ try {
         else {
             $normalizedEnv = Normalize-EnvironmentName -Value $Environment
             $reasonLabel = if ($script:EnvironmentResolutionReason) { $script:EnvironmentResolutionReason } else { 'Unknown' }
-            if ($reasonLabel -eq 'NoEnvironmentsReturned') {
-                Add-RunWarning ("Environment lookup API did not return environments for host '{0}'. Continuing with the supplied LiongardEnvironment value '{1}' without API confirmation." -f $liongardHost, $Environment)
+            if ($reasonLabel -like 'Ambiguous*') {
+                throw ("Environment '{0}' (normalized '{1}') matches more than one Liongard environment. Reason: {2}. Aborting installation; set Environment to the exact name." -f $Environment, $normalizedEnv, $reasonLabel)
+            }
+            elseif ($reasonLabel -eq 'LookupFailed') {
+                $environmentRetryAllowed = $true
+                Add-RunWarning ("Could not check environment '{0}' in Liongard for host '{1}'. Continuing with the value as typed; if the installer reports that it does not exist, the install is retried once without an environment." -f $Environment, $liongardHost)
             }
             else {
-                throw ("Environment '{0}' (normalized '{1}') could not be resolved in Liongard. Reason: {2}. Aborting installation because LiongardEnvironment is required." -f $Environment, $normalizedEnv, $reasonLabel)
+                $createdEnvironment = $null
+                if ($CreateEnvironmentIfMissing) {
+                    Write-Host ("Environment '{0}' was not found in Liongard (Reason: {1}). Creating it (CreateEnvironmentIfMissing)." -f $Environment, $reasonLabel)
+                    $createdEnvironment = New-LiongardEnvironment -InstancePrefix $instancePrefix -Headers $headers -Name $Environment.Trim()
+                }
+
+                if ($createdEnvironment) {
+                    Write-Host ("Created environment in Liongard: '{0}'." -f $createdEnvironment)
+                    $script:EnvironmentResolutionReason = 'Created'
+                    $environmentCreated = $true
+                    $Environment = $createdEnvironment
+                }
+                else {
+                    $environmentWarning = "Environment '$Environment' was not found in Liongard$(if ($CreateEnvironmentIfMissing) { ' and could not be created' }). The agent was installed without an environment; assign it in Liongard."
+                    Add-RunWarning ("Environment '{0}' was not found in Liongard$(if ($CreateEnvironmentIfMissing) { ' and could not be created' }) (Reason: {1}). The agent will be installed without an environment; assign it in Liongard." -f $Environment, $reasonLabel)
+                    $includeEnvironment = $false
+                    $environmentOmitted = $true
+                }
             }
         }
     }
-    $resolvedEnvironmentValue = $Environment
+    $resolvedEnvironmentValue = if ($includeEnvironment) { $Environment } else { $null }
     Write-SectionValue -Label 'Resolution Reason' -Value $script:EnvironmentResolutionReason
     Write-SectionValue -Label 'Resolved Environment' -Value $resolvedEnvironmentValue
     Complete-LogSection
@@ -3031,63 +3146,88 @@ try {
     }
     Complete-LogSection
 
-    $exeArguments = Get-ExeInstallArguments `
-        -LiongardHost $liongardHost `
-        -AgentTokenKey $AgentTokenKey `
-        -AgentTokenSecret $AgentTokenSecret `
-        -AgentName $localHostname `
-        -Environment $(if ($IncludeEnvironmentValue) { $Environment } else { $null }) `
-        -AgentDescription $AgentDescription `
-        -EulaAccepted $EulaAccepted `
-        -InstallNpcap $InstallNpcap `
-        -SuppressRestart $SuppressRestart `
-        -PassiveMode $PassiveMode `
-        -LogPath $logPath `
-        -ProxyUrl $ProxyUrl `
-        -AutoUpdate $AutoUpdate `
-        -AutoUpdateArgumentName $AutoUpdateArgumentName
+    # A second attempt runs only after a failed environment lookup, when the first install failed
+    # and its log says the environment does not exist.
+    for ($installAttempt = 1; $installAttempt -le 2; $installAttempt++) {
+        $exeArguments = Get-ExeInstallArguments `
+            -LiongardHost $liongardHost `
+            -AgentTokenKey $AgentTokenKey `
+            -AgentTokenSecret $AgentTokenSecret `
+            -AgentName $localHostname `
+            -Environment $(if ($includeEnvironment) { $Environment } else { $null }) `
+            -AgentDescription $AgentDescription `
+            -EulaAccepted $EulaAccepted `
+            -InstallNpcap $InstallNpcap `
+            -SuppressRestart $SuppressRestart `
+            -PassiveMode $PassiveMode `
+            -LogPath $logPath `
+            -ProxyUrl $ProxyUrl `
+            -AutoUpdate $AutoUpdate `
+            -AutoUpdateArgumentName $AutoUpdateArgumentName
 
-    $maskedArguments = Get-MaskedInstallArguments -Arguments $exeArguments
+        $maskedArguments = Get-MaskedInstallArguments -Arguments $exeArguments
 
-    Start-LogSection -Name 'Installer Launch'
-    Write-Host "Launching EXE installer..."
-    Write-SectionValue -Label 'Masked Command' -Value ("`"{0}`" {1}" -f $installerPath, ($maskedArguments -join ' '))
+        Start-LogSection -Name $(if ($installAttempt -eq 1) { 'Installer Launch' } else { 'Installer Launch (retry without environment)' })
+        Write-Host "Launching EXE installer..."
+        Write-SectionValue -Label 'Masked Command' -Value ("`"{0}`" {1}" -f $installerPath, ($maskedArguments -join ' '))
 
-    $process = Start-LiongardInstallerProcess -InstallerPath $installerPath -Arguments $exeArguments -ClearProxyEnvironment $ClearProxyEnvironmentForInstaller -ExplicitProxyUrl $ProxyUrl
-    $exitCode = if ($process) { $process.ExitCode } else { $LASTEXITCODE }
+        $process = Start-LiongardInstallerProcess -InstallerPath $installerPath -Arguments $exeArguments -ClearProxyEnvironment $ClearProxyEnvironmentForInstaller -ExplicitProxyUrl $ProxyUrl
+        $exitCode = if ($process) { $process.ExitCode } else { $LASTEXITCODE }
 
-    Write-SectionValue -Label 'Installer Exit Code' -Value "$exitCode ($(Get-ExitCodeText -Code $exitCode))"
+        Write-SectionValue -Label 'Installer Exit Code' -Value "$exitCode ($(Get-ExitCodeText -Code $exitCode))"
 
-    if (Test-Path -LiteralPath $logPath) {
-        $logFile = Get-Item -LiteralPath $logPath -ErrorAction SilentlyContinue
-        if ($logFile) {
-            Write-SectionValue -Label 'Installer Log Path' -Value ("{0} ({1:N0} bytes)" -f $logPath, $logFile.Length)
+        if (Test-Path -LiteralPath $logPath) {
+            $logFile = Get-Item -LiteralPath $logPath -ErrorAction SilentlyContinue
+            if ($logFile) {
+                Write-SectionValue -Label 'Installer Log Path' -Value ("{0} ({1:N0} bytes)" -f $logPath, $logFile.Length)
+            }
+            else {
+                Write-SectionValue -Label 'Installer Log Path' -Value $logPath
+            }
         }
         else {
-            Write-SectionValue -Label 'Installer Log Path' -Value $logPath
+            Add-RunWarning "Installer log path was not found: $logPath"
         }
-    }
-    else {
-        Add-RunWarning "Installer log path was not found: $logPath"
-    }
 
-    $summary = Read-InstallerLogSummary -Path $logPath -MaxWaitSeconds 30
-    Protect-LiongardInstallerLog -Path $logPath
-    if ($summary.Found) {
-        if ($summary.StatusLine) {
-            Write-SectionValue -Label 'Installer Log Status' -Value $summary.StatusLine
+        $summary = Read-InstallerLogSummary -Path $logPath -MaxWaitSeconds 30
+        Protect-LiongardInstallerLog -Path $logPath
+        if ($summary.Found) {
+            if ($summary.StatusLine) {
+                Write-SectionValue -Label 'Installer Log Status' -Value $summary.StatusLine
+            }
+            if ($summary.ErrorLine) {
+                Add-RunWarning "Installer log error hint: $($summary.ErrorLine)"
+            }
         }
-        if ($summary.ErrorLine) {
-            Add-RunWarning "Installer log error hint: $($summary.ErrorLine)"
+        elseif ($summary.Tail -and $summary.Tail.Count -gt 0) {
+            Write-Host "Installer log tail:"
+            foreach ($line in $summary.Tail) {
+                Write-Host " - $line"
+            }
         }
+
+        $missingEnvironmentLine = $null
+        if ($exitCode -ne 0 -and $exitCode -ne 3010 -and $includeEnvironment -and $environmentRetryAllowed) {
+            # Checks the bundle log and its per-package logs.
+            $missingEnvironmentLine = Find-LiongardMissingEnvironmentError -LogPath $logPath
+        }
+        if (-not $missingEnvironmentLine) {
+            Complete-LogSection
+            break
+        }
+
+        Add-RunWarning ("Environment '{0}' was not found in Liongard (installer log: {1}). Installing again without an environment; assign it in Liongard afterwards." -f $Environment, $missingEnvironmentLine)
+        $environmentWarning = "Environment '$Environment' was not found in Liongard. The agent was installed without an environment; assign it in Liongard."
+        $script:EnvironmentResolutionReason = 'RetriedWithoutEnvironment'
+        $includeEnvironment = $false
+        $environmentOmitted = $true
+        $retriedWithoutEnvironment = $true
+        $resolvedEnvironmentValue = $null
+        $logPath = Get-LiongardRetryLogPath
+        Register-LiongardDeployLog -Label 'Installer log (retry without environment)' -Path $logPath -Redact
+        Write-SectionValue -Label 'Retry Bootstrapper Log Path' -Value $logPath
+        Complete-LogSection
     }
-    elseif ($summary.Tail -and $summary.Tail.Count -gt 0) {
-        Write-Host "Installer log tail:"
-        foreach ($line in $summary.Tail) {
-            Write-Host " - $line"
-        }
-    }
-    Complete-LogSection
 
     try {
         $componentValidation = Get-ComponentValidationResults -LogPath $logPath -InstallNpcapRequested $InstallNpcap
@@ -3128,6 +3268,7 @@ try {
         Write-SectionValue -Label 'Warnings' -Value @($script:RunWarnings)
         Write-SectionValue -Label 'Errors' -Value @($script:RunErrors)
         Write-Host "Liongard Agent installation verified successfully."
+        if ($environmentWarning) { Write-Warning $environmentWarning }
         Complete-LogSection
         exit 0
     }
@@ -3169,6 +3310,9 @@ finally {
             environmentInput            = $environmentInput
             environmentResolved         = $resolvedEnvironmentValue
             environmentResolutionReason = $script:EnvironmentResolutionReason
+            environmentOmitted          = $environmentOmitted
+            environmentCreated          = $environmentCreated
+            retriedWithoutEnvironment   = $retriedWithoutEnvironment
             installState                = $installStateValue
             installedAgentVersion       = if ($installedAgentVersion) { $installedAgentVersion.ToString() } else { $null }
             installerBundleVersion      = if ($installerBundleVersion) { $installerBundleVersion.ToString() } else { $null }

@@ -19,7 +19,7 @@ What the install script does, in order:
    It downloads the package with retries, unless `PKG_PATH` points to one already on the Mac.
 3. Checks the package before installing. The download size must match the server's `Content-Length`, and the package must be at least 20 MB, signed with Liongard's Developer ID Installer certificate (Team ID `KU4C98N3LW`), and built for this Mac. SHA-256 checks will be added once checksum files are published ([#3](https://github.com/liongard/agent-scripts/issues/3)).
 4. Installs Rosetta 2 silently if the Intel package is used on Apple Silicon and Rosetta is missing.
-5. Hands your settings to the package (see [Logs and files](#logs-and-files)), runs `installer`, and confirms the agent is running.
+5. Hands your settings to the package (see [Logs and files](#logs-and-files)), runs `installer`, and confirms the agent is running. If registration fails because `ENVIRONMENT` doesn't exist in Liongard, it installs once more without it (see [Missing environment](#missing-environment)).
 
 What the uninstall script does, in order:
 
@@ -60,12 +60,20 @@ The script ships with `REPLACE_WITH_*` placeholders for these. For a new install
 | Setting | Default | What it does |
 |---|---|---|
 | `NAME` | The Mac's hostname | Agent name. |
-| `ENVIRONMENT` | None | Environment name. It must match the name in Liongard exactly. Blank registers the agent without an environment. |
+| `ENVIRONMENT` | None | Environment name. It must match the name in Liongard exactly. Blank registers the agent without an environment. If it doesn't exist in Liongard, the agent is installed without one. See [Missing environment](#missing-environment). |
 | `AGENT_DESCRIPTION` | None | Agent description. Needs agent package 5.5.0 or newer. |
 | `MAC_ARCHITECTURE` | `auto` | `auto` picks the package for the Mac's CPU. `x64` or `arm64` forces one. Ignored when `PKG_PATH` is set, because the package's own architecture is used. |
 | `PKG_PATH` | None | Full path to a `.pkg` already on the Mac, for example one your MDM staged. The script installs it instead of downloading. |
 
 `NAME`, `ENVIRONMENT` and `AGENT_DESCRIPTION` are blank by default. Leave them blank if you don't use them: the script stops with exit code `1` if one starts with `REPLACE_WITH_`. They apply only to a new install. The package skips registration when `/Library/Liongard/.config.json` already exists, so changing them and running the script again doesn't change an existing agent.
+
+### Missing environment
+
+If `ENVIRONMENT` names an environment that doesn't exist in Liongard, registration fails and `installer` exits non-zero. A failed registration leaves no agent config behind, so the script can safely try again: when the package log (`/tmp/liongard-agent-installer.log`) says the environment doesn't exist, it hands the settings to the package again without `ENVIRONMENT` and runs `installer` once more. Any other failure is reported as before.
+
+The script logs a WARN before the second attempt and again at the end: `Environment '<name>' was not found in Liongard. The agent was installed without an environment; assign it in Liongard.` Assign the agent to its environment in Liongard afterwards.
+
+The exact registration error for a missing environment isn't confirmed yet. The script looks for a line like "environment ... does not exist" in the package log; the pattern will be tightened once the real message is known.
 
 ## Running through an RMM or MDM
 
@@ -123,6 +131,8 @@ Logs can contain sensitive details, so check them before you share them.
 | `the Liongard Agent is still detected` (uninstall, exit `1`) | The lines after it list what's left. Check that your MDM isn't reinstalling the agent, then run the script again. |
 | `/Library/Liongard/uninstall.sh isn't a root-owned file ...` (uninstall) | The script skipped the package's own uninstall script and removed the agent itself. Check who changed the file. |
 | `/Library/Liongard is a symlink or can be changed by users other than root ...` (uninstall) | The script skipped the package's own uninstall script and removed the agent itself. Check who changed the folder. |
+| `Environment '<name>' was not found in Liongard. The agent was installed without an environment` | The agent is installed. Assign it to its environment in Liongard, and fix `ENVIRONMENT` for future installs. |
+| `the retry without environment '<name>' failed too` | Registration failed for another reason as well. Read `/tmp/liongard-agent-installer.log`. |
 | `the installer succeeded, but the agent isn't running` | Check `sudo launchctl print system/com.liongard.liongard-agent` and the package log. |
 
 For anything else, contact Liongard Partner Support with the logs above.

@@ -41,7 +41,7 @@ Set these in the configuration block at the top of the script. A script stops wi
 | `$LiongardUrl` | Clean install | Your instance address, for example `us9.app.liongard.com`. The short form `us9` also works. |
 | `$AgentTokenKey`, `$AgentTokenSecret` | All install scripts | Agent install token. |
 | `$ApiTokenKey`, `$ApiTokenSecret` | MSI and EXE Advanced. Uninstall Advanced only when `$RemoveAgentFromPlatform = $true` | Liongard API token. |
-| `$Environment` | All install scripts, unless `$IncludeEnvironmentValue = $false` | The Simple and Clean install scripts pass it to the installer exactly as written, so it must match the name in Liongard. The Advanced scripts look it up and correct casing or punctuation, and stop if no environment matches. |
+| `$Environment` | All install scripts, unless `$IncludeEnvironmentValue = $false` | The Simple and Clean install scripts pass it to the installer exactly as written, so it must match the name in Liongard. The Advanced scripts look it up and correct casing or punctuation. If the environment doesn't exist, the agent is installed without one. See [Missing environment](#missing-environment). |
 
 ### Optional
 
@@ -49,6 +49,7 @@ Set these in the configuration block at the top of the script. A script stops wi
 |---|---|---|---|
 | `$AgentDescription` | All install scripts | `""` | Agent description, passed to the installer when set. |
 | `$IncludeEnvironmentValue` | All install scripts | `$true` | `$false` registers the agent without an environment, and `$Environment` isn't needed. |
+| `$CreateEnvironmentIfMissing` | MSI and EXE Advanced | `$false` | `$true` creates the environment in Liongard when it doesn't exist, using `$Environment` as written. Only an exact name match (ignoring case) counts as existing. The API token must be allowed to create environments. If creating fails, the agent is installed without an environment. |
 | `$Folder` | All install scripts | `$env:ProgramData` | Parent of the working folder. See [Logs and files](#logs-and-files). |
 | `$InstallerUrl` | All install scripts | The `-lts` MSI or EXE on `agents.static.liongard.com` | Installer download address. |
 | `$EnableNetworkDiscovery` | EXE Simple and Advanced | `$false` | `$true` turns on network discovery in `network_discovery.yml` after the install, or when the agent is already up to date. |
@@ -67,6 +68,21 @@ Set these in the configuration block at the top of the script. A script stops wi
 | `$Environment` | Uninstall Advanced | `""` | The environment the agent is registered in, used only to pick the record to delete. Leave it blank for an agent with no environment. |
 | `$MinimumRemoteDeletionScore` | Uninstall Advanced | `50` | Deprecated and ignored. A warning is logged if it's changed. |
 | `$LogFolder` | Uninstall Simple and Advanced | `$env:ProgramData` | Same as `$Folder`, for the uninstall scripts. Uninstall Simple only writes its log there if `LiongardDeploy` already exists; see [Logs and files](#logs-and-files). |
+
+### Missing environment
+
+If `$Environment` names an environment that doesn't exist in Liongard, the installer fails. The scripts handle that so the agent still installs:
+
+- **MSI and EXE Advanced** look the name up through the API first:
+  - No match (including a name too short to match loosely): the agent is installed without an environment.
+  - With `$CreateEnvironmentIfMissing = $true`: only an exact match counts. A missing environment is created and used; if creating fails, the agent is installed without an environment.
+  - The name matches more than one environment: the script stops (exit `1`). Set `$Environment` to the exact name.
+  - The API call fails: the script continues with the name as written, and retries as described for the Simple scripts below. It doesn't create an environment in this case.
+- **MSI Simple, EXE Simple and Clean install** don't call the API. If the install fails and the installer log says the environment doesn't exist, they install once more without an environment. Any other failure is reported as before. The second attempt writes its own `AgentInstall_<timestamp>.log`, redacted like the first.
+
+Whenever the agent is installed without an environment, the script logs a WARN before the install and again at the end: `Environment '<name>' was not found in Liongard. The agent was installed without an environment; assign it in Liongard.` Assign the agent to its environment in Liongard afterwards. EXE Advanced finishes with `SuccessWithWarnings` and records the outcome in the JSON summary (`environmentOmitted`, `environmentCreated`, `retriedWithoutEnvironment`).
+
+The installer's exact error text for a missing environment isn't confirmed yet. The scripts look for a line like "environment ... does not exist" in the installer log; the pattern will be tightened once the real message is known.
 
 ## How remote deletion picks the agent
 
@@ -109,7 +125,7 @@ Current behavior. Standard exit codes across all scripts are planned in [#11](ht
 |---|---|---|
 | MSI Simple | Installed and validated, or already up to date. msiexec `3010` counts as success. | msiexec's own code when msiexec fails. `1` for any other failure. |
 | EXE Simple | Installed and validated, or already up to date. Installer `3010` counts as success. | The installer's own code when it fails. `1` for any other failure. |
-| MSI Advanced | Installed and validated, or already up to date. msiexec `3010` counts as success. | msiexec's own code when msiexec fails. `1` for any other failure, including an environment that can't be matched. |
+| MSI Advanced | Installed and validated, or already up to date. msiexec `3010` counts as success. | msiexec's own code when msiexec fails. `1` for any other failure, including an environment name that matches more than one environment. |
 | EXE Advanced | Installed and validated, or already up to date. Installer `3010` counts as success. | `1` for any failure. The installer's code is in the log and the JSON summary. |
 | Clean install | Installed and validated, or already up to date. msiexec `3010` and `1641` count as success and log a reboot WARN. | `1618`: another Windows Installer operation was running; run again later. msiexec's own code when msiexec fails. `1` for any other failure. Cleanup problems are logged as WARN and don't change the exit code. |
 | Uninstall Simple | The agent was removed and nothing is left, or no agent was installed. | `1` when anything is still detected afterwards (the script lists it), the script isn't elevated, or the script fails. |
@@ -158,8 +174,10 @@ After the installer exits, the scripts redact the installer logs in place, wheth
 | `... is a reparse point` or `... is a file, not a folder` | `$Folder` or `LiongardDeploy` is a link or a file. Remove it, or set `$Folder` to a different local folder. |
 | `Folder [...] must be an absolute local path` or `is inside the agent's own folder` | Set `$Folder` to a local path such as `C:\ProgramData`, outside `C:\ProgramData\Liongard`. |
 | Installer download failed | Check HTTPS access to `agents.static.liongard.com` from the endpoint. For a proxy, set `$ProxyUrl` (EXE scripts). |
-| `Environment '<name>' ... could not be resolved in Liongard` (Advanced) | Check the name and that the environment exists in your instance, or set `$IncludeEnvironmentValue = $false`. |
-| Environment problems (Simple, Clean install) | These scripts pass `$Environment` exactly as written and don't check it. Make sure it matches the name in Liongard exactly. Handling of a missing environment is tracked in [#9](https://github.com/liongard/agent-scripts/issues/9). |
+| `Environment '<name>' was not found in Liongard. The agent was installed without an environment` | The agent is installed. Assign it to its environment in Liongard, and fix `$Environment` for future installs. See [Missing environment](#missing-environment). |
+| `Environment '<name>' ... matches more than one Liongard environment` (Advanced) | Set `$Environment` to the exact name of the environment in Liongard. |
+| `Could not check environment '<name>' in Liongard` (Advanced) | The environment API call failed (check the API token and access to your instance). The script continued with the name as written. |
+| `Unable to create Liongard environment` (Advanced) | The API token may not be allowed to create environments. Create the environment in Liongard, or use a token that can. The agent was installed without an environment. |
 | `Remote agent deletion skipped: <n> agent records match this environment and hostname` (Uninstall Advanced) | Nothing was deleted from Liongard. Check the candidates listed above the warning. Set `$Environment` to the agent's environment (or blank for none), or delete the record in Liongard yourself. |
 | Exit code `1618` | Another Windows Installer operation was running. Run the script again later. |
 | `An agent update is still in progress after waiting 2 minutes` (Clean install) | The agent updates itself once a day, around midnight local time. Nothing was changed. Run the script again later. |

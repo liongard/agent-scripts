@@ -13,7 +13,9 @@
 #     unless REMOVE_AGENT_FROM_PLATFORM=true, and is then deleted only when exactly one
 #     agent has the same environment and hostname.
 #   - Matches the environment name through the Liongard API by default
-#     (ENABLE_ENVIRONMENT_MATCHING=true) and checks for machine-ID collisions.
+#     (ENABLE_ENVIRONMENT_MATCHING=true) and checks for machine-ID collisions. An
+#     environment that does not exist is left out with a WARN (or created when
+#     CREATE_ENVIRONMENT_IF_MISSING=true); an ambiguous name stops the install.
 #   - Downloads the installer to a private temporary folder and installs it.
 #   - Confirms the agent service is running.
 #
@@ -73,7 +75,16 @@ INCLUDE_ENVIRONMENT_VALUE=true
 
 # Look up the environment in Liongard and match/normalize the name before
 # installing (requires jq). Set to false to use the ENVIRONMENT value verbatim.
+# If no environment matches, the agent is installed without one and a WARN is
+# logged; assign it in Liongard afterwards.
 ENABLE_ENVIRONMENT_MATCHING=true
+
+# Off by default. When true, only an exact (case-insensitive) name match counts,
+# and an environment that does not exist is created through the API with the
+# name as written. Needs ENABLE_ENVIRONMENT_MATCHING=true and an API token that
+# is allowed to create environments. If creating fails, the agent is installed
+# without an environment.
+CREATE_ENVIRONMENT_IF_MISSING=false
 
 # Remove any existing Liongard Agent on this machine before installing.
 ENABLE_PRE_UNINSTALL=true
@@ -161,6 +172,7 @@ _PKG_MANAGER=""         # apt | yum | dnf | zypper | rpm | dpkg
 _DETECTED_SVC=""        # which service name was actually found
 _DEVICE_GUID_OVERRIDE=""
 _RESOLVED_ENVIRONMENT=""
+_ENVIRONMENT_WARNING="" # set when the environment is left out; repeated at the end
 _HTTP_CLIENT=""         # curl | wget
 _INSTALLER_PATH=""      # set by download_installer; avoids stdout-capture pollution
 _WORK_DIR=""            # private mktemp -d directory; removed on exit
@@ -259,6 +271,7 @@ print_config_snapshot() {
     log_info "AgentDescription            : ${AGENT_DESCRIPTION}"
     log_info "IncludeEnvironmentValue     : ${INCLUDE_ENVIRONMENT_VALUE}"
     log_info "EnableEnvironmentMatching   : ${ENABLE_ENVIRONMENT_MATCHING}"
+    log_info "CreateEnvironmentIfMissing  : ${CREATE_ENVIRONMENT_IF_MISSING}"
     log_info "EnablePreUninstall          : ${ENABLE_PRE_UNINSTALL}"
     log_info "RemoveAgentFromPlatform     : ${REMOVE_AGENT_FROM_PLATFORM}"
     log_info "LogDirectory                : ${LOG_DIRECTORY}"
@@ -675,6 +688,29 @@ _api_get() {
     fi
 }
 
+# Perform an authenticated POST with a JSON body.
+# Usage: _api_post_json <path> <json>  → prints response body; returns non-zero on HTTP error.
+_api_post_json() {
+    local path="$1"
+    local body="$2"
+    local url="${_INSTANCE_BASE_URL}${path}"
+
+    if [[ "${_HTTP_CLIENT}" == "curl" ]]; then
+        _curl_auth_config | curl -sSL --fail --config - \
+            -X POST \
+            -H "Content-Type: application/json" \
+            -H "User-Agent: LiongardLinuxAgentInstaller/1.0" \
+            --data-binary "${body}" \
+            "${url}"
+    else
+        WGETRC="${_WGET_CONFIG_FILE}" wget -qO- \
+            --header="Content-Type: application/json" \
+            --header="User-Agent: LiongardLinuxAgentInstaller/1.0" \
+            --post-data="${body}" \
+            "${url}"
+    fi
+}
+
 # Perform an authenticated DELETE and return only the HTTP status code.
 _api_delete() {
     local path="$1"
@@ -721,24 +757,28 @@ normalize_env_name() {
 }
 
 # Resolve ENVIRONMENT against the Liongard API using progressive matching.
-# On success: sets _RESOLVED_ENVIRONMENT and returns 0.
-# On failure: logs a warning and returns 1.
+# Usage: resolve_environment_name [exact-only]
+#   exact-only → only the exact case-insensitive match counts (used with
+#   CREATE_ENVIRONMENT_IF_MISSING=true).
+# Returns 0 and sets _RESOLVED_ENVIRONMENT on a match; otherwise logs a warning
+# and returns 1 (no such environment, including a name too short to match
+# loosely), 2 (ambiguous) or 3 (the API call failed).
 resolve_environment_name() {
+    local exact_only="${1:-}"
     local input_name="${ENVIRONMENT}"
     local input_norm
     input_norm="$(normalize_env_name "${input_name}")"
-
-    if [[ "${#input_norm}" -lt 4 ]]; then
-        log_warn "Environment '${input_name}' normalizes to '${input_norm}' — too short for reliable matching (min 4 chars)."
-        return 1
-    fi
 
     log_step "Resolving environment '${input_name}' against Liongard API..."
 
     local response
     if ! response="$(_api_get "/environments" 2>/dev/null)"; then
         log_warn "Could not retrieve Liongard environments from API."
-        return 1
+        return 3
+    fi
+    if ! printf '%s' "${response}" | jq empty >/dev/null 2>&1; then
+        log_warn "The Liongard environments API returned a response that is not JSON."
+        return 3
     fi
 
     # Extract environment name values from common response shapes.
@@ -758,7 +798,7 @@ resolve_environment_name() {
     ' 2>/dev/null)"
 
     if [[ -z "${names_raw}" ]]; then
-        log_warn "No environment names extracted from API response."
+        log_warn "The Liongard environments API returned no environment names."
         return 1
     fi
 
@@ -768,7 +808,7 @@ resolve_environment_name() {
     done <<< "${names_raw}"
 
     local input_lower
-    input_lower="$(printf '%s' "${input_name}" | tr '[:upper:]' '[:lower:]')"
+    input_lower="$(printf '%s' "${input_name}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | tr '[:upper:]' '[:lower:]')"
 
     # 1. Exact case-insensitive match.
     local name name_lower
@@ -779,6 +819,17 @@ resolve_environment_name() {
             _RESOLVED_ENVIRONMENT="${name}"; return 0
         fi
     done
+
+    if [[ "${exact_only}" == "exact-only" ]]; then
+        log_warn "No Liongard environment is named exactly '${input_name}' (exact match only because CREATE_ENVIRONMENT_IF_MISSING=true)."
+        return 1
+    fi
+
+    # The remaining passes need a normalized name long enough to match reliably.
+    if [[ "${#input_norm}" -lt 4 ]]; then
+        log_warn "Environment '${input_name}' normalizes to '${input_norm}' — too short for reliable matching (min 4 chars)."
+        return 1
+    fi
 
     # Helper: build arrays of names whose normalized value equals input_norm,
     # shares a prefix, or contains input_norm (bi-directionally).
@@ -802,7 +853,7 @@ resolve_environment_name() {
         _RESOLVED_ENVIRONMENT="${norm_matches[0]}"; return 0
     elif [[ "${#norm_matches[@]}" -gt 1 ]]; then
         log_warn "Ambiguous normalized environment match for '${input_name}'. Candidates: ${norm_matches[*]}"
-        return 1
+        return 2
     fi
 
     # 3. Single prefix match.
@@ -811,7 +862,7 @@ resolve_environment_name() {
         _RESOLVED_ENVIRONMENT="${prefix_matches[0]}"; return 0
     elif [[ "${#prefix_matches[@]}" -gt 1 ]]; then
         log_warn "Ambiguous prefix environment match for '${input_name}'. Candidates: ${prefix_matches[*]}"
-        return 1
+        return 2
     fi
 
     # 4. Single contains match.
@@ -820,7 +871,7 @@ resolve_environment_name() {
         _RESOLVED_ENVIRONMENT="${contains_matches[0]}"; return 0
     elif [[ "${#contains_matches[@]}" -gt 1 ]]; then
         log_warn "Ambiguous contains environment match for '${input_name}'. Candidates: ${contains_matches[*]}"
-        return 1
+        return 2
     fi
 
     # 5. No match.
@@ -828,6 +879,30 @@ resolve_environment_name() {
     sample="$(printf '%s\n' "${env_names[@]:0:5}" | tr '\n' ';' | sed 's/;$//' | sed 's/;/; /g')"
     log_warn "No Liongard environment matched '${input_name}' (normalized '${input_norm}'). Sample known names: ${sample}"
     return 1
+}
+
+# Create ENVIRONMENT (trimmed) through the API: POST /environments with
+# {"Name": "<name>"}. The API token must be allowed to create environments.
+# On success: sets _RESOLVED_ENVIRONMENT to the created name and returns 0.
+# On failure: logs a warning and returns 1.
+create_environment() {
+    local name body response created
+    name="$(printf '%s' "${ENVIRONMENT}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    body="$(jq -cn --arg n "${name}" '{Name: $n}')"
+
+    log_step "Creating environment '${name}' in Liongard (CREATE_ENVIRONMENT_IF_MISSING=true)..."
+    if ! response="$(_api_post_json "/environments" "${body}" 2>/dev/null)"; then
+        log_warn "Could not create environment '${name}' in Liongard (check that the API token may create environments)."
+        return 1
+    fi
+
+    created="$(printf '%s' "${response}" | jq -r '
+        (if type == "array" then .[0] else . end)
+        | (.Name // .name // empty)
+    ' 2>/dev/null)" || created=""
+    _RESOLVED_ENVIRONMENT="${created:-${name}}"
+    log_ok "Created environment in Liongard: '${_RESOLVED_ENVIRONMENT}'"
+    return 0
 }
 
 # ============================================================
@@ -1763,19 +1838,49 @@ main() {
     log_info "No Liongard Agent installation detected. Proceeding with fresh install..."
 
     # ── Step 6: Environment name resolution ────────────────────────────
+    # An environment that does not exist is left out (the install fails
+    # otherwise), or created when CREATE_ENVIRONMENT_IF_MISSING=true.
     if [[ "${INCLUDE_ENVIRONMENT_VALUE}" == true ]]; then
         if [[ "${ENABLE_ENVIRONMENT_MATCHING}" == true ]]; then
-            if ! resolve_environment_name; then
-                local env_norm
-                env_norm="$(normalize_env_name "${ENVIRONMENT}")"
-                log_error "Environment '${ENVIRONMENT}' (normalized '${env_norm}') could not be resolved in Liongard. Aborting."
-                exit 4
+            local resolve_rc=0 env_norm
+            env_norm="$(normalize_env_name "${ENVIRONMENT}")"
+            if [[ "${CREATE_ENVIRONMENT_IF_MISSING}" == true ]]; then
+                resolve_environment_name exact-only || resolve_rc=$?
+            else
+                resolve_environment_name || resolve_rc=$?
             fi
+            case "${resolve_rc}" in
+                0) ;;
+                2)
+                    log_error "Environment '${ENVIRONMENT}' (normalized '${env_norm}') matches more than one Liongard environment. Set ENVIRONMENT to the exact name. Aborting."
+                    exit 4
+                    ;;
+                3)
+                    log_error "Environment '${ENVIRONMENT}' could not be checked because the Liongard API call failed. Aborting."
+                    exit 4
+                    ;;
+                *)
+                    if [[ "${CREATE_ENVIRONMENT_IF_MISSING}" != true ]] || ! create_environment; then
+                        local not_created=""
+                        if [[ "${CREATE_ENVIRONMENT_IF_MISSING}" == true ]]; then
+                            not_created=" and could not be created"
+                        fi
+                        _RESOLVED_ENVIRONMENT=""
+                        _ENVIRONMENT_WARNING="Environment '${ENVIRONMENT}' was not found in Liongard${not_created}. The agent was installed without an environment; assign it in Liongard."
+                        log_warn "Environment '${ENVIRONMENT}' was not found in Liongard${not_created}. The agent will be installed without an environment; assign it in Liongard."
+                    fi
+                    ;;
+            esac
         else
+            if [[ "${CREATE_ENVIRONMENT_IF_MISSING}" == true ]]; then
+                log_warn "CREATE_ENVIRONMENT_IF_MISSING=true is ignored because ENABLE_ENVIRONMENT_MATCHING=false."
+            fi
             _RESOLVED_ENVIRONMENT="${ENVIRONMENT}"
             log_info "Environment matching disabled; using value verbatim: ${_RESOLVED_ENVIRONMENT}"
         fi
-        log_ok "Resolved environment: ${_RESOLVED_ENVIRONMENT}"
+        if [[ -n "${_RESOLVED_ENVIRONMENT}" ]]; then
+            log_ok "Resolved environment: ${_RESOLVED_ENVIRONMENT}"
+        fi
     fi
 
     # ── Step 7: Liongard agent API query for collision detection ───────
@@ -1845,6 +1950,9 @@ main() {
 
     log_step "============================================================"
     log_ok   " Liongard Agent deployment complete."
+    if [[ -n "${_ENVIRONMENT_WARNING}" ]]; then
+        log_warn " ${_ENVIRONMENT_WARNING}"
+    fi
     log_step "============================================================"
     exit 0
 }
