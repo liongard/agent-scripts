@@ -1,7 +1,5 @@
 # Liongard Agent Deployment Scripts
 
-> **DRAFT – internal.** Not yet reviewed for public release. Do not share outside Liongard.
-
 Scripts that install, upgrade and remove the Liongard Agent on Windows, Linux and macOS endpoints through your RMM or MDM. Each script is one self-contained file: paste it into your RMM or MDM, fill in the configuration block at the top, and deploy.
 
 ## Which script do I use?

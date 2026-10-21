@@ -1,9 +1,7 @@
 # Code owners for liongard/agent-scripts.
-# Placeholders: replace with real team handles before requiring reviews.
-# Later rules take precedence over earlier ones.
+# Every pull request needs one approval from a code owner (see CONTRIBUTING.md).
+#
+# When a dev team exists in the liongard GitHub org, it can replace or join
+# the individual owners below.
 
-# *            @liongard/TEAM-PLACEHOLDER
-# /windows/    @liongard/WINDOWS-TEAM-PLACEHOLDER
-# /linux/      @liongard/LINUX-TEAM-PLACEHOLDER
-# /macos/      @liongard/MACOS-TEAM-PLACEHOLDER
-# SECURITY.md  @liongard/SECURITY-TEAM-PLACEHOLDER
+*    @david-chapman-liongard @mark-selyukov-liongard
