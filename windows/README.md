@@ -25,7 +25,7 @@ No script modifies the agent identity key `HKLM\SOFTWARE\WOW6432Node\Liongard`, 
 ## Requirements
 
 - Windows PowerShell 5.1, 64-bit. Uninstall Simple also works from 32-bit PowerShell.
-- Run as **SYSTEM** or an elevated administrator. The scripts stop if they aren't. The agent's Credential Manager entries are cleaned up only when the script runs as SYSTEM.
+- Run as **SYSTEM** or an elevated administrator. The scripts stop if they aren't. No script removes the agent's Credential Manager entries for now: that cleanup is disabled until the dev team confirms that a fresh install always issues new credentials ([#8](https://github.com/liongard/agent-scripts/issues/8)).
 - HTTPS access to `agents.static.liongard.com` for the installer, and to your instance (`<prefix>.app.liongard.com`) for the API calls of the Advanced scripts and of Uninstall Advanced with `$RemoveAgentFromPlatform = $true`. Uninstall Simple needs no network access.
 - An agent install token for every install script. An API token for the Advanced scripts, and for Uninstall Advanced when `$RemoveAgentFromPlatform = $true`. Uninstall Simple needs no token.
 

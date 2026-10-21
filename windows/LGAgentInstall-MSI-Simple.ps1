@@ -15,7 +15,7 @@
     Requires:     Windows PowerShell 5.1 (64-bit), run as SYSTEM or an elevated administrator.
                   Liongard agent install token (key and secret).
     Author:       Liongard Partner Support
-    Last updated: 2026-10-20
+    Last updated: 2026-10-21
 
 .LINK
     https://github.com/liongard/agent-scripts/blob/main/windows/README.md
@@ -545,7 +545,8 @@ function Stop-LGProcess {   # Processes running from a Liongard root (agent, upd
     foreach ($proc in $procs) { try { Stop-Process -Id $proc.ProcessId -Force -ErrorAction Stop; Write-LGLog "Stopped $($proc.Name) (PID $($proc.ProcessId))" } catch { Write-LGLog "WARN: could not stop $($proc.Name): $($_.Exception.Message)" } }
     if ($procs.Count) { Start-Sleep -Seconds 2 }
 }
-function Remove-LGStoredCredential {   # (d) TODO: pending developer confirmation that fresh installs always issue new credentials.
+function Remove-LGStoredCredential {   # (d) Disabled until dev confirms that a fresh install always issues new credentials (#8, dev Q1). The cleanup below is kept.
+    Write-LGLog 'Credential Manager cleanup is disabled until dev confirms that a fresh install always issues new credentials (#8). No entries were changed.'; return
     $id = [Security.Principal.WindowsIdentity]::GetCurrent()
     if ("$($id.User.Value)" -ne 'S-1-5-18') { Write-LGLog "WARN: not running as SYSTEM ($($id.Name)); agent credentials are not visible, cleanup skipped."; return }
     try { if (-not ('LGCred' -as [type])) { Add-Type -TypeDefinition $CredSource -ErrorAction Stop }; $store = 'LGCred' -as [type]; $targets = @($store::Find('LiongardAgent\AgentKey')) }

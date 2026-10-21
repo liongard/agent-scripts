@@ -7,7 +7,7 @@
     Set your values in the "Partner configuration" block below. Exit codes, logs and
     troubleshooting are in the README under .LINK.
     - Uninstalls the agent and removes its services, processes, folders and uninstall entries.
-    - Removes the agent's Credential Manager entries when run as SYSTEM.
+    - Leaves the agent's Credential Manager entries in place; that cleanup is disabled until the dev team confirms it is safe (#8).
     - Never modifies the agent identity key, so a later reinstall re-attaches to the same platform record.
     - Keeps the agent's record on the Liongard platform by default; set $RemoveAgentFromPlatform = $true to delete the matching record through the API.
     - Writes a full transcript log of the run.
@@ -16,7 +16,7 @@
     Requires:     Windows PowerShell 5.1 (64-bit), run as SYSTEM or an elevated administrator.
                   Liongard API token only when $RemoveAgentFromPlatform = $true.
     Author:       Liongard Partner Support
-    Last updated: 2026-10-20
+    Last updated: 2026-10-21
 
 .LINK
     https://github.com/liongard/agent-scripts/blob/main/windows/README.md
@@ -566,8 +566,11 @@ function Remove-LiongardStoredCredentials {
     # cannot reuse them. Matches ONLY Generic credentials whose UserName is exactly
     # 'LiongardAgent\AgentKey'; target names are random and are never used for matching.
     # Secret values are never read or logged.
-    # TODO: Pending developer confirmation that a fresh install always issues new
-    # credentials, so removing these entries can never strand a working agent.
+    # Disabled until dev confirms that a fresh install always issues new credentials (#8, dev Q1).
+    # The cleanup below is kept unchanged; it runs again once this early return is removed.
+    Write-LiongardStateLog INFO 'Credential Manager cleanup is disabled until dev confirms that a fresh install always issues new credentials (#8). No entries were changed.'
+    return [pscustomobject]@{ Status = 'Disabled'; Found = 0; Removed = 0; Failed = 0 }
+
     $found   = 0
     $removed = 0
     $failed  = 0
@@ -663,7 +666,7 @@ function Invoke-LiongardStaleCleanup {
         }
     }
 
-    # 4. Stored credentials.
+    # 4. Stored credentials. Currently disabled (Status 'Disabled', never an issue); see #8.
     $credentials = Remove-LiongardStoredCredentials
     if ($credentials.Status -eq 'Failed') { $issues.Add('credentials') | Out-Null }
 
@@ -1733,7 +1736,7 @@ function Invoke-LiongardAgentUninstall {
         Write-UninstallLog WARN ("Skipping installer cache cleanup: {0} MSI issue(s), {1} Liongard Agent product(s) still registered." -f $msiIssues.Count, $remainingProducts.Count)
     }
 
-    # Remove the agent's stored secrets from Credential Manager (SYSTEM context only).
+    # Credential Manager cleanup: currently disabled (#8); the call only logs that and returns 'Disabled'.
     $credentialResult = Remove-LiongardStoredCredentials
     if ($credentialResult.Status -eq 'Failed') {
         $issues.Add('credentials') | Out-Null
