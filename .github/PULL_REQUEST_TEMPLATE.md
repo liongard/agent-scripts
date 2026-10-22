@@ -12,6 +12,7 @@
 - [ ] windows/LGAgentUninstall-Simple.ps1
 - [ ] windows/LGAgentUninstall-Advanced.ps1
 - [ ] linux/LGAgentInstall-Linux.sh
+- [ ] linux/LGAgentUninstall-Linux.sh
 - [ ] macos/LGAgentInstall-macOS.sh
 
 ## Testing
