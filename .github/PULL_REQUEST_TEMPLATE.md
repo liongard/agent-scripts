@@ -14,6 +14,7 @@
 - [ ] linux/LGAgentInstall-Linux.sh
 - [ ] linux/LGAgentUninstall-Linux.sh
 - [ ] macos/LGAgentInstall-macOS.sh
+- [ ] macos/LGAgentUninstall-macOS.sh
 
 ## Testing
 

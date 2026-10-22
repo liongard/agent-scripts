@@ -17,6 +17,7 @@ Scripts that install, upgrade and remove the Liongard Agent on Windows, Linux an
 | Linux | Install (x64 or arm64; `.deb`, `.rpm`, `.run` or `.sh`) | `LGAgentInstall-Linux.sh` | [Linux](linux/README.md) |
 | Linux | Remove the agent from the endpoint | `LGAgentUninstall-Linux.sh` | [Linux](linux/README.md) |
 | macOS | Install (Intel or Apple Silicon) | `LGAgentInstall-macOS.sh` | [macOS](macos/README.md) |
+| macOS | Remove the agent from the Mac | `LGAgentUninstall-macOS.sh` | [macOS](macos/README.md) |
 
 - **Simple or Advanced (Windows):** Simple scripts make no Liongard API calls and need only an agent install token (Uninstall Simple needs none). Advanced scripts also need an API token, which they use to match the environment name before installing, or, for Uninstall Advanced, to delete the agent's platform record.
 - **MSI or EXE (Windows):** the EXE bundle adds Visual C++ and Npcap, which the network discovery inspector needs. Otherwise use the MSI.
