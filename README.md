@@ -12,7 +12,7 @@ Scripts that install, upgrade and remove the Liongard Agent on Windows, Linux an
 | Windows | Host will run the network discovery inspector (needs Npcap and Visual C++) | `LGAgentInstall-EXE-Simple.ps1` | [Windows](windows/README.md) |
 | Windows | You want the environment name checked through the Liongard API and a full transcript log | `LGAgentInstall-MSI-Advanced.ps1` or `LGAgentInstall-EXE-Advanced.ps1` | [Windows](windows/README.md) |
 | Windows | Agent is old, broken, partly uninstalled or corrupt | `LGAgentCleanInstall-MSI-Simple.ps1` | [Windows](windows/README.md) |
-| Windows | Remove the agent | `LGAgentUninstall.ps1` | [Windows](windows/README.md) |
+| Windows | Remove the agent | `LGAgentUninstall-Advanced.ps1` | [Windows](windows/README.md) |
 | Linux | Install (x64 or arm64; `.deb`, `.rpm`, `.run` or `.sh`) | `LGAgentInstall-Linux.sh` | [Linux](linux/README.md) |
 | macOS | Install (Intel or Apple Silicon) | `LGAgentInstall-macOS.sh` | [macOS](macos/README.md) |
 

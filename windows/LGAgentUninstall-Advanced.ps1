@@ -48,7 +48,7 @@ function Assert-ConfigurationValue {
 # ====================================================================
 # BEGIN SHARED BLOCK: Liongard install-state functions
 # Keep this block identical across LGAgentInstall-MSI-Advanced, LGAgentInstall-EXE-Advanced
-# and LGAgentUninstall. Edit one copy, then copy it to the other scripts.
+# and LGAgentUninstall-Advanced. Edit one copy, then copy it to the other scripts.
 # ====================================================================
 
 $script:LiongardServiceName       = 'roaragent.exe'
@@ -752,7 +752,7 @@ function Write-LiongardIdentityStatus {
 # ====================================================================
 # BEGIN SHARED BLOCK: Liongard deploy-folder functions
 # Keep this block identical across LGAgentInstall-MSI-Simple, LGAgentInstall-MSI-Advanced,
-# LGAgentInstall-EXE-Simple, LGAgentInstall-EXE-Advanced, LGAgentUninstall and
+# LGAgentInstall-EXE-Simple, LGAgentInstall-EXE-Advanced, LGAgentUninstall-Advanced and
 # LGAgentCleanInstall-MSI-Simple.
 # Edit one copy, then copy it to the other scripts.
 #
