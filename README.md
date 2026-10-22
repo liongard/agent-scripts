@@ -12,11 +12,12 @@ Scripts that install, upgrade and remove the Liongard Agent on Windows, Linux an
 | Windows | Host will run the network discovery inspector (needs Npcap and Visual C++) | `LGAgentInstall-EXE-Simple.ps1` | [Windows](windows/README.md) |
 | Windows | You want the environment name checked through the Liongard API and a full transcript log | `LGAgentInstall-MSI-Advanced.ps1` or `LGAgentInstall-EXE-Advanced.ps1` | [Windows](windows/README.md) |
 | Windows | Agent is old, broken, partly uninstalled or corrupt | `LGAgentCleanInstall-MSI-Simple.ps1` | [Windows](windows/README.md) |
-| Windows | Remove the agent | `LGAgentUninstall-Advanced.ps1` | [Windows](windows/README.md) |
+| Windows | Remove the agent from the endpoint | `LGAgentUninstall-Simple.ps1` | [Windows](windows/README.md) |
+| Windows | Remove the agent and also delete its record from the Liongard platform | `LGAgentUninstall-Advanced.ps1` | [Windows](windows/README.md) |
 | Linux | Install (x64 or arm64; `.deb`, `.rpm`, `.run` or `.sh`) | `LGAgentInstall-Linux.sh` | [Linux](linux/README.md) |
 | macOS | Install (Intel or Apple Silicon) | `LGAgentInstall-macOS.sh` | [macOS](macos/README.md) |
 
-- **Simple or Advanced (Windows):** Simple scripts make no Liongard API calls and need only an agent install token. Advanced scripts also need an API token, which they use to match the environment name before installing.
+- **Simple or Advanced (Windows):** Simple scripts make no Liongard API calls and need only an agent install token (Uninstall Simple needs none). Advanced scripts also need an API token, which they use to match the environment name before installing, or, for Uninstall Advanced, to delete the agent's platform record.
 - **MSI or EXE (Windows):** the EXE bundle adds Visual C++ and Npcap, which the network discovery inspector needs. Otherwise use the MSI.
 
 ## Before you start
@@ -25,7 +26,7 @@ You need:
 
 - **Your Liongard instance:** its prefix or address, for example `us1` or `us1.app.liongard.com`.
 - **An agent install token** (key and secret). Every install script needs one.
-- **An API token** (key and secret) for the Windows Advanced scripts, the Linux script, and the Windows uninstall script when it also removes the agent from the platform.
+- **An API token** (key and secret) for the Windows Advanced scripts, the Linux script, and `LGAgentUninstall-Advanced.ps1` when it also removes the agent from the platform. The Simple uninstall scripts need no token.
 - **The environment name**, if you assign agents to an environment. It must match the name in Liongard.
 
 Keep tokens in your RMM's or MDM's secure variables or script fields. Don't save them in a copy of the script that other people can read.
