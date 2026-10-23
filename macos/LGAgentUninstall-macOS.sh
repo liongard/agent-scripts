@@ -109,8 +109,9 @@ else
 
   # The package's own script stops and removes both services only when they're loaded, so the
   # steps after it always run. It's run only when it's a root-owned file nobody else can change,
-  # in a folder nobody else can change.
-  if [ -e "$PKG_UNINSTALL" ] && { [ -L "$AGENT_DIR" ] || writable_by_others "$AGENT_DIR"; }
+  # in a root-owned folder nobody else can change.
+  if [ -e "$PKG_UNINSTALL" ] \
+    && { [ -L "$AGENT_DIR" ] || [ ! -O "$AGENT_DIR" ] || writable_by_others "$AGENT_DIR"; }
   then
     log_warn "$AGENT_DIR is a symlink or can be changed by users other than root, so $PKG_UNINSTALL was not run."
   elif [ -f "$PKG_UNINSTALL" ] && [ ! -L "$PKG_UNINSTALL" ] && [ -O "$PKG_UNINSTALL" ] \
