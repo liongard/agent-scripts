@@ -31,12 +31,21 @@ jobs:
       - name: Run ShellCheck
         run: shellcheck linux/*.sh
 
-  # Blocking: the masking tests must pass.
+  # Blocking: every shared block must be byte-identical in each script that carries it.
+  shared-blocks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Check shared blocks
+        shell: pwsh
+        run: ./tests/Test-SharedBlocks.ps1
+
+  # Blocking: the PowerShell tests must pass.
   tests:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - name: Run masking tests
+      - name: Run PowerShell tests
         shell: pwsh
         run: ./tests/Run-Tests.ps1
 

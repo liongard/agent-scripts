@@ -1,25 +1,29 @@
 # Windows
 
-Six PowerShell scripts that install, repair or remove the Liongard Agent on Windows. For other platforms, and for what you need before you start, see the [main README](../README.md).
+Eight PowerShell scripts that install, repair or remove the Liongard Agent on Windows, and save or restore its identity. For other platforms, and for what you need before you start, see the [main README](../README.md).
 
 ## Scripts
 
 | Script | What it does | Use it when |
 |---|---|---|
-| `LGAgentInstall-MSI-Simple.ps1` | Installs the agent from the MSI, or upgrades it when the MSI is newer. No Liongard API calls. | Standard installs and upgrades. |
+| `LGAgentInstall-MSI-Simple.ps1` | Installs the agent from the MSI, or upgrades it when the MSI is newer. No Liongard API calls. Never removes an agent. | Standard installs and upgrades. |
 | `LGAgentInstall-EXE-Simple.ps1` | Installs the EXE bundle (agent, Visual C++ and Npcap), or upgrades it when the bundle is newer. No Liongard API calls. | The host will run the network discovery inspector. |
-| `LGAgentInstall-MSI-Advanced.ps1` | Like MSI Simple, but first matches the environment name through the Liongard API, and writes a full transcript log. | You want the environment name checked before the agent registers. |
+| `LGAgentInstall-MSI-Advanced.ps1` | Like MSI Simple, but first checks the environment name through the Liongard API, and writes a full transcript log. | You want the environment name checked before the agent registers. |
 | `LGAgentInstall-EXE-Advanced.ps1` | Like EXE Simple, plus the API environment check, a proxy check, per-component validation, a transcript log and a JSON run summary. | Network discovery hosts where you want the extra checks and logs. |
-| `LGAgentCleanInstall-MSI-Simple.ps1` | Removes an old, broken, incomplete or corrupt agent install, then installs from the MSI. A healthy agent is never cleaned up; it's upgraded only when the MSI is newer. It also reinstalls an agent the platform no longer accepts (for example, one deleted in the Liongard UI). | The agent was uninstalled but is still listed, or left its service, folder, Windows Installer entries or updater task behind, or the agent was deleted in the Liongard UI but is still installed. |
-| `LGAgentUninstall.ps1` | Removes the agent and its leftovers. It can also delete the agent's record from the Liongard platform. | Decommissioning an endpoint. |
+| `LGAgentCleanInstall-MSI-Simple.ps1` | Saves the agent identity, removes an old, broken, stopped, incomplete or corrupt agent install, then installs from the MSI. A healthy agent is never cleaned up; it's upgraded only when the MSI is newer. It also reinstalls an agent the platform no longer accepts (for example, one deleted in the Liongard UI) as the same agent. | The agent was uninstalled but is still listed, or left its service, folder, Windows Installer entries or updater task behind, or the agent was deleted in the Liongard UI but is still installed. |
+| `LGAgentUninstall-Simple.ps1` | Saves the agent identity, then removes the agent and its leftovers. Keeps the platform record. No API calls. | Removing the agent. |
+| `LGAgentUninstall-Advanced.ps1` | Like Uninstall Simple, then optionally deletes the agent's record from the Liongard platform. Renamed from `LGAgentUninstall.ps1`. | Decommissioning an endpoint for good. |
+| `LGAgentIdentity.ps1` | Saves the agent identity to a folder (`-Action Backup`), writes it back before a reinstall (`-Action Restore -From <folder>`), or shows it (`-Action Show`). It never saves a key or secret. | Rebuilding or reimaging a host that must come back as the same agent. |
 
 Every install script checks for an existing agent first:
 
-- **Healthy** (installed, service running, updater task present): it upgrades only when the installer is newer. Otherwise it exits `0` without changes.
-- **Stale** (leftovers of an earlier install): it removes the leftovers, then installs.
-- **NotInstalled:** it installs.
+- **Healthy** (uninstall entry, `roaragent.exe` service **Running**, and its binary): it upgrades only when the installer is newer. Otherwise it exits `0` without changes. If either version can't be read, it exits `5` and changes nothing.
+- **Stale** (a stopped agent, or leftovers of an earlier install): Install Simple and Advanced change nothing and exit `8`. Clean Install saves the identity, removes the leftovers, then installs; it exits `9` when the service or the uninstall entry survives the cleanup.
+- **NotInstalled:** it installs. Clean Install saves any identity left behind first.
 
-No script modifies the agent identity key `HKLM\SOFTWARE\WOW6432Node\Liongard`, so a reinstalled agent registers as the same agent.
+Before this release, Install Simple counted a stopped agent as Healthy, and Install Simple and Advanced cleaned up a Stale agent themselves.
+
+No install or uninstall script modifies the agent identity key `HKLM\SOFTWARE\WOW6432Node\Liongard`, so a reinstalled agent registers as the same agent. Only `LGAgentIdentity.ps1 -Action Restore` writes it.
 
 ## Requirements
 
@@ -36,35 +40,40 @@ Set these in the configuration block at the top of the script. A script stops wi
 
 | Setting | Scripts | Notes |
 |---|---|---|
-| `$InstancePrefix` | MSI and EXE Simple and Advanced. Uninstall only when `$RemoveAgentFromPlatform = $true` | Your instance prefix, for example `us1` or `eu1`. |
+| `$InstancePrefix` | MSI and EXE Simple and Advanced. Uninstall Advanced only when `$RemoveAgentFromPlatform = $true` | Your instance prefix, for example `us1` or `eu1`. |
 | `$LiongardUrl` | Clean install | Your instance address, for example `us9.app.liongard.com`. The short form `us9` also works. |
 | `$AgentTokenKey`, `$AgentTokenSecret` | All install scripts | Agent install token. |
-| `$ApiTokenKey`, `$ApiTokenSecret` | MSI and EXE Advanced. Uninstall only when `$RemoveAgentFromPlatform = $true` | Liongard API token. |
-| `$Environment` | All install scripts, unless `$IncludeEnvironmentValue = $false` | The Simple and Clean install scripts pass it to the installer exactly as written, so it must match the name in Liongard. The Advanced scripts look it up and correct casing or punctuation, and stop if no environment matches. |
+| `$ApiTokenKey`, `$ApiTokenSecret` | MSI and EXE Advanced. Uninstall Advanced only when `$RemoveAgentFromPlatform = $true` | Liongard API token. |
+| `$Environment` | All install scripts, unless `$IncludeEnvironmentValue = $false` | The Simple and Clean install scripts pass it to the installer exactly as written, so it must match the name in Liongard. The Advanced scripts look it up: exact, case-insensitive, normalized, then prefix or contains with 6+ normalized characters on both sides. No match, several matches or a failed lookup exits `4`. |
 
 ### Optional
 
 | Setting | Scripts | Default | What it does |
 |---|---|---|---|
 | `$AgentDescription` | All install scripts | `""` | Agent description, passed to the installer when set. |
+| `$AgentName` | All install scripts | `""` | Agent name (`LIONGARDAGENTNAME` for the MSI, `LiongardAgentName` for the EXE). Blank uses `$env:COMPUTERNAME`. |
+| `$DeviceGuid` | All install scripts | `""` | Agent identity to use on a fresh install (`DEVICEGUID` / `DeviceGuid`). An existing identity always wins. Must be a GUID. MSI 5.2.0 or later, EXE bundle 5.3.0 or later; older installers ignore it. |
+| `$ResetDeviceGuid` | All install scripts | `$false` | `$true` passes `RESETDEVICEGUID=1` / `ResetDeviceGuid=1`, so a fresh install gets a new identity instead of the saved one. 5.5.0 or later; older installers ignore it. |
+| `$InstallLocation` | All install scripts | `""` | Install folder (`INSTALLLOCATION` / `InstallLocation`). Blank uses `C:\Program Files (x86)\LiongardInc\LiongardAgent`. |
 | `$IncludeEnvironmentValue` | All install scripts | `$true` | `$false` registers the agent without an environment, and `$Environment` isn't needed. |
 | `$Folder` | All install scripts | `$env:ProgramData` | Parent of the working folder. See [Logs and files](#logs-and-files). |
 | `$InstallerUrl` | All install scripts | The `-lts` MSI or EXE on `agents.static.liongard.com` | Installer download address. |
 | `$EnableNetworkDiscovery` | EXE Simple and Advanced | `$false` | `$true` turns on network discovery in `network_discovery.yml` after the install, or when the agent is already up to date. |
-| `$InstallNpcap` | EXE Simple and Advanced | `$true` | Passed to the bundle as `InstallNpcap=1` or `0`. |
-| `$EulaAccepted` | EXE Simple and Advanced | `$true` | Passed to the bundle as `EulaAccepted=1` or `0`. |
+| `$InstallNpcap` | EXE Simple and Advanced | `$true` | Passed to the bundle as `InstallEnhancedNetworkDiscovery=1` or `0` (bundle 5.3.1 or later) and as `InstallNpcap=1` or `0` (5.3.0 and older). |
+| `$EulaAccepted` | EXE Simple and Advanced | `$true` | Passed to the bundle as `EulaAcceptCheckbox=1` or `0` (bundle 5.4.0 or later) and as `EulaAccepted=1` or `0` (5.3.x and older). |
 | `$SuppressRestart` | EXE Simple and Advanced | `$true` | Adds `/norestart`. |
 | `$PassiveMode` | EXE Simple and Advanced | `$false` | `$true` runs the bundle with `/passive` (progress UI) instead of `/quiet`. |
-| `$ProxyUrl` | EXE Simple and Advanced | `""` | Proxy for the installer, for example `http://proxy:8080`. Credentials in it are masked in the logs. |
+| `$ProxyUrl` | All install scripts | `""` | Proxy for the agent, for example `http://proxy:8080` (`PROXYURL` for the MSI, `ProxyUrl` for the EXE). Credentials in it are masked in the logs. |
 | `$ClearProxyEnvironmentForInstaller` | EXE Simple and Advanced | `$true` | Removes inherited `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` and `NO_PROXY` from the installer's environment. `$ProxyUrl`, if set, is applied again. |
-| `$AutoUpdate` | EXE Simple and Advanced | `$null` | `$true` or `$false` passes `AUTOUPDATE=1` or `0`. `$null` leaves it out. |
+| `$AutoUpdate` | All install scripts | `$null` | `$true` or `$false` passes `AUTOUPDATE=1` or `0`. `$null` leaves it out, and the installer default is on. |
+| `$ServiceAccount`, `$ServiceAccountPassword` | MSI Simple, MSI Advanced, Clean install | `""` | Runs the agent service as this account (`DOMAIN\user`) instead of LocalSystem (`LIONGARDAGENTSERVICEACCOUNT`, `LIONGARDAGENTSERVICEPASSWORD`). Set both or neither. The password is masked in the logs. The EXE bundle doesn't pass these to the MSI. |
 | `$InstallerFileName` | EXE Advanced | `LiongardAgent-lts.exe` | Name of the downloaded bundle. A file name only, with no folder. |
 | `$AutoUpdateArgumentName` | EXE Advanced | `AUTOUPDATE` | Property name used for `$AutoUpdate`. |
 | `$InstallerLogPath` | EXE Advanced | `""` | Deprecated and ignored. Installer logs always go to the working folder. |
-| `$CleanupPreviousAgents` | Clean install | `$true` | Removes broken, incomplete or corrupt installs before installing. `$false` makes the script behave like MSI Simple. |
-| `$RemoveAgentFromPlatform` | Uninstall | `$false` | `$true` also deletes the matching agent record from Liongard, after the local uninstall succeeds. Matching is being tightened in [#6](https://github.com/liongard/agent-scripts/issues/6), so leave it off unless you need it. |
-| `$MinimumRemoteDeletionScore` | Uninstall | `50` | Minimum match score a platform record needs before it's deleted. |
-| `$LogFolder` | Uninstall | `$env:ProgramData` | Same as `$Folder`, for the uninstall script. |
+| `$CleanupPreviousAgents` | Clean install | `$true` | Deprecated. Must stay `$true`; `$false` exits `2`. Use MSI Simple to install without cleanup. |
+| `$RemoveAgentFromPlatform` | Uninstall Advanced | `$false` | `$true` also deletes the agent's record from Liongard, after the local uninstall succeeds. See [Removing the platform record](#removing-the-platform-record). |
+| `$Environment` | Uninstall Advanced | `""` | The environment the agent is in. A MachineGuid or hostname match must be in this environment. Blank matches only an agent with no environment. |
+| `$LogFolder` | Uninstall Simple and Advanced | `$env:ProgramData` | Same as `$Folder`, for the uninstall scripts. |
 
 ## Running through an RMM or MDM
 
@@ -90,16 +99,39 @@ Set these in the configuration block at the top of the script. A script stops wi
 
 ## Exit codes
 
-Current behavior. Standard exit codes across all scripts are planned in [#11](https://github.com/liongard/agent-scripts/issues/11).
+Every Windows script uses the same table as Linux and macOS.
 
-| Script | `0` | Non-zero |
-|---|---|---|
-| MSI Simple | Installed and validated, or already up to date. msiexec `3010` counts as success. | msiexec's own code when msiexec fails. `1` for any other failure. |
-| EXE Simple | Installed and validated, or already up to date. Installer `3010` counts as success. | The installer's own code when it fails. `1` for any other failure. |
-| MSI Advanced | Installed and validated, or already up to date. msiexec `3010` counts as success. | msiexec's own code when msiexec fails. `1` for any other failure, including an environment that can't be matched. |
-| EXE Advanced | Installed and validated, or already up to date. Installer `3010` counts as success. | `1` for any failure. The installer's code is in the log and the JSON summary. |
-| Clean install | Installed and validated, or already up to date. msiexec `3010` and `1641` count as success and log a reboot WARN. | `1618`: another Windows Installer operation was running; run again later. msiexec's own code when msiexec fails. `1` for any other failure. Cleanup problems are logged as WARN and don't change the exit code. |
-| Uninstall | The agent is no longer detected. Problems with the optional platform removal are logged as warnings. | `1` when the agent is still detected afterwards, or the script fails. |
+| Code | Meaning |
+|---|---|
+| `0` | Installed and validated, already up to date, or the agent is removed (and the platform record deleted, or no record qualified). msiexec or bundle `3010` (and `1641` in Clean install) count as success and log a reboot note. |
+| `1` | Unexpected error. |
+| `2` | A setting is missing, a `REPLACE_WITH_*` placeholder, or invalid (including `$CleanupPreviousAgents = $false`). |
+| `3` | The `LiongardDeploy` folder check failed, or the script isn't running as SYSTEM or an elevated administrator. |
+| `4` | Environment check failed (Advanced): no match, several matches, or the lookup failed. |
+| `5` | Installer download failed, or the installed and installer versions can't be compared. Nothing was changed. |
+| `6` | The installer failed. msiexec's or the bundle's own code is in the log (and in the EXE Advanced JSON summary). |
+| `7` | The installer finished, but the service isn't Running or the updater task is missing. |
+| `8` | The agent is Stale (Install Simple and Advanced). Nothing was changed. Run Clean install. |
+| `9` | The agent is still detected after the uninstall, or after Clean install's cleanup. |
+| `10` | Uninstall Advanced removed the agent, but not the platform record. |
+| `11` | Busy: another Windows Installer operation is running (`1618`), or an agent update kept running for 2 minutes (Clean install). |
+| `12` | The agent identity couldn't be saved. Nothing was removed. |
+
+Changed from earlier versions: msiexec and bundle failure codes are now `6` (their own code is logged), `1618` is `11`, configuration errors are `2` instead of `1`, a deploy-folder failure is `3`, a failed platform removal is `10` instead of `2`, an agent still detected after uninstall is `9` instead of `1`, and an identity backup failure is `12`.
+
+## Removing the platform record
+
+Both uninstall scripts save the agent identity to `LiongardDeploy\liongard-identity-<computer>-<timestamp>\` before they remove anything, in the format `LGAgentIdentity.ps1 -Action Restore` reads. It holds the identity and the AgentID, never a key or secret. If the agent's settings file exists but no identity can be read, the script stops with `12` before it removes anything.
+
+The local removal uninstalls every Liongard Agent MSI and bundle entry, removes the services, the updater task, stored credentials and both `LiongardInc` folders (from `${env:ProgramFiles(x86)}`, `$env:ProgramFiles` and `$env:ProgramW6432`). It never touches the identity key.
+
+With `$RemoveAgentFromPlatform = $true`, Uninstall Advanced checks the API settings first, removes the agent locally, and then looks for the record:
+
+1. **AgentID** from `appsettings-override.config` (found through `INSTALLLOCATION` in both registry views, then the `LiongardInc` folders). The record must match a local name or `$Environment`, and its MachineGuid, when set, must match a local identifier. A MachineGuid that matches only the Windows MachineGuid also needs a local name match.
+2. **MachineGuid:** the AgentGuid (`HKLM\SOFTWARE\WOW6432Node\Liongard\LiongardAgent\MachineID`, both registry views) as an agent identifier, and the Windows MachineGuid (both registry views) as an OS identifier. Each is queried in its raw registry form (case and braces kept), in lowercase, and as the bare GUID in lower and upper case, with `=` and `like`. The trimmed value is compared on the client. The record must be in `$Environment`; an OS-only match also needs a local name match.
+3. **Hostname:** `$env:COMPUTERNAME`, the DNS host name and the FQDN against the record's Hostname, Name and FQDN, in `$Environment`. A record whose MachineGuid is set and matches no local identifier is skipped.
+
+Placeholder identifiers (`local`, `uninitialized`, all zeros, no hex digit) are never used. Every candidate is logged with its signals. Nothing is deleted when more than one record qualifies. A failed lookup or delete exits `10`. Each delete is confirmed with a lookup, because the API can time out after the record is gone. The Linux and macOS Uninstall Advanced scripts use the same rules.
 
 ## Logs and files
 
@@ -123,9 +155,9 @@ All logs are written to `LiongardDeploy`. Log names carry a timestamp, and the s
 | Script | Files |
 |---|---|
 | All install scripts | `AgentInstall_<timestamp>.log` (installer log; the EXE bundle also writes `AgentInstall_<timestamp>_*.log` per package), `StaleUninstall_<ProductCode>_<timestamp>.log` |
-| MSI Advanced | `LGAgentScript_<timestamp>.log` (transcript) |
+| MSI and EXE Simple, MSI Advanced, Clean install | `LGAgentScript_<timestamp>.log` (script log or transcript) |
 | EXE Advanced | `LGAgentScript_EXE_<timestamp>.log` (transcript), `LGAgentSummary_<timestamp>.json` |
-| Uninstall | `LGAgentUninstall_<timestamp>.log` |
+| Uninstall Simple and Advanced | `LGAgentUninstall_<timestamp>.log`, and the identity backup folder `liongard-identity-<computer>-<timestamp>\` (not removed by log retention) |
 
 The script output itself goes to the console, so your RMM's script output shows the same steps.
 
@@ -142,9 +174,10 @@ After the installer exits, the scripts redact the installer logs in place, wheth
 | `... is a reparse point` or `... is a file, not a folder` | `$Folder` or `LiongardDeploy` is a link or a file. Remove it, or set `$Folder` to a different local folder. |
 | `Folder [...] must be an absolute local path` or `is inside the agent's own folder` | Set `$Folder` to a local path such as `C:\ProgramData`, outside `C:\ProgramData\Liongard`. |
 | Installer download failed | Check HTTPS access to `agents.static.liongard.com` from the endpoint. For a proxy, set `$ProxyUrl` (EXE scripts). |
-| `Environment '<name>' ... could not be resolved in Liongard` (Advanced) | Check the name and that the environment exists in your instance, or set `$IncludeEnvironmentValue = $false`. |
+| `The environment check failed` (Advanced, exit `4`) | Read the candidate or known-environment lines. Check the name and that the environment exists, or set `$IncludeEnvironmentValue = $false`. |
+| `The installed agent is broken or not running (Stale)` (exit `8`) | Run `LGAgentCleanInstall-MSI-Simple.ps1`. |
 | Environment problems (Simple, Clean install) | These scripts pass `$Environment` exactly as written and don't check it. Make sure it matches the name in Liongard exactly. Handling of a missing environment is tracked in [#9](https://github.com/liongard/agent-scripts/issues/9). |
-| Exit code `1618` | Another Windows Installer operation was running. Run the script again later. |
+| Exit code `11` | Another Windows Installer operation (`1618`) or an agent update was running. Run the script again later. |
 | `An agent update is still in progress after waiting 2 minutes` (Clean install) | The agent updates itself once a day, around midnight local time. Nothing was changed. Run the script again later. |
 | Exit code `1638` (EXE) | A newer agent is already installed. The bundle doesn't downgrade. |
 | `Post-install validation failed` | The installer finished, but the `roaragent.exe` service isn't running or the updater task is missing. Check `AgentInstall_<timestamp>.log`, then run the Clean install script. |

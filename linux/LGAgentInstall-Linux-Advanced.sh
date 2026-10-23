@@ -1,742 +1,226 @@
 #!/usr/bin/env bash
 #
 # SYNOPSIS
-#   Installs the Liongard Agent on Linux (.deb, .rpm, .run or .sh installer).
+#   Installs or upgrades the Liongard Agent on Linux after an environment check. Never removes an agent.
 #
 # DESCRIPTION
-#   Installs the Liongard Agent and registers it with your Liongard instance.
-#   Set your values in sections A and B of the configuration block below. Exit codes, logs
-#   and troubleshooting are in the README under LINK.
-#   - Checks prerequisites and picks the x64 or arm64 installer.
-#   - Removes any existing agent first by default (ENABLE_PRE_UNINSTALL=true; set it to false
-#     to skip, and an installed agent is then left as it is). The platform record is kept
-#     unless REMOVE_AGENT_FROM_PLATFORM=true.
-#   - Matches the environment name through the Liongard API by default
-#     (ENABLE_ENVIRONMENT_MATCHING=true) and checks for machine-ID collisions.
-#   - Downloads the installer to a private temporary folder and installs it.
-#   - Confirms the agent service is running.
+#   Set your values in the configuration block below. Exit codes, logs and troubleshooting are in
+#   the README under LINK.
+#   - Not installed: downloads the installer and installs the agent.
+#   - Checks ENVIRONMENT against the Liongard environments first: exact, then normalized,
+#     then prefix or contains (6+ characters). No match, several matches or a failed
+#     lookup exits 4 and changes nothing.
+#   - Installed and running (Healthy): upgrades only when the installer is newer, else exits 0.
+#   - Installed but broken or stopped (Stale): changes nothing and exits 8. Run
+#     LGAgentCleanInstall-Linux-Simple.sh to repair it.
+#   - Validates the settings and downloads the installer before it changes anything.
+#   - Confirms the agent service runs and the updater timer exists after the install.
 #
 # NOTES
-#   Requires:     root, Bash 4+, curl or wget, and jq for environment matching or platform removal.
+#   Requires:     root, bash, systemd, curl and jq.
 #                 Liongard API token and agent install token (key and secret for each).
 #   Author:       Liongard Partner Support
-#   Last updated: 2026-10-20
+#   Last updated: 2026-10-23
 #
 # LINK
 #   https://github.com/liongard/agent-scripts/blob/main/linux/README.md
 
-# Abort on unset variables and propagate pipeline failures.
-# Individual functions use explicit || handling for expected non-zero returns.
-set -euo pipefail
-
-# ############################################################
-# #                                                          #
-# #   PARTNER CONFIGURATION                                  #
-# #                                                          #
-# #   Update sections A and B below before deploying.        #
-# #   Section C (Advanced) should normally be left as-is.    #
-# #                                                          #
-# ############################################################
-
 # ------------------------------------------------------------
-# A. REQUIRED CONFIGURATION — you MUST update these
+# A. REQUIRED CONFIGURATION
 # ------------------------------------------------------------
 
-# Liongard instance identifier. Accepts any of:
-#   us1                          → prefix: us1
-#   us1.app.liongard.com         → prefix: us1
-#   https://us1.app.liongard.com → prefix: us1
-INSTANCE_PREFIX="us?"                                  # e.g. us1, us2, eu1
+# Liongard instance: us1, us1.app.liongard.com or https://us1.app.liongard.com.
+INSTANCE_PREFIX="REPLACE_WITH_INSTANCE_PREFIX"
 
-# API token (key + secret): used for environment lookup and collision detection.
+# Liongard API token (key and secret) for the environment check.
 API_TOKEN_KEY="REPLACE_WITH_API_TOKEN_KEY"
 API_TOKEN_SECRET="REPLACE_WITH_API_TOKEN_SECRET"
 
-# Agent token (key + secret): used to register/install the agent.
+# Agent install token (key and secret) that registers the agent.
 AGENT_TOKEN_KEY="REPLACE_WITH_AGENT_TOKEN_KEY"
 AGENT_TOKEN_SECRET="REPLACE_WITH_AGENT_TOKEN_SECRET"
 
-# Environment name to register the agent under.
-# Required only when INCLUDE_ENVIRONMENT_VALUE=true.
-# May be a static environment name or an RMM variable injection.
+# Environment to register the agent in (-e). Required when INCLUDE_ENVIRONMENT_VALUE=true.
 ENVIRONMENT="REPLACE_WITH_ENVIRONMENT_NAME"
 
 # ------------------------------------------------------------
-# B. OPTIONAL PARTNER CONFIGURATION — commonly changed
+# B. OPTIONAL CONFIGURATION (every installer value)
 # ------------------------------------------------------------
 
-# Pass the environment name to the installer during registration.
-# Set to false to install without assigning an environment (ENVIRONMENT above
-# is then not required).
+# false registers the agent without an environment; ENVIRONMENT is then not required.
 INCLUDE_ENVIRONMENT_VALUE=true
 
-# Look up the environment in Liongard and match/normalize the name before
-# installing (requires jq). Set to false to use the ENVIRONMENT value verbatim.
-ENABLE_ENVIRONMENT_MATCHING=true
+# Agent name (-n). Blank uses the hostname.
+AGENT_NAME=""
 
-# Remove any existing Liongard Agent on this machine before installing.
-ENABLE_PRE_UNINSTALL=true
-
-# After a successful pre-uninstall, also delete the matching agent record from
-# the Liongard platform via the API. Only applies when ENABLE_PRE_UNINSTALL=true.
-REMOVE_AGENT_FROM_PLATFORM=false
-
-# Optional free-text description for the agent. Passed only when non-empty.
+# Free-text description (-d). Needs installer 5.5.0 or later.
 AGENT_DESCRIPTION=""
 
-# Directory for the log transcript. Created root-only (0700) when missing.
-LOG_DIRECTORY="/var/log/liongard-agent"
+# Proxy for the agent (-p), e.g. http://user:pass@proxy:8080. Credentials are masked in the log.
+PROXY_URL=""
 
-# DEPRECATED: no longer used and will be removed in a later release. The
-# installer now downloads to a private temporary directory that is removed on
-# exit, and the log transcript goes to LOG_DIRECTORY. A WARN is logged if set.
-DOWNLOAD_DIRECTORY=""
+# Seeds the agent identity (-g) on a fresh install; ignored when an identity exists. Installer 5.4.0+.
+DEVICE_GUID=""
 
-# CPU architecture of the installer to download. "auto" picks it from
-# uname -m (x86_64 → x64, aarch64 → arm64) and stops with an error on any
-# other machine type. "x64" or "arm64" forces one.
+# true passes --reset-identity: the agent enrols as a NEW agent. Installer 5.5.0+.
+RESET_IDENTITY=false
+
+# auto picks x64 or arm64 from uname -m; x64 or arm64 forces one.
 LINUX_ARCHITECTURE="auto"
 
-# Installer download URL. Leave empty to use the LTS installer for
-# LINUX_ARCHITECTURE. When set, it is used as-is and LINUX_ARCHITECTURE is
-# ignored. Package type is inferred from the file extension
-# (.deb / .rpm / .sh / .run). NOTE: the MachineGuid collision override (passed
-# to the installer via -g) requires an agent installer v5.4.0 or newer; older
-# builds silently ignore it.
+# Installer URL (.run, .sh, .deb or .rpm). Blank uses the LTS .run for LINUX_ARCHITECTURE.
+# PROXY_URL, DEVICE_GUID and RESET_IDENTITY reach only the .run installer.
 INSTALLER_URL=""
 
-# Saved installer filename. Leave empty to infer it from the URL.
+# Saved installer file name. Blank infers it from INSTALLER_URL.
 INSTALLER_FILE_NAME=""
 
-# ------------------------------------------------------------
-# C. ADVANCED OPTIONS — normally leave unchanged
-# Advanced options below should normally remain unchanged unless directed
-# by Liongard Support.
-# ------------------------------------------------------------
+# Root-only folder for the script log and the identity backup.
+LOG_DIRECTORY="/var/log/liongard-agent"
 
-# Minimum confidence score (0–185) required before deleting a remote record.
-MINIMUM_REMOTE_DELETION_SCORE=50
+# Do not edit below this line.
 
-# Candidate service names to check for, in priority order.
-SERVICE_NAMES=("roaragent" "liongard-agent" "liongardagent" "LiongardAgent")
+# BEGIN SHARED BLOCK: Liongard shell common functions
+# Identical in every Linux and macOS script except LGAgentIdentity-*. Bash 3.2 or later.
 
-# Installer property name for the device-identifier override.
-DEVICE_ID_OVERRIDE_ARG_NAME="DEVICEID"
+EXIT_OK=0
+EXIT_UNEXPECTED=1
+EXIT_CONFIG=2
+EXIT_PREREQUISITE=3
+EXIT_ENVIRONMENT=4
+EXIT_DOWNLOAD=5
+EXIT_INSTALLER=6
+EXIT_VALIDATION=7
+EXIT_STALE=8
+EXIT_REMOVAL=9
+EXIT_PLATFORM=10
+EXIT_BUSY=11
+EXIT_IDENTITY=12
 
-# Behavior when the Liongard API call for collision detection fails:
-#   conservative → abort (safest default; recommended for production)
-#   permissive   → continue without a DEVICEID override
-API_FAILURE_BEHAVIOR="conservative"
+LG_LOG_FILE=""
+LG_SECRETS=()
+LG_API_BASE=""
+LG_API_AUTH=""
+LG_ID_AGENT_ID=""
+LG_ID_AGENT=""
+LG_ID_OS=""
 
-# Minimum downloaded file size (bytes) to consider the installer valid.
-MINIMUM_INSTALLER_BYTES=10240   # 10 KB; raise to 1048576 for large packages
+# Masks registered secrets and proxy credentials (user:****@host).
+lg_mask() {
+    local text="$1" secret
+    for secret in ${LG_SECRETS[@]+"${LG_SECRETS[@]}"}; do
+        if [ "${#secret}" -ge 4 ]; then text="${text//"${secret}"/****}"; fi
+    done
+    case "${text}" in
+        *@*) printf '%s' "${text}" | sed -E 's#([^:/@[:space:],;="]+):[^/[:space:],;"]*@#\1:****@#g' ;;
+        *) printf '%s' "${text}" ;;
+    esac
+}
 
-# Number of download attempts before giving up.
-MAX_DOWNLOAD_ATTEMPTS=3
-
-# ============================================================
-# INSTALLER PARAMETER MAPPING — internal, not partner configuration
-# Centralised so they can be adjusted if the Linux installer uses different
-# argument names than the Windows MSI properties. Partners do not edit these.
-# ============================================================
-readonly PARAM_URL="LIONGARDURL"
-readonly PARAM_ACCESS_KEY="LIONGARDACCESSKEY"
-readonly PARAM_ACCESS_SECRET="LIONGARDACCESSSECRET"
-readonly PARAM_AGENT_NAME="LIONGARDAGENTNAME"
-readonly PARAM_ENVIRONMENT="LIONGARDENVIRONMENT"
-readonly PARAM_DESCRIPTION="LIONGARDDESCRIPTION"
-
-# ============================================================
-# INTERNAL STATE — do not edit below this line
-# ============================================================
-_SCRIPT_LOG_FILE=""
-_INSTANCE_HOST=""
-_INSTANCE_BASE_URL=""
-_AUTH_HEADER_VALUE=""   # base64(key:secret) — never printed raw
-_PKG_TYPE=""            # deb | rpm | sh
-_PKG_MANAGER=""         # apt | yum | dnf | zypper | rpm | dpkg
-_DETECTED_SVC=""        # which service name was actually found
-_DEVICE_GUID_OVERRIDE=""
-_RESOLVED_ENVIRONMENT=""
-_HTTP_CLIENT=""         # curl | wget
-_INSTALLER_PATH=""      # set by download_installer; avoids stdout-capture pollution
-_WORK_DIR=""            # private mktemp -d directory; removed on exit
-_WGET_CONFIG_FILE=""    # 0600 wgetrc holding the auth header; removed on exit
-
-# ============================================================
-# LOGGING
-# ============================================================
+lg_add_secret() {
+    if [ -n "$1" ]; then LG_SECRETS+=("$1"); fi
+}
 
 _log() {
-    local level="$1"; shift
-    local msg="$*"
-    local ts
-    ts="$(date '+%Y-%m-%d %H:%M:%S')"
-    local line="[${ts}][${level}] ${msg}"
+    local line
+    line="[$(date '+%Y-%m-%d %H:%M:%S')][$1] $(lg_mask "$2")"
+    printf '%s\n' "${line}" >&2
+    if [ -n "${LG_LOG_FILE}" ]; then printf '%s\n' "${line}" >> "${LG_LOG_FILE}" 2>/dev/null; fi
+    return 0
+}
+log_info()  { _log INFO "$*"; }
+log_step()  { _log STEP "$*"; }
+log_ok()    { _log OK "$*"; }
+log_warn()  { _log WARN "$*"; }
+log_error() { _log ERROR "$*"; }
 
-    # All log output goes to STDERR. stdout is reserved exclusively for function
-    # return values captured via $(...). If logs went to stdout, capturing a
-    # function that also logs (e.g. get_local_machine_id, get_agents_filtered)
-    # would fold the log lines into the returned value and corrupt it — which
-    # silently broke MachineGuid collision detection. Colour only when stderr
-    # is an interactive terminal.
-    if [[ -t 2 ]]; then
-        case "${level}" in
-            WARN)  printf '\033[33m%s\033[0m\n' "${line}" >&2 ;;
-            ERROR) printf '\033[31m%s\033[0m\n' "${line}" >&2 ;;
-            OK)    printf '\033[32m%s\033[0m\n' "${line}" >&2 ;;
-            STEP)  printf '\033[36m%s\033[0m\n' "${line}" >&2 ;;
-            *)     printf '%s\n' "${line}" >&2 ;;
-        esac
-    else
-        printf '%s\n' "${line}" >&2
-    fi
-
-    # Mirror every line to the transcript file.
-    if [[ -n "${_SCRIPT_LOG_FILE}" ]]; then
-        printf '%s\n' "${line}" >> "${_SCRIPT_LOG_FILE}" 2>/dev/null || true
-    fi
+# Usage: lg_exit <code> <message>
+lg_exit() {
+    if [ "$1" -eq 0 ]; then log_ok "$2"; else log_error "$2 (exit $1)"; fi
+    if [ -n "${LG_LOG_FILE}" ]; then printf 'Log file: %s\n' "${LG_LOG_FILE}" >&2; fi
+    exit "$1"
 }
 
-log_info()  { _log INFO  "$@"; }
-log_step()  { _log STEP  "$@"; }
-log_ok()    { _log OK    "$@"; }
-log_warn()  { _log WARN  "$@"; }
-log_error() { _log ERROR "$@"; }
-
-# Create the transcript log file inside LOG_DIRECTORY. A missing directory is
-# created 0700 and the log file 0600; an existing directory keeps its mode.
-start_transcript() {
-    local dir="${LOG_DIRECTORY}"
-    ( umask 077 && mkdir -p "${dir}" ) 2>/dev/null || {
-        log_warn "Could not create [${dir}]; file logging disabled."
-        return
-    }
-    local ts
-    ts="$(date '+%Y%m%d_%H%M%S')"
-    _SCRIPT_LOG_FILE="${dir}/LGAgentScript_${ts}.log"
-    ( umask 077 && : > "${_SCRIPT_LOG_FILE}" ) 2>/dev/null || { _SCRIPT_LOG_FILE=""; return; }
-    log_info "Transcript logging started at [${_SCRIPT_LOG_FILE}]."
+lg_require_root() {
+    if [ "$(id -u)" -ne 0 ]; then lg_exit "${EXIT_PREREQUISITE}" "Run this script as root (for example with sudo)."; fi
 }
 
-# Remove the private working directory and the wget auth config on every
-# exit path, including an exit or a TERM/INT/HUP signal in the middle of an
-# API call.
-# shellcheck disable=SC2329  # invoked by the EXIT trap below
-_cleanup() {
-    if [[ -n "${_WGET_CONFIG_FILE}" ]]; then
-        rm -f -- "${_WGET_CONFIG_FILE}"
+# Usage: lg_start_log <folder> <prefix>. The folder is root-only (0700); the 5 newest logs per prefix are kept.
+lg_start_log() {
+    local dir="${1%/}" old count=0
+    if [ -L "${dir}" ] || { [ -e "${dir}" ] && [ ! -d "${dir}" ]; }; then
+        lg_exit "${EXIT_PREREQUISITE}" "Log folder ${dir} is a symlink or a file. Refusing to use it."
     fi
-    if [[ -n "${_WORK_DIR}" && -d "${_WORK_DIR}" ]]; then
-        rm -rf -- "${_WORK_DIR}"
+    if ! ( umask 077 && mkdir -p "${dir}" ) || [ ! -O "${dir}" ] || ! chmod 700 "${dir}"; then
+        lg_exit "${EXIT_PREREQUISITE}" "Log folder ${dir} could not be created as a root-only folder."
     fi
-}
-trap _cleanup EXIT
-
-# ============================================================
-# SECRET MASKING
-# ============================================================
-
-mask_secret() {
-    local value="$1"
-    local len="${#value}"
-    if [[ -z "${value}" ]]; then printf '(empty)'; return; fi
-    if [[ "${len}" -le 8 ]]; then printf '%*s' "${len}" '' | tr ' ' '*'; return; fi
-    printf '%s****%s' "${value:0:4}" "${value: -4}"
-}
-
-print_config_snapshot() {
-    log_step "=== Liongard Agent Config Snapshot ==="
-    log_info "InstancePrefix              : ${INSTANCE_PREFIX}"
-    log_info "ApiTokenKey (masked)        : $(mask_secret "${API_TOKEN_KEY}")"
-    log_info "ApiTokenSecret (masked)     : $(mask_secret "${API_TOKEN_SECRET}")"
-    log_info "AgentTokenKey (masked)      : $(mask_secret "${AGENT_TOKEN_KEY}")"
-    log_info "AgentTokenSecret (masked)   : $(mask_secret "${AGENT_TOKEN_SECRET}")"
-    log_info "Environment                 : ${ENVIRONMENT}"
-    log_info "AgentDescription            : ${AGENT_DESCRIPTION}"
-    log_info "IncludeEnvironmentValue     : ${INCLUDE_ENVIRONMENT_VALUE}"
-    log_info "EnableEnvironmentMatching   : ${ENABLE_ENVIRONMENT_MATCHING}"
-    log_info "EnablePreUninstall          : ${ENABLE_PRE_UNINSTALL}"
-    log_info "RemoveAgentFromPlatform     : ${REMOVE_AGENT_FROM_PLATFORM}"
-    log_info "MinimumRemoteDeletionScore  : ${MINIMUM_REMOTE_DELETION_SCORE}"
-    log_info "LogDirectory                : ${LOG_DIRECTORY}"
-    log_info "LinuxArchitecture           : ${LINUX_ARCHITECTURE}"
-    log_info "InstallerUrl                : ${INSTALLER_URL}"
-    log_info "ApiFailureBehavior          : ${API_FAILURE_BEHAVIOR}"
-    log_step "======================================"
-}
-
-# ============================================================
-# CONFIGURATION VALIDATION
-# ============================================================
-
-assert_config_value() {
-    local name="$1"
-    local value="$2"
-    if [[ -z "${value}" || "${value}" == REPLACE_WITH_* ]]; then
-        log_error "Configuration value [${name}] must be provided before running this script."
-        exit 2
+    LG_LOG_FILE="${dir}/$2_$(date '+%Y%m%d_%H%M%S').log"
+    if ! ( umask 077 && : > "${LG_LOG_FILE}" ); then
+        LG_LOG_FILE=""
+        lg_exit "${EXIT_PREREQUISITE}" "Could not create a log file in ${dir}."
     fi
-}
-
-validate_config() {
-    log_step "Validating configuration..."
-    assert_config_value "INSTANCE_PREFIX"    "${INSTANCE_PREFIX}"
-    assert_config_value "API_TOKEN_KEY"      "${API_TOKEN_KEY}"
-    assert_config_value "API_TOKEN_SECRET"   "${API_TOKEN_SECRET}"
-    assert_config_value "AGENT_TOKEN_KEY"    "${AGENT_TOKEN_KEY}"
-    assert_config_value "AGENT_TOKEN_SECRET" "${AGENT_TOKEN_SECRET}"
-    if [[ "${INCLUDE_ENVIRONMENT_VALUE}" == true ]]; then
-        assert_config_value "ENVIRONMENT"    "${ENVIRONMENT}"
-    fi
-    if [[ -n "${DOWNLOAD_DIRECTORY}" ]]; then
-        log_warn "DOWNLOAD_DIRECTORY is deprecated and no longer used. The installer downloads to a private temporary directory, and the log goes to LOG_DIRECTORY [${LOG_DIRECTORY}]."
-    fi
-    log_ok "Configuration validated."
-}
-
-# ============================================================
-# INSTALLER URL (by CPU architecture)
-# Sets INSTALLER_URL from LINUX_ARCHITECTURE unless it was set explicitly.
-# ============================================================
-
-resolve_installer_url() {
-    local arch="${LINUX_ARCHITECTURE,,}"
-    local machine
-
-    case "${arch}" in
-        auto|x64|arm64) ;;
-        *)
-            log_error "LINUX_ARCHITECTURE must be auto, x64 or arm64 (got '${LINUX_ARCHITECTURE}')."
-            exit 2
-            ;;
-    esac
-
-    if [[ -n "${INSTALLER_URL}" ]]; then
-        log_info "Using the configured INSTALLER_URL; LINUX_ARCHITECTURE is ignored."
-        return 0
-    fi
-
-    if [[ "${arch}" == auto ]]; then
-        machine="$(uname -m 2>/dev/null || printf 'unknown')"
-        case "${machine}" in
-            x86_64)  arch="x64" ;;
-            aarch64) arch="arm64" ;;
-            *)
-                log_error "Unsupported CPU architecture '${machine}' (uname -m). The Liongard Agent installer is available for x86_64 and aarch64 only."
-                exit 3
-                ;;
-        esac
-        log_info "CPU architecture: ${machine} → ${arch}"
-    else
-        log_info "CPU architecture forced by LINUX_ARCHITECTURE: ${arch}"
-    fi
-
-    INSTALLER_URL="https://agents.static.liongard.com/LiongardAgent-lts-${arch}.xz.run"
-}
-
-# ============================================================
-# INSTANCE PREFIX NORMALIZATION
-# Accepts: us1 | us1.app.liongard.com | https://us1.app.liongard.com
-# Sets:    _INSTANCE_HOST, _INSTANCE_BASE_URL
-# ============================================================
-
-resolve_instance_prefix() {
-    local raw="${INSTANCE_PREFIX}"
-    local sanitized
-
-    # Strip URL scheme if present.
-    sanitized="${raw#https://}"
-    sanitized="${sanitized#http://}"
-    # Strip trailing slashes.
-    sanitized="${sanitized%/}"
-
-    # If it looks like a full hostname, extract only the first label.
-    if [[ "${sanitized}" == *".app.liongard.com" ]]; then
-        sanitized="${sanitized%%.*}"
-    fi
-
-    INSTANCE_PREFIX="${sanitized}"
-    _INSTANCE_HOST="${INSTANCE_PREFIX}.app.liongard.com"
-    _INSTANCE_BASE_URL="https://${_INSTANCE_HOST}/api/v1"
-    log_info "Liongard instance: ${_INSTANCE_HOST}"
-}
-
-# ============================================================
-# PREREQUISITE CHECKS
-# ============================================================
-
-_has_cmd() {
-    command -v "$1" &>/dev/null
-}
-
-check_root() {
-    local uid
-    uid="${EUID:-$(id -u 2>/dev/null || printf '1')}"
-    if [[ "${uid}" -ne 0 ]]; then
-        log_error "This script must be run as root or via sudo."
-        exit 3
-    fi
-}
-
-check_prerequisites() {
-    log_step "Checking prerequisites..."
-
-    # HTTP client — prefer curl, fall back to wget.
-    if _has_cmd curl; then
-        _HTTP_CLIENT="curl"
-    elif _has_cmd wget; then
-        _HTTP_CLIENT="wget"
-    else
-        log_error "Neither curl nor wget is available. Install one and retry."
-        exit 3
-    fi
-    log_info "HTTP client: ${_HTTP_CLIENT}"
-
-    # Core utilities that must exist.
-    local -a missing=()
-    for cmd in sed awk grep hostname; do
-        _has_cmd "${cmd}" || missing+=("${cmd}")
+    for old in $(ls -1t "${dir}/$2_"*.log 2>/dev/null); do
+        count=$((count + 1))
+        if [ "${count}" -gt 5 ]; then rm -f -- "${old}"; fi
     done
-    if [[ "${#missing[@]}" -gt 0 ]]; then
-        log_error "Missing required commands: ${missing[*]}"
-        exit 3
-    fi
-
-    # MAC collection utilities — warn only, script continues.
-    if ! _has_cmd ip && ! _has_cmd ifconfig; then
-        log_warn "Neither 'ip' nor 'ifconfig' found; MAC address collection will use /sys/class/net only."
-    fi
-
-    # jq is required when environment matching or scored remote deletion is on.
-    local need_jq=false
-    [[ "${INCLUDE_ENVIRONMENT_VALUE}" == true && "${ENABLE_ENVIRONMENT_MATCHING}" == true ]] && need_jq=true
-    [[ "${REMOVE_AGENT_FROM_PLATFORM}" == true ]] && need_jq=true
-    if [[ "${need_jq}" == true ]] && ! _has_cmd jq; then
-        log_error "jq is required when EnableEnvironmentMatching=true or RemoveAgentFromPlatform=true. Install jq and retry."
-        exit 3
-    fi
-
-    # Init system detection (informational; the script adapts at runtime).
-    if _has_cmd systemctl; then
-        log_info "Init system: systemd"
-    elif _has_cmd service; then
-        log_info "Init system: SysV (service command)"
-    else
-        log_warn "Neither systemctl nor service found; service management will be limited."
-    fi
-
-    log_ok "Prerequisites satisfied."
+    log_info "Logging to ${LG_LOG_FILE}."
 }
 
-# ============================================================
-# DISTRIBUTION AND PACKAGE MANAGER DETECTION
-# ============================================================
-
-detect_distro() {
-    log_step "Detecting Linux distribution and package manager..."
-
-    local os_id="" os_like=""
-    if [[ -f /etc/os-release ]]; then
-        # Source selectively to avoid polluting the shell environment.
-        os_id="$(. /etc/os-release 2>/dev/null; printf '%s' "${ID:-}")"
-        os_like="$(. /etc/os-release 2>/dev/null; printf '%s' "${ID_LIKE:-}")"
-    fi
-
-    # Determine package manager by probing available commands in family order.
-    if _has_cmd dpkg && { [[ "${os_id}" == "debian" || "${os_id}" == "ubuntu" \
-                           || "${os_like}" == *"debian"* ]]; }; then
-        _PKG_TYPE="deb"
-        _PKG_MANAGER="$(_has_cmd apt-get && printf 'apt' || printf 'dpkg')"
-    elif _has_cmd zypper; then
-        _PKG_TYPE="rpm"; _PKG_MANAGER="zypper"
-    elif _has_cmd dnf; then
-        _PKG_TYPE="rpm"; _PKG_MANAGER="dnf"
-    elif _has_cmd yum; then
-        _PKG_TYPE="rpm"; _PKG_MANAGER="yum"
-    elif _has_cmd rpm; then
-        _PKG_TYPE="rpm"; _PKG_MANAGER="rpm"
-    elif _has_cmd dpkg; then
-        _PKG_TYPE="deb"; _PKG_MANAGER="dpkg"
-    else
-        log_warn "Could not detect a known package manager; will infer type from URL extension."
-    fi
-
-    # Override / set _PKG_TYPE from the installer URL extension when the
-    # URL is more specific than the probed package manager.
-    # The last extension of the URL filename is extracted with ##*. — so for
-    # LiongardAgent-lts-x64.xz.run that yields "run", not "xz.run".
-    local url_ext="${INSTALLER_URL##*.}"
-    case "${url_ext,,}" in
-        deb|rpm|sh) _PKG_TYPE="${url_ext,,}" ;;
-        # Makeself self-extracting archives (.run, .bin) are executed directly
-        # like shell scripts; they must NOT be passed to dpkg/rpm.
-        run|bin)    _PKG_TYPE="sh" ;;
-    esac
-
-    if [[ -z "${_PKG_TYPE}" ]]; then
-        log_error "Cannot determine installer type. Set INSTALLER_URL to a .deb, .rpm, .sh, .run, or .bin file."
-        exit 3
-    fi
-
-    log_info "OS: ${os_id:-unknown} (family: ${os_like:-none})"
-    log_info "Package type: ${_PKG_TYPE} | Manager: ${_PKG_MANAGER:-unknown}"
-}
-
-# ============================================================
-# MACHINE IDENTIFIER (Linux analogue of Windows MachineGuid)
-#
-# Priority order:
-#   1. /etc/machine-id
-#   2. /var/lib/dbus/machine-id
-#   3. hostnamectl Machine ID field
-#   4. /sys/class/dmi/id/product_uuid
-#   5. dmidecode -s system-uuid
-#
-# Returns the identifier on stdout; exits 1 if no valid source found.
-# NOTE: This script NEVER modifies /etc/machine-id or any system ID file.
-# ============================================================
-
-_normalize_id() {
-    # Trim whitespace, strip braces, lowercase.
-    printf '%s' "$1" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | tr -d '{}' | tr '[:upper:]' '[:lower:]'
-}
-
-_is_placeholder_id() {
+# True when a value is blank or still a REPLACE_WITH_ placeholder.
+lg_is_unset() {
     case "$1" in
-        ""|"00000000-0000-0000-0000-000000000000" \
-        |"ffffffff-ffff-ffff-ffff-ffffffffffff"   \
-        |"not set"|"none"|"unknown") return 0 ;;
-        *) return 1 ;;
+        REPLACE_WITH_*) return 0 ;;
     esac
+    [ -z "$(printf '%s' "$1" | tr -d '[:space:]')" ]
 }
 
-get_local_machine_id() {
-    local raw id
-
-    # 1. /etc/machine-id
-    if [[ -f /etc/machine-id ]]; then
-        raw="$(cat /etc/machine-id 2>/dev/null)"
-        id="$(_normalize_id "${raw}")"
-        if ! _is_placeholder_id "${id}"; then
-            log_info "Machine ID source: /etc/machine-id"
-            printf '%s' "${id}"; return 0
-        fi
-    fi
-
-    # 2. /var/lib/dbus/machine-id
-    if [[ -f /var/lib/dbus/machine-id ]]; then
-        raw="$(cat /var/lib/dbus/machine-id 2>/dev/null)"
-        id="$(_normalize_id "${raw}")"
-        if ! _is_placeholder_id "${id}"; then
-            log_info "Machine ID source: /var/lib/dbus/machine-id"
-            printf '%s' "${id}"; return 0
-        fi
-    fi
-
-    # 3. hostnamectl
-    if _has_cmd hostnamectl; then
-        raw="$(hostnamectl 2>/dev/null | awk '/Machine ID[[:space:]]*:/{print $NF}')"
-        id="$(_normalize_id "${raw}")"
-        if ! _is_placeholder_id "${id}"; then
-            log_info "Machine ID source: hostnamectl"
-            printf '%s' "${id}"; return 0
-        fi
-    fi
-
-    # 4. /sys/class/dmi/id/product_uuid
-    if [[ -r /sys/class/dmi/id/product_uuid ]]; then
-        raw="$(cat /sys/class/dmi/id/product_uuid 2>/dev/null)"
-        id="$(_normalize_id "${raw}")"
-        if ! _is_placeholder_id "${id}"; then
-            log_info "Machine ID source: /sys/class/dmi/id/product_uuid"
-            printf '%s' "${id}"; return 0
-        fi
-    fi
-
-    # 5. dmidecode
-    if _has_cmd dmidecode; then
-        raw="$(dmidecode -s system-uuid 2>/dev/null | head -1)"
-        id="$(_normalize_id "${raw}")"
-        if ! _is_placeholder_id "${id}"; then
-            log_info "Machine ID source: dmidecode"
-            printf '%s' "${id}"; return 0
-        fi
-    fi
-
-    log_error "Unable to determine a stable machine identifier. All sources returned empty or placeholder values."
-    exit 1
+# Usage: lg_require <setting name> <value>
+lg_require() {
+    if lg_is_unset "$2"; then lg_exit "${EXIT_CONFIG}" "Configuration value [$1] must be set."; fi
 }
 
-# ============================================================
-# LOCAL HOST IDENTITY COLLECTION
-# ============================================================
+# Usage: lg_require_bool <setting name> <value>
+lg_require_bool() {
+    if [ "$2" != true ] && [ "$2" != false ]; then lg_exit "${EXIT_CONFIG}" "$1 must be true or false (got '$2')."; fi
+}
 
-get_local_hostnames() {
-    # Collect hostname variants into a newline-delimited list on stdout,
-    # deduplicated case-insensitively. 15-character truncations are also
-    # included for parity with Windows NETBIOS matching behaviour.
-    local -A seen=()
-    local -a names=()
-    local -a raw=()
+# Prints <prefix>.app.liongard.com for us1, us1.app.liongard.com or https://us1.app.liongard.com/.
+lg_instance_host() {
+    local value
+    value="$(printf '%s' "$1" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
+    case "${value}" in
+        *\?*|*\**|*\[*|*\]*) return 1 ;;
+    esac
+    value="${value#https://}"
+    value="${value#http://}"
+    value="${value%%/*}"
+    value="${value%.app.liongard.com}"
+    if [[ ! "${value}" =~ ^[a-z0-9-]+$ ]]; then return 1; fi
+    printf '%s.app.liongard.com' "${value}"
+}
 
-    # Gather raw candidates from all available sources.
-    local n
-    [[ -f /etc/hostname ]] && { n="$(tr -d '[:space:]' < /etc/hostname 2>/dev/null)"; [[ -n "${n}" ]] && raw+=("${n}"); }
-    n="$(hostname 2>/dev/null)"    && [[ -n "${n}" ]] && raw+=("${n}") || true
-    n="$(hostname -s 2>/dev/null)" && [[ -n "${n}" ]] && raw+=("${n}") || true
-    n="$(hostname -f 2>/dev/null)" && [[ -n "${n}" ]] && raw+=("${n}") || true
+lg_version_valid() {
+    [[ "$1" =~ ^[0-9]+(\.[0-9]+)*$ ]]
+}
 
-    # Deduplicate and add 15-char truncations in a single loop.
-    local v lc trunc tlc
-    for v in "${raw[@]}"; do
-        [[ -z "${v}" ]] && continue
-        lc="$(printf '%s' "${v}" | tr '[:upper:]' '[:lower:]')"
-        if [[ -z "${seen[${lc}]+_}" ]]; then
-            seen["${lc}"]=1
-            names+=("${v}")
-        fi
-        if [[ "${#v}" -gt 15 ]]; then
-            trunc="${v:0:15}"
-            tlc="$(printf '%s' "${trunc}" | tr '[:upper:]' '[:lower:]')"
-            if [[ -z "${seen[${tlc}]+_}" ]]; then
-                seen["${tlc}"]=1
-                names+=("${trunc}")
-            fi
-        fi
+# True if version $1 is newer than version $2. Missing parts count as 0.
+lg_version_newer() {
+    local a b x y i=0
+    IFS=. read -r -a a <<< "$1"
+    IFS=. read -r -a b <<< "$2"
+    while [ "${i}" -lt "${#a[@]}" ] || [ "${i}" -lt "${#b[@]}" ]; do
+        x=$((10#${a[i]:-0}))
+        y=$((10#${b[i]:-0}))
+        if [ "${x}" -gt "${y}" ]; then return 0; fi
+        if [ "${x}" -lt "${y}" ]; then return 1; fi
+        i=$((i + 1))
     done
-
-    [[ "${#names[@]}" -gt 0 ]] && printf '%s\n' "${names[@]}"
-    return 0
+    return 1
 }
 
-# ============================================================
-# MAC ADDRESS COLLECTION
-# ============================================================
-
-_normalize_mac() {
-    local raw="$1"
-    local clean
-    # Keep only hex-digit characters, stripping all separators.
-    # Avoid tr ranges that cross ASCII order (e.g. ':- ' → descending range error).
-    clean="$(printf '%s' "${raw}" | tr -cd '0-9a-fA-F')"
-    if [[ "${#clean}" -lt 12 ]]; then
-        return 1
-    fi
-    printf '%s' "${clean:0:12}" | tr '[:lower:]' '[:upper:]'
-}
-
-get_local_mac_addresses() {
-    # Returns normalized (no-separator, uppercase) MAC addresses for all
-    # active non-loopback interfaces, one per line, deduplicated.
-    local -A mac_set=()
-    local mac
-
-    # ip link show (preferred).
-    if _has_cmd ip; then
-        while IFS= read -r line; do
-            if [[ "${line}" =~ link/ether[[:space:]]([0-9a-fA-F:]{17}) ]]; then
-                mac="$(_normalize_mac "${BASH_REMATCH[1]}")" && mac_set["${mac}"]=1 || true
-            fi
-        done < <(ip link show 2>/dev/null | grep -v 'link/loopback')
-    fi
-
-    # ifconfig fallback.
-    if [[ "${#mac_set[@]}" -eq 0 ]] && _has_cmd ifconfig; then
-        while IFS= read -r line; do
-            if [[ "${line}" =~ ([Hh][Ww][Aa][Dd][Dd][Rr]|ether)[[:space:]]+([0-9a-fA-F:]{17}) ]]; then
-                mac="$(_normalize_mac "${BASH_REMATCH[2]}")" && mac_set["${mac}"]=1 || true
-            fi
-        done < <(ifconfig 2>/dev/null)
-    fi
-
-    # /sys/class/net/*/address last resort.
-    if [[ "${#mac_set[@]}" -eq 0 ]]; then
-        local iface addr_file
-        for addr_file in /sys/class/net/*/address; do
-            iface="${addr_file%/address}"; iface="${iface##*/}"
-            [[ "${iface}" == lo ]] && continue
-            local raw_mac
-            raw_mac="$(cat "${addr_file}" 2>/dev/null)"
-            [[ -z "${raw_mac}" || "${raw_mac}" == "00:00:00:00:00:00" ]] && continue
-            mac="$(_normalize_mac "${raw_mac}")" && mac_set["${mac}"]=1 || true
-        done
-    fi
-
-    [[ "${#mac_set[@]}" -gt 0 ]] && printf '%s\n' "${!mac_set[@]}"
-    return 0
-}
-
-# ============================================================
-# LIONGARD API HELPERS
-# ============================================================
-
-# Build the base64-encoded auth token (key:secret) and store it in
-# _AUTH_HEADER_VALUE. Never prints the encoded value.
-# The token never goes on a command line, where it would show in the process
-# list: curl reads it from a config on stdin (see _curl_auth_config). wget
-# cannot read headers from stdin, so for wget it is written once to a mktemp
-# file (mode 0600) passed through WGETRC and removed by the EXIT trap.
-build_auth_header() {
-    local raw="${API_TOKEN_KEY}:${API_TOKEN_SECRET}"
-    _AUTH_HEADER_VALUE="$(printf '%s' "${raw}" | base64 | tr -d '\n')"
-
-    if [[ "${_HTTP_CLIENT}" == "wget" && -z "${_WGET_CONFIG_FILE}" ]]; then
-        _WGET_CONFIG_FILE="$(mktemp "${TMPDIR:-/tmp}/liongard-wgetrc.XXXXXXXX" 2>/dev/null)" || {
-            _WGET_CONFIG_FILE=""
-            log_error "Cannot create a private wget config file under [${TMPDIR:-/tmp}]."
-            exit 4
-        }
-        printf 'header = X-ROAR-API-KEY: %s\n' "${_AUTH_HEADER_VALUE}" > "${_WGET_CONFIG_FILE}"
-    fi
-}
-
-# Print the curl config line that carries the auth header. Pipe it to
-# `curl --config -`; printf is a shell builtin, so no process sees the token.
-_curl_auth_config() {
-    printf 'header = "X-ROAR-API-KEY: %s"\n' "${_AUTH_HEADER_VALUE}"
-}
-
-# Perform an authenticated GET request.
-# Usage: _api_get <path>  → prints response body; returns non-zero on HTTP error.
-_api_get() {
-    local path="$1"
-    local url="${_INSTANCE_BASE_URL}${path}"
-
-    if [[ "${_HTTP_CLIENT}" == "curl" ]]; then
-        _curl_auth_config | curl -sSL --fail --config - \
-            -H "User-Agent: LiongardLinuxAgentInstaller/1.0" \
-            "${url}"
-    else
-        # WGETRC replaces only the per-user ~/.wgetrc; the system wgetrc
-        # (proxy settings and so on) is still read.
-        WGETRC="${_WGET_CONFIG_FILE}" wget -qO- \
-            --header="User-Agent: LiongardLinuxAgentInstaller/1.0" \
-            "${url}"
-    fi
-}
-
-# Perform an authenticated DELETE and return only the HTTP status code.
-_api_delete() {
-    local path="$1"
-    local url="${_INSTANCE_BASE_URL}${path}"
-
-    if [[ "${_HTTP_CLIENT}" != "curl" ]]; then
-        log_warn "wget does not natively support HTTP DELETE; remote agent deletion skipped."
-        printf '0'; return 1
-    fi
-
-    _curl_auth_config | curl -sSL -o /dev/null -w '%{http_code}' --config - \
-        -X DELETE \
-        -H "User-Agent: LiongardLinuxAgentInstaller/1.0" \
-        "${url}"
-}
-
-# URL-encode a string (RFC 3986).
 url_encode() {
     local string="$1" encoded="" char i
-    local length="${#string}"
-    for (( i = 0; i < length; i++ )); do
+    for (( i = 0; i < ${#string}; i++ )); do
         char="${string:i:1}"
         case "${char}" in
             [a-zA-Z0-9.~_-]) encoded+="${char}" ;;
@@ -746,1092 +230,722 @@ url_encode() {
     printf '%s' "${encoded}"
 }
 
-# ============================================================
-# ENVIRONMENT NAME NORMALIZATION AND MATCHING
-# ============================================================
-
-normalize_env_name() {
-    local raw="$1"
-    # Trim leading/trailing whitespace.
-    local trimmed
-    trimmed="$(printf '%s' "${raw}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
-    # Remove leading articles (the, a, an — case-insensitive).
-    trimmed="$(printf '%s' "${trimmed}" | sed 's/^[Tt][Hh][Ee][[:space:]]\+//;s/^[Aa][Nn]\?[[:space:]]\+//')"
-    # Strip all non-alphanumeric characters then uppercase.
-    printf '%s' "${trimmed}" | tr -cd 'a-zA-Z0-9' | tr 'a-z' 'A-Z'
+# Usage: lg_api_setup <instance host> <api key> <api secret>
+lg_api_setup() {
+    LG_API_BASE="https://$1/api/v1"
+    LG_API_AUTH="$(printf '%s' "$2:$3" | base64 | tr -d '\n')"
+    lg_add_secret "${LG_API_AUTH}"
 }
 
-# Resolve ENVIRONMENT against the Liongard API using progressive matching.
-# On success: sets _RESOLVED_ENVIRONMENT and returns 0.
-# On failure: logs a warning and returns 1.
-resolve_environment_name() {
-    local input_name="${ENVIRONMENT}"
-    local input_norm
-    input_norm="$(normalize_env_name "${input_name}")"
+# The token reaches curl on stdin, never on the command line.
+_lg_curl_auth() {
+    printf 'header = "X-ROAR-API-KEY: %s"\n' "${LG_API_AUTH}"
+}
 
-    if [[ "${#input_norm}" -lt 4 ]]; then
-        log_warn "Environment '${input_name}' normalizes to '${input_norm}' — too short for reliable matching (min 4 chars)."
-        return 1
+# Prints the response body; fails on a network error or a non-2xx status.
+_api_get() {
+    _lg_curl_auth | curl -sS --fail --max-time 120 --config - \
+        -H "User-Agent: LiongardAgentScript/1.0" "${LG_API_BASE}$1"
+}
+
+# Prints the HTTP status code (000 when no response arrived).
+_api_delete() {
+    _lg_curl_auth | curl -sS -o /dev/null -w '%{http_code}' --max-time 120 --config - \
+        -X DELETE -H "User-Agent: LiongardAgentScript/1.0" "${LG_API_BASE}$1"
+}
+
+# Trims whitespace (including a trailing newline), strips enclosing braces and lowercases.
+lg_id_key() {
+    printf '%s' "$1" | tr -d '[:space:]' | sed -E 's/^\{(.*)\}$/\1/' | tr '[:upper:]' '[:lower:]'
+}
+
+# True for values that must never be a match key: empty, local, uninitialized, all-zero, or no hex digit.
+lg_is_junk_id() {
+    local key
+    key="$(lg_id_key "$1")"
+    case "${key}" in
+        ""|local|uninitialized) return 0 ;;
+    esac
+    if [ -z "$(printf '%s' "${key}" | tr -d '0{}-')" ]; then return 0; fi
+    case "${key}" in
+        *[0-9a-f]*) return 1 ;;
+    esac
+    return 0
+}
+
+# Usage: lg_id_add <list variable> <source> <value>. Appends "source=value" unless junk or already listed.
+lg_id_add() {
+    local list value key
+    eval "list=\"\${$1}\""
+    value="$(printf '%s' "$3" | tr -d '[:space:]')"
+    if lg_is_junk_id "${value}"; then return 0; fi
+    key="$(lg_id_key "${value}")"
+    if printf '%s\n' "${LG_ID_AGENT}${LG_ID_OS}" | cut -d= -f2- | while IFS= read -r v; do lg_id_key "${v}"; echo; done | grep -Fxq -- "${key}"; then
+        return 0
     fi
+    printf -v "$1" '%s%s=%s\n' "${list}" "$2" "${value}"
+}
 
-    log_step "Resolving environment '${input_name}' against Liongard API..."
+lg_values() {
+    printf '%s' "$1" | cut -d= -f2- | sed '/^$/d'
+}
 
-    local response
-    if ! response="$(_api_get "/environments" 2>/dev/null)"; then
-        log_warn "Could not retrieve Liongard environments from API."
-        return 1
+# True when the last 3 heartbeat results in an agent log are HTTP 401 (the platform refuses the agent).
+# Network errors have no status code and never match.
+lg_heartbeat_rejected() {
+    local lines
+    [ -r "$1" ] || return 1
+    lines="$(tail -n 500 "$1" 2>/dev/null | grep '"caller":"http/heartbeat\.go' | tail -n 3)"
+    [ "$(printf '%s\n' "${lines}" | grep -c '"status_code":401[^0-9]')" -eq 3 ]
+}
+
+# END SHARED BLOCK: Liongard shell common functions
+
+# BEGIN SHARED BLOCK: Liongard environment check
+# Identical in the Linux and macOS Install-Advanced scripts; same rules as Resolve-LiongardEnvironment on Windows. Needs jq.
+
+LG_ENV_NAME=""
+LG_ENV_REASON=""
+
+# Uppercase letters and digits only, without a leading article, "&" or the word "and".
+lg_env_normalize() {
+    local s ascii
+    s="$(printf '%s' "$1" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//; s/^([Tt][Hh][Ee]|[Aa][Nn]?)[[:space:]]+//')"
+    s="$(printf ' %s ' "${s//&/ and }" | sed -E 's/([^[:alnum:]])[Aa][Nn][Dd]([^[:alnum:]])/\1 \2/g; s/([^[:alnum:]])[Aa][Nn][Dd]([^[:alnum:]])/\1 \2/g')"
+    ascii="$(printf '%s' "${s}" | LC_ALL=C.UTF-8 iconv -f UTF-8 -t ASCII//TRANSLIT 2>/dev/null)"
+    if [ -n "${ascii}" ]; then s="${ascii}"; fi
+    printf '%s' "${s}" | LC_ALL=C tr -cd 'A-Za-z0-9' | tr '[:lower:]' '[:upper:]'
+}
+
+# Usage: lg_env_pick <reason> <names, one per line>. Returns 0 for one name, 2 for several, 1 for none.
+lg_env_pick() {
+    local count
+    count="$(printf '%s' "$2" | sed '/^$/d' | wc -l | tr -d ' ')"
+    if [ "${count}" -eq 1 ]; then
+        LG_ENV_NAME="$(printf '%s' "$2" | sed '/^$/d')"
+        LG_ENV_REASON="$1"
+        return 0
     fi
-
-    # Extract environment name values from common response shapes.
-    # Handles top-level array or object with data/items/results/value key.
-    local names_raw
-    names_raw="$(printf '%s' "${response}" | jq -r '
-        (if   type == "array" then .
-         elif .data    then .data
-         elif .items   then .items
-         elif .results then .results
-         elif .value   then .value
-         else [.]
-         end)
-        | .[]
-        | (.Name // .DisplayName // .EnvironmentName // .name // .displayName // "")
-        | select(length > 0)
-    ' 2>/dev/null)"
-
-    if [[ -z "${names_raw}" ]]; then
-        log_warn "No environment names extracted from API response."
-        return 1
+    if [ "${count}" -gt 1 ]; then
+        LG_ENV_REASON="Ambiguous$1"
+        log_error "More than one Liongard environment matches by ${1}: $(printf '%s' "$2" | sed '/^$/d' | head -n 5 | tr '\n' ';' | sed 's/;$//; s/;/; /g')."
+        return 2
     fi
-
-    local -a env_names=()
-    while IFS= read -r line; do
-        [[ -n "${line}" ]] && env_names+=("${line}")
-    done <<< "${names_raw}"
-
-    local input_lower
-    input_lower="$(printf '%s' "${input_name}" | tr '[:upper:]' '[:lower:]')"
-
-    # 1. Exact case-insensitive match.
-    local name name_lower
-    for name in "${env_names[@]}"; do
-        name_lower="$(printf '%s' "${name}" | tr '[:upper:]' '[:lower:]')"
-        if [[ "${name_lower}" == "${input_lower}" ]]; then
-            log_info "Environment exact match: '${input_name}' → '${name}'"
-            _RESOLVED_ENVIRONMENT="${name}"; return 0
-        fi
-    done
-
-    # Helper: build arrays of names whose normalized value equals input_norm,
-    # shares a prefix, or contains input_norm (bi-directionally).
-    local -a norm_matches=() prefix_matches=() contains_matches=()
-    local norm
-    for name in "${env_names[@]}"; do
-        norm="$(normalize_env_name "${name}")"
-        [[ -z "${norm}" ]] && continue
-        if [[ "${norm}" == "${input_norm}" ]]; then
-            norm_matches+=("${name}")
-        elif [[ "${norm}" == "${input_norm}"* || "${input_norm}" == "${norm}"* ]]; then
-            prefix_matches+=("${name}")
-        elif [[ "${norm}" == *"${input_norm}"* || "${input_norm}" == *"${norm}"* ]]; then
-            contains_matches+=("${name}")
-        fi
-    done
-
-    # 2. Single normalized match.
-    if [[ "${#norm_matches[@]}" -eq 1 ]]; then
-        log_info "Environment normalized match: '${input_name}' → '${norm_matches[0]}'"
-        _RESOLVED_ENVIRONMENT="${norm_matches[0]}"; return 0
-    elif [[ "${#norm_matches[@]}" -gt 1 ]]; then
-        log_warn "Ambiguous normalized environment match for '${input_name}'. Candidates: ${norm_matches[*]}"
-        return 1
-    fi
-
-    # 3. Single prefix match.
-    if [[ "${#prefix_matches[@]}" -eq 1 ]]; then
-        log_info "Environment prefix match: '${input_name}' → '${prefix_matches[0]}'"
-        _RESOLVED_ENVIRONMENT="${prefix_matches[0]}"; return 0
-    elif [[ "${#prefix_matches[@]}" -gt 1 ]]; then
-        log_warn "Ambiguous prefix environment match for '${input_name}'. Candidates: ${prefix_matches[*]}"
-        return 1
-    fi
-
-    # 4. Single contains match.
-    if [[ "${#contains_matches[@]}" -eq 1 ]]; then
-        log_info "Environment contains match: '${input_name}' → '${contains_matches[0]}'"
-        _RESOLVED_ENVIRONMENT="${contains_matches[0]}"; return 0
-    elif [[ "${#contains_matches[@]}" -gt 1 ]]; then
-        log_warn "Ambiguous contains environment match for '${input_name}'. Candidates: ${contains_matches[*]}"
-        return 1
-    fi
-
-    # 5. No match.
-    local sample
-    sample="$(printf '%s\n' "${env_names[@]:0:5}" | tr '\n' ';' | sed 's/;$//' | sed 's/;/; /g')"
-    log_warn "No Liongard environment matched '${input_name}' (normalized '${input_norm}'). Sample known names: ${sample}"
     return 1
 }
 
-# ============================================================
-# LIONGARD AGENT API QUERY
-# ============================================================
-
-# Returns agent records matching a conditions filter on stdout.
-# Prints '[]' and returns 1 on failure.
-get_agents_filtered() {
-    local conditions="$1"
-    local encoded
-    encoded="$(url_encode "${conditions}")"
-
-    log_info "Querying Liongard agents: ${conditions}"
-
-    local response
-    if ! response="$(_api_get "/agents?conditions=${encoded}" 2>/dev/null)"; then
-        log_warn "Agent API lookup failed."
-        printf '[]'; return 1
+# Usage: lg_resolve_environment <name>. Returns 0 found (LG_ENV_NAME), 1 not found, 2 ambiguous, 3 lookup failed.
+# Prefix and contains matches need 6 or more normalized characters on both sides.
+lg_resolve_environment() {
+    local input="$1" response names norm_in line norm lc_in rc
+    local exact="" folded="" normalized="" prefix="" contains=""
+    LG_ENV_NAME=""
+    LG_ENV_REASON=""
+    if ! response="$(_api_get "/environments" 2>/dev/null)"; then
+        LG_ENV_REASON="LookupFailed"
+        log_error "The environment lookup failed (GET /environments). Check the API token and HTTPS access to the instance."
+        return 3
     fi
+    if ! names="$(printf '%s' "${response}" | jq -r '
+            (if type == "array" then . elif type == "object" and (.data | type) == "array" then .data else error("unexpected response") end)
+            | .[] | (.Name // .name // .DisplayName // "") | tostring | select(length > 0)' 2>/dev/null)"; then
+        LG_ENV_REASON="LookupFailed"
+        log_error "The environment lookup returned an unexpected response."
+        return 3
+    fi
+    norm_in="$(lg_env_normalize "${input}")"
+    lc_in="$(printf '%s' "${input}" | tr '[:upper:]' '[:lower:]')"
+    while IFS= read -r line; do
+        if [ -z "${line}" ]; then continue; fi
+        if [ "${line}" = "${input}" ]; then exact="${exact}${line}"$'\n'; fi
+        if [ "$(printf '%s' "${line}" | tr '[:upper:]' '[:lower:]')" = "${lc_in}" ]; then folded="${folded}${line}"$'\n'; fi
+        norm="$(lg_env_normalize "${line}")"
+        if [ -z "${norm}" ] || [ -z "${norm_in}" ]; then continue; fi
+        if [ "${norm}" = "${norm_in}" ]; then normalized="${normalized}${line}"$'\n'; continue; fi
+        if [ "${#norm}" -lt 6 ] || [ "${#norm_in}" -lt 6 ]; then continue; fi
+        case "${norm}" in "${norm_in}"*) prefix="${prefix}${line}"$'\n'; continue ;; esac
+        case "${norm_in}" in "${norm}"*) prefix="${prefix}${line}"$'\n'; continue ;; esac
+        case "${norm}" in *"${norm_in}"*) contains="${contains}${line}"$'\n'; continue ;; esac
+        case "${norm_in}" in *"${norm}"*) contains="${contains}${line}"$'\n' ;; esac
+    done <<< "${names}"
 
-    # Normalise to a JSON array regardless of response shape.
-    if _has_cmd jq; then
-        local normalised
-        normalised="$(printf '%s' "${response}" | jq -c '
-            if type == "array" then .
-            elif .data    then .data
-            elif .items   then .items
-            elif .results then .results
-            else [.]
-            end
-        ' 2>/dev/null)" || normalised="[]"
-        printf '%s' "${normalised}"
+    rc=0
+    lg_env_pick Exact "${exact}" || rc=$?
+    if [ "${rc}" -eq 1 ]; then rc=0; lg_env_pick CaseInsensitive "${folded}" || rc=$?; fi
+    if [ "${rc}" -eq 1 ]; then rc=0; lg_env_pick Normalized "${normalized}" || rc=$?; fi
+    if [ "${rc}" -eq 1 ]; then rc=0; lg_env_pick Prefix "${prefix}" || rc=$?; fi
+    if [ "${rc}" -eq 1 ]; then rc=0; lg_env_pick Contains "${contains}" || rc=$?; fi
+    if [ "${rc}" -eq 0 ]; then
+        log_info "Environment '${input}' matched '${LG_ENV_NAME}' (${LG_ENV_REASON})."
+        return 0
+    fi
+    if [ "${rc}" -eq 2 ]; then return 2; fi
+    LG_ENV_REASON="NotFound"
+    log_error "No Liongard environment matches '${input}' (normalized '${norm_in}'). Known environments: $(printf '%s\n' "${names}" | sed '/^$/d' | head -n 5 | tr '\n' ';' | sed 's/;$//; s/;/; /g')"
+    return 1
+}
+
+# END SHARED BLOCK: Liongard environment check
+
+# BEGIN SHARED BLOCK: Liongard Linux agent functions
+# Identical in every linux/LGAgent*.sh script except LGAgentIdentity-Linux.sh.
+
+LG_AGENT_DIR="/opt/liongard"
+LG_AGENT_BINARY="${LG_AGENT_DIR}/LiongardAgent"
+LG_AGENT_CONFIG="${LG_AGENT_DIR}/.config"
+LG_AGENT_LOG="${LG_AGENT_DIR}/logs/agent.log"
+LG_GUID_DIR="/etc/liongard-agent"
+LG_GUID_FILE="${LG_GUID_DIR}/.machine-guid"
+LG_MACHINE_ID_FILES="/etc/machine-id /var/lib/dbus/machine-id"
+LG_CORE_SERVICE="liongard-agent"
+LG_UPDATER_SERVICE="liongard-agent-updater"
+LG_LEGACY_SERVICES="roaragent liongardagent LiongardAgent"
+LG_LEGACY_UPDATER_TIMERS="liongard-updater roaragent-updater"
+LG_UNIT_DIRS="/etc/systemd/system /lib/systemd/system /usr/lib/systemd/system"
+LG_AGENT_DIRS="/opt/liongard /opt/liongard-agent /usr/local/liongard /etc/liongard"
+LG_LEGACY_BINARIES="/usr/local/bin/liongard-agent /usr/bin/liongard-agent /usr/local/bin/roaragent /usr/bin/roaragent /usr/local/bin/liongardagent /usr/bin/liongardagent"
+LG_UNINSTALL_SCRIPTS="/opt/liongard/uninstall.sh /opt/liongard/uninstall /opt/liongard-agent/uninstall.sh /opt/liongard-agent/uninstall /usr/local/liongard/uninstall.sh /usr/local/liongard/uninstall"
+LG_MACHINE_GUID_PATTERN='^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$'
+LG_MIN_INSTALLER_BYTES=10240
+LG_STATE=""
+LG_WORK_DIR=""
+LG_INSTALLER_FILE=""
+LG_INSTALLER_TYPE=""
+LG_INSTALL_HOST=""
+LG_INSTALL_ENVIRONMENT=""
+LG_ID_VALUE=""
+LG_ID_SOURCE=""
+LG_ID_TIER=""
+
+_lg_has() {
+    command -v "$1" >/dev/null 2>&1
+}
+
+# Reads KEY from the agent config the way the installer does: split on the first '='.
+lg_config_value() {
+    [ -r "${LG_AGENT_CONFIG}" ] || return 0
+    awk -v k="$1" 'index($0, k "=") == 1 { print substr($0, length(k) + 2); exit }' "${LG_AGENT_CONFIG}"
+}
+
+lg_unit_file() {
+    local dir
+    for dir in ${LG_UNIT_DIRS}; do
+        if [ -f "${dir}/$1" ]; then printf '%s' "${dir}/$1"; return 0; fi
+    done
+    return 1
+}
+
+lg_service_running() {
+    _lg_has systemctl && systemctl is-active --quiet "${LG_CORE_SERVICE}" 2>/dev/null
+}
+
+lg_deb_packages() {
+    _lg_has dpkg-query || return 0
+    dpkg-query -W -f='${Status} ${Package}\n' 2>/dev/null | awk '$3 == "installed" && tolower($4) ~ /liongard|roaragent/ { print $4 }'
+}
+
+lg_rpm_packages() {
+    _lg_has rpm || return 0
+    rpm -qa --qf '%{NAME}\n' 2>/dev/null | grep -Ei 'liongard|roaragent'
+    return 0
+}
+
+# Prints one line for everything that marks this machine as having an agent. The identity
+# (/etc/liongard-agent) and the script logs are never leftovers.
+lg_agent_leftovers() {
+    local name dir path
+    for name in "${LG_CORE_SERVICE}.service" "${LG_UPDATER_SERVICE}.service" "${LG_UPDATER_SERVICE}.timer"; do
+        path="$(lg_unit_file "${name}")" && echo "unit ${path}"
+    done
+    for name in ${LG_LEGACY_SERVICES}; do
+        path="$(lg_unit_file "${name}.service")" && echo "unit ${path}"
+    done
+    for name in ${LG_LEGACY_UPDATER_TIMERS}; do
+        path="$(lg_unit_file "${name}.timer")" && echo "unit ${path}"
+    done
+    if _lg_has pgrep && pgrep -f "^${LG_AGENT_DIR}/" >/dev/null 2>&1; then echo "processes running from ${LG_AGENT_DIR}"; fi
+    for name in ${LG_LEGACY_SERVICES}; do
+        if _lg_has pgrep && pgrep -x "${name}" >/dev/null 2>&1; then echo "process ${name}"; fi
+    done
+    for name in $(lg_deb_packages) $(lg_rpm_packages); do echo "package ${name}"; done
+    for path in ${LG_LEGACY_BINARIES}; do
+        if [ -e "${path}" ]; then echo "binary ${path}"; fi
+    done
+    for dir in ${LG_AGENT_DIRS}; do
+        if [ -e "${dir}" ]; then echo "folder ${dir}"; fi
+    done
+    return 0
+}
+
+# Usage: lg_install_state [clean]. Sets LG_STATE to Healthy, Stale or NotInstalled. Healthy means the
+# unit, binary and config exist and the service is running; "clean" also counts a refused agent as Stale.
+lg_install_state() {
+    local unit binary=false config=false running=false rejected=false leftovers line
+    unit="$(lg_unit_file "${LG_CORE_SERVICE}.service")" || unit=""
+    if [ -x "${LG_AGENT_BINARY}" ]; then binary=true; fi
+    if [ -f "${LG_AGENT_CONFIG}" ]; then config=true; fi
+    if lg_service_running; then running=true; fi
+    if [ "$1" = clean ] && lg_heartbeat_rejected "${LG_AGENT_LOG}"; then rejected=true; fi
+    leftovers="$(lg_agent_leftovers)"
+    log_info "Service unit ${LG_CORE_SERVICE}: ${unit:-not registered}; running: ${running}"
+    log_info "Agent binary ${LG_AGENT_BINARY}: ${binary}; agent config ${LG_AGENT_CONFIG}: ${config}"
+    if [ "$1" = clean ]; then log_info "Platform refused the last 3 heartbeats (HTTP 401 in ${LG_AGENT_LOG}): ${rejected}"; fi
+    while IFS= read -r line; do
+        if [ -n "${line}" ]; then log_info "  Found: ${line}"; fi
+    done <<< "${leftovers}"
+    if [ -n "${unit}" ] && [ "${binary}" = true ] && [ "${config}" = true ] && [ "${running}" = true ] && [ "${rejected}" = false ]; then
+        LG_STATE=Healthy
+    elif [ -z "${leftovers}" ]; then
+        LG_STATE=NotInstalled
     else
-        # jq not available — return raw response; callers handle absence of jq.
-        printf '%s' "${response}"
+        LG_STATE=Stale
+    fi
+    log_info "Install state: ${LG_STATE}"
+}
+
+# True while the agent's updater runs; an install or cleanup now could break it.
+lg_updating() {
+    _lg_has systemctl || return 1
+    case "$(systemctl is-active "${LG_UPDATER_SERVICE}.service" 2>/dev/null)" in
+        active|activating|reloading) return 0 ;;
+    esac
+    return 1
+}
+
+# Clean install only: waits for a running update, then gives a stopped agent one start attempt.
+lg_prepare_existing_agent() {
+    local i=0
+    if lg_service_running; then return 0; fi
+    if lg_updating; then
+        log_info "The agent is not running and its updater is running; waiting up to 2 minutes."
+        while lg_updating && [ "${i}" -lt 12 ]; do sleep 10; i=$((i + 1)); done
+        if lg_updating; then lg_exit "${EXIT_BUSY}" "An agent update is still running after 2 minutes. Nothing was changed; run the script again later."; fi
+    fi
+    if lg_unit_file "${LG_CORE_SERVICE}.service" >/dev/null && [ -x "${LG_AGENT_BINARY}" ] && [ -f "${LG_AGENT_CONFIG}" ] && _lg_has systemctl; then
+        log_info "The agent service is stopped; trying to start it once."
+        systemctl start "${LG_CORE_SERVICE}" >/dev/null 2>&1
+        i=0
+        while ! lg_service_running && [ "${i}" -lt 6 ]; do sleep 5; i=$((i + 1)); done
     fi
     return 0
 }
 
-# ============================================================
-# COLLISION DETECTION AND DEVICEID OVERRIDE
-#
-# If the local machine ID already exists in Liongard under a DIFFERENT
-# hostname, a fresh UUID is generated for the DEVICEID install property.
-# This prevents the new agent from overwriting an unrelated existing record.
-# The script NEVER modifies /etc/machine-id.
-# ============================================================
-
-_generate_uuid() {
-    if _has_cmd uuidgen; then
-        uuidgen | tr '[:upper:]' '[:lower:]'
-    elif [[ -r /proc/sys/kernel/random/uuid ]]; then
-        cat /proc/sys/kernel/random/uuid | tr '[:upper:]' '[:lower:]'
-    else
-        log_error "Cannot generate UUID: uuidgen is missing and /proc/sys/kernel/random/uuid is unavailable."
-        exit 1
-    fi
+lg_installed_version() {
+    local v
+    v="$(lg_config_value AGENT_VERSION | tr -d '[:space:]')"
+    if lg_version_valid "${v}"; then printf '%s' "${v}"; fi
 }
 
-# Sets _DEVICE_GUID_OVERRIDE when a collision with a different host is found.
-resolve_device_guid_override() {
-    local local_machine_id="$1"
-    local agents_json="$2"
-    shift 2
-    local -a local_hostnames=("$@")
+# Reads the version of a downloaded installer without running its install step.
+lg_installer_version() {
+    local v=""
+    case "${LG_INSTALLER_TYPE}" in
+        sh)
+            if sed -n 2p "$1" 2>/dev/null | grep -q '^# This script was generated using Makeself'; then
+                v="$(sh "$1" --tar xOf ./version.txt 2>/dev/null | head -n 1 | tr -d '[:space:]')"
+            fi ;;
+        deb) if _lg_has dpkg-deb; then v="$(dpkg-deb -f "$1" Version 2>/dev/null | sed 's/[-~+].*//')"; fi ;;
+        rpm) if _lg_has rpm; then v="$(rpm -qp --qf '%{VERSION}' "$1" 2>/dev/null)"; fi ;;
+    esac
+    if lg_version_valid "${v}"; then printf '%s' "${v}"; fi
+}
 
-    # No agents returned → no collision possible.
-    if [[ -z "${agents_json}" || "${agents_json}" == "[]" || "${agents_json}" == "null" ]]; then
-        log_info "No existing agents for this machine ID; no DEVICEID override required."
+_lg_set_identity() {
+    if [ -z "${LG_ID_VALUE}" ]; then LG_ID_VALUE="$1"; LG_ID_SOURCE="$2"; LG_ID_TIER="$3"; fi
+}
+
+# Collects every local identifier. The identity to save follows the installer's tier order
+# (resolveMachineGuid in installers/makeself/src/install.ts).
+lg_collect_identity() {
+    local value path
+    LG_ID_AGENT_ID="$(lg_config_value AGENT_ID | tr -d '[:space:]')"
+    LG_ID_AGENT="" LG_ID_OS="" LG_ID_VALUE="" LG_ID_SOURCE="" LG_ID_TIER=""
+    if [ -f "${LG_GUID_FILE}" ]; then
+        value="$(tr -d '[:space:]' < "${LG_GUID_FILE}" 2>/dev/null)"
+        if [[ "${value}" =~ ${LG_MACHINE_GUID_PATTERN} ]]; then
+            lg_id_add LG_ID_AGENT guid-file "${value}"
+            _lg_set_identity "${value}" guid-file 1
+        elif [ -n "${value}" ]; then
+            log_warn "Ignoring the invalid identity in ${LG_GUID_FILE} (the installer ignores it too)."
+        fi
+    fi
+    value="$(lg_config_value MACHINE_GUID | tr -d '[:space:]')"
+    if [ -n "${value}" ]; then
+        lg_id_add LG_ID_AGENT config "${value}"
+        if [[ "${value}" =~ ${LG_MACHINE_GUID_PATTERN} ]]; then _lg_set_identity "${value}" config 2; else _lg_set_identity "${value}" config-nonstandard 2; fi
+    fi
+    for path in ${LG_MACHINE_ID_FILES}; do
+        value="$(tr -d '[:space:]' < "${path}" 2>/dev/null)"
+        [[ "${value}" =~ ${LG_MACHINE_GUID_PATTERN} ]] || continue
+        lg_id_add LG_ID_OS "machine-id:${path}" "${value}"
+        if [ -f "${LG_AGENT_CONFIG}" ]; then _lg_set_identity "${value}" machine-id 3; fi
+    done
+    if [ -n "${LG_ID_VALUE}" ] && lg_is_junk_id "${LG_ID_VALUE}"; then
+        log_warn "The agent identity [${LG_ID_VALUE}] is a placeholder value; it is saved but never used to find a platform record."
+    fi
+    log_info "Local AgentID: ${LG_ID_AGENT_ID:-none}"
+    log_info "Agent identifiers: $(lg_values "${LG_ID_AGENT}" | tr '\n' ' ')"
+    log_info "OS identifiers: $(lg_values "${LG_ID_OS}" | tr '\n' ' ')"
+}
+
+# Saves the identity (never the config: it holds the agent secret) in the LGAgentIdentity-Linux.sh
+# backup format, so `LGAgentIdentity-Linux.sh restore --from <folder>` can use it.
+lg_save_identity_backup() {
+    local host created dest
+    if [ -z "${LG_ID_VALUE}" ]; then
+        if [ -f "${LG_AGENT_CONFIG}" ]; then
+            lg_exit "${EXIT_IDENTITY}" "${LG_AGENT_CONFIG} exists but no agent identity could be resolved, so it can't be saved. Nothing was removed."
+        fi
+        log_info "No agent identity found on this machine; nothing to save."
         return 0
     fi
-
-    if ! _has_cmd jq; then
-        log_warn "jq not available; collision detection skipped. Install jq for full collision detection."
-        return 0
+    host="$(hostname -s 2>/dev/null || uname -n)"
+    host="${host%%.*}"
+    created="$(date -u +%Y%m%dT%H%M%SZ)"
+    dest="${1%/}/liongard-identity-${host}-${created}"
+    if [ -e "${dest}" ]; then
+        lg_exit "${EXIT_IDENTITY}" "${dest} already exists. Nothing was removed."
     fi
-
-    # Re-verify the MachineGuid client-side rather than trusting that the API
-    # honoured the server-side 'MachineGuid = ...' condition. Without this guard,
-    # an API that ignored the filter and returned unrelated agents would look
-    # like a hostname mismatch and trigger a spurious override.
-    local matched_json
-    matched_json="$(printf '%s' "${agents_json}" | jq -c \
-        --arg mid "${local_machine_id}" \
-        '[.[] | select((.MachineGuid // "" | ascii_downcase) == ($mid | ascii_downcase))]' 2>/dev/null)" \
-        || matched_json="[]"
-
-    local agent_count
-    agent_count="$(printf '%s' "${matched_json}" | jq 'length' 2>/dev/null)" || agent_count=0
-
-    if [[ "${agent_count}" -eq 0 ]]; then
-        log_info "No agents with a matching MachineGuid; no DEVICEID override required."
-        return 0
+    if ! ( umask 077 && mkdir -m 0700 "${dest}" \
+           && printf '%s\n' "${LG_ID_VALUE}" > "${dest}/machine-guid" \
+           && {
+                  echo "format_version=1"
+                  echo "os=linux"
+                  echo "hostname=${host}"
+                  echo "created_utc=${created}"
+                  echo "identity_source=${LG_ID_SOURCE}"
+                  echo "identity_tier=${LG_ID_TIER}"
+                  echo "agent_id=${LG_ID_AGENT_ID}"
+                  echo "agent_name=$(lg_config_value AGENT_NAME)"
+                  echo "agent_uid=$(lg_config_value AGENT_UID)"
+                  echo "url=$(lg_config_value URL)"
+                  echo "agent_version=$(lg_config_value AGENT_VERSION)"
+                  echo "config_included=false"
+                  echo "sha256_machine_guid=$(sha256sum -- "${dest}/machine-guid" | cut -d' ' -f1)"
+              } > "${dest}/manifest.txt" \
+           && chmod 0600 "${dest}/machine-guid" "${dest}/manifest.txt" ); then
+        rm -rf -- "${dest}"
+        lg_exit "${EXIT_IDENTITY}" "Could not write the agent identity backup to ${dest}. Nothing was removed."
     fi
+    log_ok "Agent identity saved to ${dest} (identity ${LG_ID_VALUE}, source ${LG_ID_SOURCE}, AgentID ${LG_ID_AGENT_ID:-unknown}). It holds no key or secret."
+}
 
-    log_info "Found ${agent_count} Liongard agent record(s) matching this machine ID."
+# Clean install: an identity that lived only in the agent config is written to the identity file
+# before the config is removed, so the reinstall keeps it.
+lg_seed_identity() {
+    local tmp
+    if [ "${LG_ID_TIER}" != 2 ] || [ -e "${LG_GUID_FILE}" ] || ! [[ "${LG_ID_VALUE}" =~ ${LG_MACHINE_GUID_PATTERN} ]]; then return 0; fi
+    if ! { mkdir -p -- "${LG_GUID_DIR}" && chmod 0700 "${LG_GUID_DIR}" && tmp="$(mktemp "${LG_GUID_DIR}/.machine-guid.XXXXXXXX")"; }; then
+        lg_exit "${EXIT_IDENTITY}" "Could not write ${LG_GUID_FILE}. The agent was removed but not reinstalled; restore the identity with LGAgentIdentity-Linux.sh."
+    fi
+    if ! { printf '%s\n' "${LG_ID_VALUE}" > "${tmp}" && chmod 0600 "${tmp}" && mv -f -- "${tmp}" "${LG_GUID_FILE}"; }; then
+        rm -f -- "${tmp}"
+        lg_exit "${EXIT_IDENTITY}" "Could not write ${LG_GUID_FILE}. The agent was removed but not reinstalled; restore the identity with LGAgentIdentity-Linux.sh."
+    fi
+    log_info "Wrote the saved identity to ${LG_GUID_FILE}, so the reinstalled agent keeps it."
+}
 
-    # Check whether any returned agent matches the local hostname/FQDN.
-    local hostname_matched=false
-    local agent_hostname agent_fqdn h h_lower
-    while IFS= read -r agent_json; do
-        [[ -z "${agent_json}" || "${agent_json}" == "null" ]] && continue
-        agent_hostname="$(printf '%s' "${agent_json}" | jq -r '.Hostname // .Name // "" | ascii_downcase' 2>/dev/null)"
-        agent_fqdn="$(printf '%s' "${agent_json}" | jq -r '(.Data.FQDN // "") | ascii_downcase' 2>/dev/null)"
-
-        for h in "${local_hostnames[@]}"; do
-            h_lower="$(printf '%s' "${h}" | tr '[:upper:]' '[:lower:]')"
-            if [[ -n "${agent_hostname}" && "${h_lower}" == "${agent_hostname}" ]] || \
-               [[ -n "${agent_fqdn}"    && "${h_lower}" == "${agent_fqdn}" ]]; then
-                hostname_matched=true
-                break 2
-            fi
+# Removes the agent and its leftovers. Keeps /etc/liongard-agent (identity) and the script logs.
+lg_remove_local_agent() {
+    local name dir path pkg
+    log_step "Removing the Liongard Agent from this machine."
+    if _lg_has systemctl; then
+        for name in "${LG_UPDATER_SERVICE}.timer" "${LG_UPDATER_SERVICE}.service" "${LG_CORE_SERVICE}.service" ${LG_LEGACY_SERVICES} ${LG_LEGACY_UPDATER_TIMERS}; do
+            systemctl stop "${name}" >/dev/null 2>&1
+            systemctl disable "${name}" >/dev/null 2>&1
         done
-    done < <(printf '%s' "${matched_json}" | jq -c '.[]' 2>/dev/null)
-
-    if [[ "${hostname_matched}" == true ]]; then
-        log_info "Existing agent matches this machine ID and hostname — no DEVICEID override required (likely a reinstall)."
-        return 0
+    elif _lg_has service; then
+        for name in "${LG_CORE_SERVICE}" ${LG_LEGACY_SERVICES}; do service "${name}" stop >/dev/null 2>&1; done
     fi
-
-    # Collision: same machine ID, different hostname → generate override.
-    local other_hosts
-    other_hosts="$(printf '%s' "${matched_json}" | jq -r '[.[].Hostname // .[].Name // ""] | join(", ")' 2>/dev/null)"
-    log_warn "Machine ID [${local_machine_id}] is registered in Liongard under different hostname(s): ${other_hosts}"
-    log_warn "Generating a DEVICEID override to prevent overwriting the existing record."
-
-    _DEVICE_GUID_OVERRIDE="$(_generate_uuid)"
-    log_ok "DEVICEID override generated: ${_DEVICE_GUID_OVERRIDE}"
-}
-
-# ============================================================
-# REMOTE PLATFORM AGENT DELETION
-# ============================================================
-
-# Confidence scoring mirrors the Windows script model:
-#   MachineGuid exact match  → +100
-#   Hostname match           → +30 (+5 per additional, max +15 bonus)
-#   MAC address match        → +40 (+5 per additional, max +10 bonus)
-_score_agent() {
-    local agent_json="$1"
-    local local_machine_id="$2"
-    shift 2
-    local -a local_hostnames=("$@")
-
-    local score=0
-
-    # MachineGuid match.
-    local agent_guid
-    agent_guid="$(printf '%s' "${agent_json}" | jq -r '(.MachineGuid // "") | ascii_downcase' 2>/dev/null)"
-    if [[ -n "${agent_guid}" && "${agent_guid}" == "${local_machine_id}" ]]; then
-        (( score += 100 ))
-    fi
-
-    # Hostname match.
-    local agent_hostname h h_lower
-    agent_hostname="$(printf '%s' "${agent_json}" | jq -r '(.Hostname // .Name // "") | ascii_downcase' 2>/dev/null)"
-    local host_hits=0
-    for h in "${local_hostnames[@]}"; do
-        h_lower="$(printf '%s' "${h}" | tr '[:upper:]' '[:lower:]')"
-        if [[ -n "${agent_hostname}" && "${h_lower}" == "${agent_hostname}" ]]; then
-            (( ++host_hits ))
+    for pkg in $(lg_deb_packages); do
+        log_info "Removing package ${pkg}."
+        if _lg_has apt-get; then
+            DEBIAN_FRONTEND=noninteractive apt-get remove -y "${pkg}" < /dev/null >/dev/null 2>&1 || log_warn "apt-get remove ${pkg} failed."
+        else
+            dpkg --remove "${pkg}" < /dev/null >/dev/null 2>&1 || log_warn "dpkg --remove ${pkg} failed."
         fi
     done
-    if [[ "${host_hits}" -gt 0 ]]; then
-        local hbonus=$(( 5 * (host_hits - 1) ))
-        [[ "${hbonus}" -gt 15 ]] && hbonus=15
-        (( score += 30 + hbonus ))
-    fi
-
-    # MAC address match.
-    local -a local_macs
-    mapfile -t local_macs < <(get_local_mac_addresses)
-    local agent_macs_raw mac_entry clean_agent_mac lm
-    agent_macs_raw="$(printf '%s' "${agent_json}" | jq -r '
-        (.MACAddress // .MacAddress // .Data.MACAddress // "") |
-        if type == "array" then join(",") else . end
-    ' 2>/dev/null)"
-
-    local mac_hits=0
-    local OLD_IFS="${IFS}"; IFS=",; "
-    for mac_entry in ${agent_macs_raw}; do
-        clean_agent_mac="$(_normalize_mac "${mac_entry}")" || continue
-        for lm in "${local_macs[@]}"; do
-            if [[ "${clean_agent_mac}" == "${lm}" ]]; then
-                (( ++mac_hits ))
-                break
-            fi
-        done
-    done
-    IFS="${OLD_IFS}"
-
-    if [[ "${mac_hits}" -gt 0 ]]; then
-        local mbonus=$(( 5 * (mac_hits - 1) ))
-        [[ "${mbonus}" -gt 10 ]] && mbonus=10
-        (( score += 40 + mbonus ))
-    fi
-
-    printf '%d' "${score}"
-}
-
-invoke_remote_agent_removal() {
-    local agents_json="$1"
-    local local_machine_id="$2"
-    shift 2
-    local -a local_hostnames=("$@")
-
-    if [[ -z "${agents_json}" || "${agents_json}" == "[]" || "${agents_json}" == "null" ]]; then
-        log_info "No agents returned; remote deletion skipped."
-        return 0
-    fi
-
-    if ! _has_cmd jq; then
-        log_warn "jq required for remote deletion scoring. Skipping."
-        return 0
-    fi
-
-    local best_score=0 best_agent_id=""
-    local agent_json agent_id score
-
-    while IFS= read -r agent_json; do
-        [[ -z "${agent_json}" || "${agent_json}" == "null" ]] && continue
-        score="$(_score_agent "${agent_json}" "${local_machine_id}" "${local_hostnames[@]}")"
-        agent_id="$(printf '%s' "${agent_json}" | jq -r '.ID // .id // ""' 2>/dev/null)"
-
-        if [[ "${score}" -gt "${best_score}" && -n "${agent_id}" ]]; then
-            best_score="${score}"
-            best_agent_id="${agent_id}"
+    for pkg in $(lg_rpm_packages); do
+        log_info "Removing package ${pkg}."
+        if _lg_has dnf; then dnf remove -y "${pkg}" < /dev/null >/dev/null 2>&1 || log_warn "dnf remove ${pkg} failed."
+        elif _lg_has yum; then yum remove -y "${pkg}" < /dev/null >/dev/null 2>&1 || log_warn "yum remove ${pkg} failed."
+        elif _lg_has zypper; then zypper --non-interactive remove "${pkg}" < /dev/null >/dev/null 2>&1 || log_warn "zypper remove ${pkg} failed."
+        else rpm -e "${pkg}" >/dev/null 2>&1 || log_warn "rpm -e ${pkg} failed."
         fi
-    done < <(printf '%s' "${agents_json}" | jq -c '.[]' 2>/dev/null)
-
-    if [[ -z "${best_agent_id}" ]]; then
-        log_info "No Liongard agent record matched the local host identity; remote deletion skipped."
-        return 0
+    done
+    for path in ${LG_UNINSTALL_SCRIPTS}; do
+        if [ -f "${path}" ] && [ -x "${path}" ]; then
+            log_info "Running ${path}."
+            "${path}" < /dev/null >/dev/null 2>&1 || log_warn "${path} returned $?."
+        fi
+    done
+    if _lg_has pkill; then
+        pkill -TERM -f "^${LG_AGENT_DIR}/" >/dev/null 2>&1 && sleep 2
+        pkill -KILL -f "^${LG_AGENT_DIR}/" >/dev/null 2>&1
+        for name in ${LG_LEGACY_SERVICES}; do pkill -x "${name}" >/dev/null 2>&1; done
     fi
-
-    if [[ "${best_score}" -lt "${MINIMUM_REMOTE_DELETION_SCORE}" ]]; then
-        log_warn "Remote deletion skipped: match score ${best_score} is below threshold ${MINIMUM_REMOTE_DELETION_SCORE}."
-        return 0
+    for dir in ${LG_UNIT_DIRS}; do
+        for name in "${LG_CORE_SERVICE}.service" "${LG_UPDATER_SERVICE}.service" "${LG_UPDATER_SERVICE}.timer"; do
+            rm -f -- "${dir}/${name}" "${dir}/multi-user.target.wants/${name}" "${dir}/timers.target.wants/${name}"
+        done
+        for name in ${LG_LEGACY_SERVICES}; do rm -f -- "${dir}/${name}.service" "${dir}/multi-user.target.wants/${name}.service"; done
+        for name in ${LG_LEGACY_UPDATER_TIMERS}; do rm -f -- "${dir}/${name}.timer" "${dir}/timers.target.wants/${name}.timer"; done
+    done
+    if _lg_has systemctl; then
+        systemctl daemon-reload >/dev/null 2>&1
+        for name in "${LG_CORE_SERVICE}" ${LG_LEGACY_SERVICES}; do systemctl reset-failed "${name}" >/dev/null 2>&1; done
     fi
-
-    log_info "Deleting Liongard agent ID ${best_agent_id} (match score: ${best_score})..."
-    local http_status
-    http_status="$(_api_delete "/agents/${best_agent_id}")" || { log_warn "DELETE request failed."; return 0; }
-
-    if [[ "${http_status}" == "204" || "${http_status}" == "200" ]]; then
-        log_ok "Remote agent ID ${best_agent_id} deleted (HTTP ${http_status})."
-    else
-        log_warn "Unexpected HTTP ${http_status} while deleting agent ID ${best_agent_id}."
-    fi
+    for path in ${LG_LEGACY_BINARIES}; do
+        rm -f -- "${path}" 2>/dev/null || log_warn "Could not remove ${path}."
+    done
+    for dir in ${LG_AGENT_DIRS}; do
+        if [ -e "${dir}" ]; then
+            log_info "Removing ${dir}."
+            rm -rf -- "${dir}" || log_warn "Could not remove ${dir}."
+        fi
+    done
 }
 
-# ============================================================
-# LOCAL AGENT DETECTION
-# ============================================================
+# The names this machine can be registered under. No truncated variants; "localhost" is never used.
+lg_local_hostnames() {
+    local seen=" " n lc
+    for n in "$(hostname 2>/dev/null)" "$(hostname -s 2>/dev/null)" "$(hostname -f 2>/dev/null)"; do
+        n="${n%.}"
+        lc="$(printf '%s' "${n}" | tr '[:upper:]' '[:lower:]')"
+        if [ -z "${n}" ] || [ "${lc}" = localhost ] || [ "${lc}" = localhost.localdomain ] || [[ "${seen}" == *" ${lc} "* ]]; then continue; fi
+        seen="${seen}${lc} "
+        printf '%s\n' "${n}"
+    done
+}
 
-is_agent_installed() {
-    # Returns 0 (true) if any concrete Liongard agent signal is detected.
-    local svc
-
-    # Systemd: check if the service is active, OR if a unit file backing it exists.
-    # Deliberately avoid list-units --all because a just-stopped/disabled service can
-    # still appear there even after daemon-reload in a "not-found" state.
-    if _has_cmd systemctl; then
-        for svc in "${SERVICE_NAMES[@]}"; do
-            # Active check (most reliable signal).
-            if systemctl is-active --quiet "${svc}" 2>/dev/null; then
-                _DETECTED_SVC="${svc}"; return 0
-            fi
-            # Unit-file existence check (covers enabled-but-stopped, or failed state).
-            local unit_dir
-            for unit_dir in /etc/systemd/system /lib/systemd/system /usr/lib/systemd/system; do
-                if [[ -f "${unit_dir}/${svc}.service" || -f "${unit_dir}/${svc}" ]]; then
-                    _DETECTED_SVC="${svc}"; return 0
-                fi
-            done
-        done
-    fi
-
-    # SysV service check (non-systemd hosts).
-    if _has_cmd service; then
-        for svc in "${SERVICE_NAMES[@]}"; do
-            if service "${svc}" status &>/dev/null; then
-                _DETECTED_SVC="${svc}"; return 0
-            fi
-        done
-    fi
-
-    # Running process check.
-    local proc_name
-    for proc_name in roaragent liongardagent; do
-        if pgrep -x "${proc_name}" &>/dev/null; then
-            log_info "Liongard process '${proc_name}' is running."
+# Usage: lg_download <url> <file>. Three attempts; a file smaller than 10 KB is rejected.
+lg_download() {
+    local attempt=1 size
+    while [ "${attempt}" -le 3 ]; do
+        rm -f -- "$2"
+        if _lg_has curl; then
+            curl -sSfL --connect-timeout 30 -o "$2" "$1" 2>/dev/null
+        else
+            wget -q -O "$2" "$1" 2>/dev/null
+        fi
+        size="$(wc -c < "$2" 2>/dev/null | tr -d ' ')"
+        if [ -n "${size}" ] && [ "${size}" -ge "${LG_MIN_INSTALLER_BYTES}" ]; then
+            log_ok "Downloaded ${1} (${size} bytes)."
             return 0
         fi
+        log_warn "Download attempt ${attempt} of ${1} failed (${size:-0} bytes)."
+        attempt=$((attempt + 1))
+        if [ "${attempt}" -le 3 ]; then sleep 5; fi
     done
-
-    # Installed package check.
-    if _has_cmd dpkg && dpkg -l 2>/dev/null | grep -qi liongard; then return 0; fi
-    if _has_cmd rpm  && rpm  -qa 2>/dev/null | grep -qi liongard; then return 0; fi
-
-    # Agent binary presence check. Only checks for actual executables in known
-    # install locations — intentionally excludes log and config-only directories
-    # which may outlive an uninstall and would produce false positives.
-    local bin_path
-    for bin_path in \
-        /usr/local/bin/liongard-agent /usr/bin/liongard-agent \
-        /usr/local/bin/roaragent      /usr/bin/roaragent \
-        /usr/local/bin/liongardagent  /usr/bin/liongardagent \
-        /opt/liongard/liongard-agent  /opt/liongard/bin/liongard-agent \
-        /opt/liongard-agent/liongard-agent \
-        /usr/local/liongard/liongard-agent; do
-        [[ -f "${bin_path}" ]] && return 0
-    done
-
     return 1
 }
 
-# ============================================================
-# PRE-UNINSTALL
-# ============================================================
-
-_stop_liongard_services() {
-    local svc
-    for svc in "${SERVICE_NAMES[@]}"; do
-        if _has_cmd systemctl; then
-            if systemctl is-active --quiet "${svc}" 2>/dev/null; then
-                log_info "Stopping service: ${svc}"
-                systemctl stop "${svc}" 2>/dev/null || log_warn "Could not stop ${svc}."
-            fi
-            if systemctl is-enabled --quiet "${svc}" 2>/dev/null; then
-                log_info "Disabling service: ${svc}"
-                systemctl disable "${svc}" 2>/dev/null || log_warn "Could not disable ${svc}."
-            fi
-        elif _has_cmd service; then
-            service "${svc}" stop 2>/dev/null || true
-        fi
-    done
-}
-
-_remove_liongard_package() {
-    log_info "Attempting package removal..."
-    local pkg removed=false
-
-    case "${_PKG_TYPE}" in
-        deb)
-            for pkg in liongard-agent roaragent liongardagent; do
-                if [[ "${_PKG_MANAGER}" == "apt" ]] && _has_cmd apt-get; then
-                    apt-get remove --purge -y "${pkg}" &>/dev/null && removed=true || true
-                elif _has_cmd dpkg; then
-                    dpkg --purge "${pkg}" &>/dev/null && removed=true || true
-                fi
-            done
-            ;;
-        rpm)
-            for pkg in liongard-agent roaragent liongardagent; do
-                if   _has_cmd dnf;    then dnf    remove -y "${pkg}" &>/dev/null && removed=true || true
-                elif _has_cmd yum;    then yum    remove -y "${pkg}" &>/dev/null && removed=true || true
-                elif _has_cmd zypper; then zypper --non-interactive remove "${pkg}" &>/dev/null && removed=true || true
-                elif _has_cmd rpm;    then rpm    -e "${pkg}"         &>/dev/null && removed=true || true
-                fi
-            done
-            ;;
+# Usage: lg_installer_url <architecture setting> <installer url setting>. Prints the URL to use.
+lg_installer_url() {
+    local arch machine
+    arch="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+    case "${arch}" in
+        auto|x64|arm64) ;;
+        *) lg_exit "${EXIT_CONFIG}" "LINUX_ARCHITECTURE must be auto, x64 or arm64 (got '$1')." ;;
     esac
-
-    # Attempt a generic uninstall script if one exists.
-    local uninstall_script
-    for uninstall_script in /opt/liongard/uninstall.sh /usr/local/liongard/uninstall.sh; do
-        if [[ -x "${uninstall_script}" ]]; then
-            log_info "Running Liongard uninstall script: ${uninstall_script}"
-            "${uninstall_script}" 2>/dev/null && removed=true || true
-        fi
-    done
-
-    if [[ "${removed}" == true ]]; then
-        log_ok "Package removal completed."
-    else
-        log_warn "No Liongard packages found via package manager (may have been installed differently)."
+    if [ -n "$2" ]; then printf '%s' "$2"; return 0; fi
+    if [ "${arch}" = auto ]; then
+        machine="$(uname -m 2>/dev/null)"
+        case "${machine}" in
+            x86_64) arch=x64 ;;
+            aarch64|arm64) arch=arm64 ;;
+            *) lg_exit "${EXIT_PREREQUISITE}" "Unsupported CPU architecture '${machine}'. The installer exists for x86_64 and aarch64 only." ;;
+        esac
     fi
-
-    # Reload systemd unit files after removal.
-    _has_cmd systemctl && systemctl daemon-reload 2>/dev/null || true
+    printf 'https://agents.static.liongard.com/LiongardAgent-lts-%s.xz.run' "${arch}"
 }
 
-invoke_liongard_agent_uninstall() {
-    log_step "Pre-uninstall: removing existing Liongard Agent..."
-
-    _stop_liongard_services
-    _remove_liongard_package
-
-    # Kill any lingering processes.
-    local proc_name
-    for proc_name in roaragent liongardagent; do
-        if pgrep -x "${proc_name}" &>/dev/null; then
-            log_info "Terminating lingering process: ${proc_name}"
-            pkill -x "${proc_name}" 2>/dev/null || true
-            sleep 1
-        fi
-    done
-
-    # Remove stale, Liongard-specific systemd unit files.
-    local svc_file
-    for svc_file in /etc/systemd/system/roaragent.service \
-                    /etc/systemd/system/liongard-agent.service \
-                    /lib/systemd/system/roaragent.service \
-                    /lib/systemd/system/liongard-agent.service \
-                    /usr/lib/systemd/system/roaragent.service \
-                    /usr/lib/systemd/system/liongard-agent.service; do
-        if [[ -f "${svc_file}" ]]; then
-            log_info "Removing stale service unit: ${svc_file}"
-            rm -f "${svc_file}" 2>/dev/null || log_warn "Could not remove ${svc_file}."
-        fi
-    done
-
-    # Disable and stop the Liongard auto-updater timer before reloading systemd.
-    # Without this the timer fires in the background and re-installs a newer agent
-    # version, causing the installer to find an orphaned config and refuse to install.
-    if _has_cmd systemctl; then
-        local timer_name
-        for timer_name in liongard-agent-updater liongard-updater roaragent-updater; do
-            systemctl stop    "${timer_name}.timer" 2>/dev/null || true
-            systemctl disable "${timer_name}.timer" 2>/dev/null || true
-        done
-        local timer_file
-        for timer_file in \
-            /etc/systemd/system/liongard-agent-updater.timer \
-            /etc/systemd/system/liongard-updater.timer \
-            /lib/systemd/system/liongard-agent-updater.timer \
-            /lib/systemd/system/liongard-updater.timer \
-            /usr/lib/systemd/system/liongard-agent-updater.timer \
-            /usr/lib/systemd/system/liongard-updater.timer; do
-            if [[ -f "${timer_file}" || -L "${timer_file}" ]]; then
-                log_info "Removing updater timer unit: ${timer_file}"
-                rm -f "${timer_file}" 2>/dev/null || true
-            fi
-        done
-    fi
-
-    _has_cmd systemctl && systemctl daemon-reload 2>/dev/null || true
-
-    # Clear any lingering systemd failed-state entries so list-units no longer
-    # shows the removed service. This matters for the post-uninstall detection check.
-    if _has_cmd systemctl; then
-        local svc
-        for svc in "${SERVICE_NAMES[@]}"; do
-            systemctl reset-failed "${svc}" 2>/dev/null || true
-            systemctl reset-failed "${svc}.timer" 2>/dev/null || true
-        done
-    fi
-
-    # Run the agent's own uninstall script when present.
-    # .run / self-extracting installers often ship one alongside the binary.
-    local uninstall_script
-    for uninstall_script in \
-        /opt/liongard/uninstall.sh      /opt/liongard/uninstall \
-        /opt/liongard-agent/uninstall.sh /opt/liongard-agent/uninstall \
-        /usr/local/liongard/uninstall.sh /usr/local/liongard/uninstall; do
-        if [[ -x "${uninstall_script}" ]]; then
-            log_info "Running agent uninstall script: ${uninstall_script}"
-            "${uninstall_script}" 2>/dev/null || true
-        fi
-    done
-
-    # Remove agent binaries from standard PATH locations.
-    local bin_path
-    for bin_path in \
-        /usr/local/bin/liongard-agent /usr/bin/liongard-agent \
-        /usr/local/bin/roaragent      /usr/bin/roaragent \
-        /usr/local/bin/liongardagent  /usr/bin/liongardagent; do
-        if [[ -f "${bin_path}" ]]; then
-            log_info "Removing agent binary: ${bin_path}"
-            rm -f "${bin_path}" 2>/dev/null || log_warn "Could not remove ${bin_path}."
-        fi
-    done
-
-    # Remove installation directories left by .run / self-extracting installers.
-    # /var/log/liongard is intentionally excluded to preserve diagnostic logs.
-    local install_dir
-    for install_dir in \
-        /opt/liongard /opt/liongard-agent \
-        /usr/local/liongard /etc/liongard; do
-        if [[ -d "${install_dir}" ]]; then
-            log_info "Removing agent installation directory: ${install_dir}"
-            rm -rf "${install_dir}" 2>/dev/null || log_warn "Could not remove ${install_dir}."
-        fi
-    done
-
-    log_ok "Pre-uninstall steps completed."
-}
-
-# ============================================================
-# INSTALLER DOWNLOAD
-# ============================================================
-
-download_installer() {
-    # Creates a private working directory (mktemp -d: owned by root, mode
-    # 0700, removed on exit by _cleanup), downloads the installer with retry
-    # logic and size validation.
-    # Result is written to the global _INSTALLER_PATH — NOT stdout — so that
-    # callers do not accidentally capture log lines when using $(...).
-    local url="${INSTALLER_URL}"
-    local dest_dir
-    local dest_file
-
-    if [[ -z "${_WORK_DIR}" ]]; then
-        _WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/liongard-agent.XXXXXXXX" 2>/dev/null)" || {
-            _WORK_DIR=""
-            log_error "Cannot create a private download directory under [${TMPDIR:-/tmp}]."
-            exit 5
-        }
-    fi
-    dest_dir="${_WORK_DIR}"
-
-    if [[ -n "${INSTALLER_FILE_NAME}" ]]; then
-        dest_file="${dest_dir}/${INSTALLER_FILE_NAME}"
-    else
-        dest_file="${dest_dir}/${url##*/}"
-        # Strip query strings from the filename if present.
-        dest_file="${dest_file%%\?*}"
-    fi
-
-    log_step "Downloading Liongard Agent installer..."
-    log_info "URL         : ${url}"
-    log_info "Destination : ${dest_file}"
-
-    local attempt=0
-    while [[ "${attempt}" -lt "${MAX_DOWNLOAD_ATTEMPTS}" ]]; do
-        (( ++attempt ))
-        log_info "Download attempt ${attempt}/${MAX_DOWNLOAD_ATTEMPTS}..."
-
-        [[ -f "${dest_file}" ]] && rm -f "${dest_file}"
-
-        local dl_ok=true
-        if [[ "${_HTTP_CLIENT}" == "curl" ]]; then
-            curl -sSL --fail -o "${dest_file}" "${url}" 2>/dev/null || dl_ok=false
-        else
-            wget -qO "${dest_file}" "${url}" 2>/dev/null || dl_ok=false
-        fi
-
-        if [[ "${dl_ok}" == false || ! -f "${dest_file}" ]]; then
-            log_warn "Attempt ${attempt} failed to produce a file."
-            continue
-        fi
-
-        local size
-        size="$(wc -c < "${dest_file}" 2>/dev/null || printf '0')"
-        if [[ "${size}" -lt "${MINIMUM_INSTALLER_BYTES}" ]]; then
-            log_warn "Downloaded file is ${size} bytes (minimum: ${MINIMUM_INSTALLER_BYTES}). Retrying..."
-            continue
-        fi
-
-        log_ok "Installer downloaded and verified (${size} bytes): ${dest_file}"
-        _INSTALLER_PATH="${dest_file}"
-        return 0
-    done
-
-    log_error "Installer download failed after ${MAX_DOWNLOAD_ATTEMPTS} attempts."
-    exit 5
-}
-
-# ============================================================
-# INSTALL
-# ============================================================
-
-# Run a command, log each output line, capture the exit code.
-# Usage: _run_logged <log_prefix> <command> [args...]
-_run_logged() {
-    local prefix="$1"; shift
-    local tmp exit_code=0
-    tmp="$(mktemp)"
-
-    "$@" >"${tmp}" 2>&1 || exit_code=$?
-
-    while IFS= read -r line; do
-        log_info "${prefix}: ${line}"
-    done < "${tmp}"
-    rm -f "${tmp}"
-
-    return "${exit_code}"
-}
-
-run_installer() {
-    local pkg_file="$1"
-    local local_hostname="$2"
-
-    log_step "Installing Liongard Agent from [${pkg_file}]..."
-
-    # Build an associative array of installer parameters.
-    declare -A _install_env
-    _install_env["${PARAM_URL}"]="${_INSTANCE_HOST}"
-    _install_env["${PARAM_ACCESS_KEY}"]="${AGENT_TOKEN_KEY}"
-    _install_env["${PARAM_ACCESS_SECRET}"]="${AGENT_TOKEN_SECRET}"
-    _install_env["${PARAM_AGENT_NAME}"]="${local_hostname}"
-
-    if [[ "${INCLUDE_ENVIRONMENT_VALUE}" == true && -n "${_RESOLVED_ENVIRONMENT}" ]]; then
-        _install_env["${PARAM_ENVIRONMENT}"]="${_RESOLVED_ENVIRONMENT}"
-    fi
-    if [[ -n "${AGENT_DESCRIPTION}" ]]; then
-        _install_env["${PARAM_DESCRIPTION}"]="${AGENT_DESCRIPTION}"
-    fi
-    if [[ -n "${_DEVICE_GUID_OVERRIDE}" ]]; then
-        _install_env["${DEVICE_ID_OVERRIDE_ARG_NAME}"]="${_DEVICE_GUID_OVERRIDE}"
-    fi
-
-    # The .run (sh) installer takes command-line flags, not env vars, and prints
-    # its own sanitised flag list below. For the deb/rpm paths we export these as
-    # environment variables (some postinstall scripts read them) and show them here.
-    if [[ "${_PKG_TYPE}" != "sh" ]]; then
-        log_info "Installer parameters (sanitised):"
-        local k display_val
-        for k in "${!_install_env[@]}"; do
-            display_val="${_install_env[${k}]}"
-            case "${k}" in
-                "${PARAM_ACCESS_KEY}"|"${PARAM_ACCESS_SECRET}")
-                    display_val="$(mask_secret "${display_val}")" ;;
-            esac
-            log_info "  ${k}=${display_val}"
-        done
-
-        for k in "${!_install_env[@]}"; do
-            export "${k}=${_install_env[${k}]}"
-        done
-    fi
-
-    local install_exit=0
-
-    case "${_PKG_TYPE}" in
-        deb)
-            log_info "Installing .deb package..."
-            _run_logged "dpkg" dpkg -i "${pkg_file}" || install_exit=$?
-
-            # Resolve broken dependencies if dpkg failed.
-            if [[ "${install_exit}" -ne 0 && "${_PKG_MANAGER}" == "apt" ]]; then
-                log_warn "dpkg returned ${install_exit}; running apt-get install -f to resolve dependencies..."
-                _run_logged "apt-get" apt-get install -f -y || install_exit=$?
-            fi
-            ;;
-        rpm)
-            if   _has_cmd dnf;    then _run_logged "dnf"    dnf    install -y "${pkg_file}" || install_exit=$?
-            elif _has_cmd yum;    then _run_logged "yum"    yum    localinstall -y "${pkg_file}" || install_exit=$?
-            elif _has_cmd zypper; then _run_logged "zypper" zypper --non-interactive install "${pkg_file}" || install_exit=$?
-            elif _has_cmd rpm;    then _run_logged "rpm"    rpm    -Uvh "${pkg_file}" || install_exit=$?
-            else
-                log_error "No RPM-capable package manager found."
-                exit 6
-            fi
-            ;;
-        sh)
-            chmod +x "${pkg_file}" || true
-
-            # The Liongard .run (makeself) installer does NOT read environment
-            # variables. It requires command-line flags passed AFTER a literal
-            # '--' separator (everything before '--' goes to the makeself wrapper,
-            # everything after goes to the bundled startup.sh). Flags (getopts
-            # 'u:k:s:n:e:d:p:g:x' in startup.sh, verified on agent v5.4.1):
-            #   -u URL  -k ACCESS_KEY  -s ACCESS_SECRET  -n NAME  -e ENVIRONMENT
-            #   -d DESCRIPTION  -p PROXY  -g DEVICE_GUID (override)  -x (uninstall)
-            # The -g flag maps to startup.sh's deviceGuid and overrides the
-            # machine-id the agent would otherwise self-report. It was added in
-            # 5.4.x; the 5.3.1 LTS build silently ignores unknown flags, so a
-            # generated override only takes effect on 5.4.0+ installers.
-            local -a _sh_args=( -- )
-            _sh_args+=( -u "${_INSTANCE_HOST}" )
-            _sh_args+=( -k "${AGENT_TOKEN_KEY}" )
-            _sh_args+=( -s "${AGENT_TOKEN_SECRET}" )
-            _sh_args+=( -n "${local_hostname}" )
-            if [[ "${INCLUDE_ENVIRONMENT_VALUE}" == true && -n "${_RESOLVED_ENVIRONMENT}" ]]; then
-                _sh_args+=( -e "${_RESOLVED_ENVIRONMENT}" )
-            fi
-            if [[ -n "${AGENT_DESCRIPTION}" ]]; then
-                _sh_args+=( -d "${AGENT_DESCRIPTION}" )
-            fi
-            if [[ -n "${_DEVICE_GUID_OVERRIDE}" ]]; then
-                _sh_args+=( -g "${_DEVICE_GUID_OVERRIDE}" )
-                log_info "Applying DEVICEID override via -g: ${_DEVICE_GUID_OVERRIDE}"
-                log_info "(Requires agent installer v5.4.0+; older builds ignore -g.)"
-            fi
-
-            # Sanitised flag list (mask the access key and secret values).
-            log_info "Installer flags (sanitised):"
-            local i flag val
-            for (( i = 1; i < ${#_sh_args[@]}; i += 2 )); do
-                flag="${_sh_args[i]}"
-                val="${_sh_args[i+1]}"
-                case "${flag}" in
-                    -k|-s) val="$(mask_secret "${val}")" ;;
-                esac
-                log_info "  ${flag} ${val}"
-            done
-
-            log_info "Running shell installer with command-line flags..."
-            _run_logged "installer" "${pkg_file}" "${_sh_args[@]}" || install_exit=$?
-            ;;
-        *)
-            log_error "Unsupported package type: ${_PKG_TYPE}"
-            exit 6
-            ;;
+# Prints deb, rpm or sh from the installer file name.
+lg_installer_type() {
+    local name="${1%%\?*}"
+    case "$(printf '%s' "${name##*.}" | tr '[:upper:]' '[:lower:]')" in
+        deb) echo deb ;;
+        rpm) echo rpm ;;
+        run|sh|bin) echo sh ;;
     esac
-
-    # Unset exported parameters.
-    for k in "${!_install_env[@]}"; do
-        unset "${k}"
-    done
-    unset _install_env
-
-    if [[ "${install_exit}" -ne 0 ]]; then
-        log_error "Installer exited with code ${install_exit}."
-        return "${install_exit}"
-    fi
-
-    log_ok "Installer completed successfully."
-    return 0
 }
 
-# ============================================================
-# INSTALLATION VALIDATION
-# ============================================================
-
-validate_installation() {
-    log_step "Validating Liongard Agent installation..."
-
-    local svc_found=false svc_running=false detected_svc="" pkg_found=false
-    local svc
-
-    # Service existence and status.
-    for svc in "${SERVICE_NAMES[@]}"; do
-        local found_this=false
-
-        if _has_cmd systemctl; then
-            if systemctl list-units --all --type=service 2>/dev/null | grep -q "${svc}"; then
-                found_this=true
-            fi
-        fi
-        if [[ "${found_this}" == false ]] && _has_cmd service; then
-            service "${svc}" status &>/dev/null && found_this=true || true
-        fi
-
-        if [[ "${found_this}" == true ]]; then
-            svc_found=true
-            detected_svc="${svc}"
-            if _has_cmd systemctl && systemctl is-active --quiet "${svc}" 2>/dev/null; then
-                svc_running=true
-            fi
-            break
-        fi
-    done
-
-    # Attempt one service start if found but not yet running.
-    if [[ "${svc_found}" == true && "${svc_running}" == false ]]; then
-        log_warn "Service '${detected_svc}' exists but is not running. Attempting to start..."
-        if _has_cmd systemctl; then
-            systemctl start "${detected_svc}" 2>/dev/null || true
-        elif _has_cmd service; then
-            service "${detected_svc}" start 2>/dev/null || true
-        fi
-        sleep 3
-        if _has_cmd systemctl && systemctl is-active --quiet "${detected_svc}" 2>/dev/null; then
-            svc_running=true
-        fi
-    fi
-
-    # Package installation check.
-    if _has_cmd dpkg && dpkg -l 2>/dev/null | grep -qi liongard; then pkg_found=true; fi
-    if [[ "${pkg_found}" == false ]] && _has_cmd rpm && rpm -qa 2>/dev/null | grep -qi liongard; then pkg_found=true; fi
-
-    # Scrape recent log lines for useful signals.
-    local log_snippet=""
-    local log_dir
-    for log_dir in /var/log/liongard /opt/liongard/logs /usr/local/liongard/logs; do
-        if [[ -d "${log_dir}" ]]; then
-            log_snippet="$(find "${log_dir}" -type f -name '*.log' 2>/dev/null \
-                | head -1 \
-                | xargs grep -i -E 'error|warn|fail|success|register|heartbeat' 2>/dev/null \
-                | tail -5)" || true
-            break
-        fi
-    done
-    if [[ -z "${log_snippet}" && -n "${detected_svc}" ]] && _has_cmd journalctl; then
-        log_snippet="$(journalctl -u "${detected_svc}" --no-pager -n 20 2>/dev/null \
-            | grep -i -E 'error|warn|fail|success|register|heartbeat' \
-            | tail -5)" || true
-    fi
-
-    # Summary report.
-    log_step "=== Installation Validation Summary ==="
-    log_info "Service found     : ${svc_found}"
-    log_info "Service running   : ${svc_running}"
-    log_info "Detected service  : ${detected_svc:-none}"
-    log_info "Package installed : ${pkg_found}"
-    if [[ -n "${log_snippet}" ]]; then
-        log_info "Recent log lines  :"
-        while IFS= read -r line; do
-            log_info "  ${line}"
-        done <<< "${log_snippet}"
-    fi
-    log_step "======================================="
-
-    if [[ "${svc_running}" == true || "${pkg_found}" == true ]]; then
-        log_ok "Liongard Agent installation validated successfully."
-        return 0
-    fi
-
-    log_warn "Liongard Agent installation could not be fully validated."
-    return 7
-}
-
-# ============================================================
-# MAIN EXECUTION
-# ============================================================
-
-main() {
-    start_transcript
-
-    log_step "============================================================"
-    log_step " Liongard Agent Linux Deployment Script"
-    log_step " $(date '+%Y-%m-%d %H:%M:%S %Z')"
-    log_step "============================================================"
-
-    # ── Step 1: Sanity checks ──────────────────────────────────────────
-    check_root
-    validate_config
-    resolve_installer_url
-    check_prerequisites
-    print_config_snapshot
-
-    # ── Step 2: Resolve instance and detect distro ─────────────────────
-    resolve_instance_prefix
-    detect_distro
-
-    # ── Step 3: Build API auth header ──────────────────────────────────
-    build_auth_header
-
-    # ── Step 4: Collect local identity signals ─────────────────────────
-    local local_hostname
-    local_hostname="$(hostname 2>/dev/null)"
-    log_info "Local hostname: ${local_hostname}"
-
-    local local_machine_id
-    local_machine_id="$(get_local_machine_id)"
-    log_info "Local machine ID: ${local_machine_id}"
-
-    local -a local_hostnames
-    mapfile -t local_hostnames < <(get_local_hostnames)
-    log_info "Local host identifiers: $(IFS=', '; printf '%s' "${local_hostnames[*]}")"
-
-    local -a local_macs
-    mapfile -t local_macs < <(get_local_mac_addresses)
-    log_info "Local MAC addresses: $(IFS=', '; printf '%s' "${local_macs[*]}")"
-
-    # ── Step 5: Pre-uninstall ──────────────────────────────────────────
-    local do_remote_deletion=false
-
-    if [[ "${ENABLE_PRE_UNINSTALL}" == true ]]; then
-        log_step "Pre-uninstall is enabled..."
-        if is_agent_installed; then
-            invoke_liongard_agent_uninstall
-
-            if is_agent_installed; then
-                log_error "Liongard Agent is still detected after uninstall. Aborting."
-                exit 8
-            fi
-            log_ok "Existing Liongard Agent removed."
-            [[ "${REMOVE_AGENT_FROM_PLATFORM}" == true ]] && do_remote_deletion=true
-        else
-            log_info "No active Liongard Agent service/binary detected."
-            log_info "Running full artifact cleanup — orphaned install dirs and config files"
-            log_info "can cause the installer to detect a previous agent and refuse to install."
-            invoke_liongard_agent_uninstall
-        fi
+# Runs the downloaded installer with the settings; returns its exit code.
+lg_run_installer() {
+    local name rc=0 out flag i
+    local -a args=()
+    name="${AGENT_NAME:-$(hostname 2>/dev/null)}"
+    out="$(mktemp "${LG_WORK_DIR}/installer-output.XXXXXXXX")" || return 1
+    log_step "Running the installer (${LG_INSTALLER_TYPE})."
+    if [ "${LG_INSTALLER_TYPE}" = sh ]; then
+        # The makeself installer reads flags after "--": -u -k -s -n -e -d -p -g and --reset-identity.
+        args=(-- -u "${LG_INSTALL_HOST}" -k "${AGENT_TOKEN_KEY}" -s "${AGENT_TOKEN_SECRET}" -n "${name}")
+        if [ -n "${LG_INSTALL_ENVIRONMENT}" ]; then args+=(-e "${LG_INSTALL_ENVIRONMENT}"); fi
+        if [ -n "${AGENT_DESCRIPTION}" ]; then args+=(-d "${AGENT_DESCRIPTION}"); fi
+        if [ -n "${PROXY_URL}" ]; then args+=(-p "${PROXY_URL}"); fi
+        if [ -n "${DEVICE_GUID}" ]; then args+=(-g "${DEVICE_GUID}"); fi
+        if [ "${RESET_IDENTITY}" = true ]; then args+=(--reset-identity); fi
+        flag="Installer flags:"
+        for (( i = 1; i < ${#args[@]}; i++ )); do flag="${flag} ${args[i]}"; done
+        log_info "${flag}"
+        chmod 0700 "${LG_INSTALLER_FILE}"
+        "${LG_INSTALLER_FILE}" "${args[@]}" < /dev/null > "${out}" 2>&1 || rc=$?
     else
-        if is_agent_installed; then
-            log_info "Liongard Agent is already installed and EnablePreUninstall=false. Exiting (success)."
-            exit 0
-        fi
-        if [[ "${REMOVE_AGENT_FROM_PLATFORM}" == true ]]; then
-            log_warn "RemoveAgentFromPlatform=true is ignored because EnablePreUninstall=false."
-        fi
-    fi
-
-    log_info "No Liongard Agent installation detected. Proceeding with fresh install..."
-
-    # ── Step 6: Environment name resolution ────────────────────────────
-    if [[ "${INCLUDE_ENVIRONMENT_VALUE}" == true ]]; then
-        if [[ "${ENABLE_ENVIRONMENT_MATCHING}" == true ]]; then
-            if ! resolve_environment_name; then
-                local env_norm
-                env_norm="$(normalize_env_name "${ENVIRONMENT}")"
-                log_error "Environment '${ENVIRONMENT}' (normalized '${env_norm}') could not be resolved in Liongard. Aborting."
-                exit 4
-            fi
+        log_info "Installer settings: LIONGARDURL=${LG_INSTALL_HOST} LIONGARDAGENTNAME=${name} LIONGARDENVIRONMENT=${LG_INSTALL_ENVIRONMENT} LIONGARDDESCRIPTION=${AGENT_DESCRIPTION}"
+        if [ "${LG_INSTALLER_TYPE}" = deb ]; then
+            LIONGARDURL="${LG_INSTALL_HOST}" LIONGARDACCESSKEY="${AGENT_TOKEN_KEY}" LIONGARDACCESSSECRET="${AGENT_TOKEN_SECRET}" \
+                LIONGARDAGENTNAME="${name}" LIONGARDENVIRONMENT="${LG_INSTALL_ENVIRONMENT}" LIONGARDDESCRIPTION="${AGENT_DESCRIPTION}" \
+                DEBIAN_FRONTEND=noninteractive dpkg -i "${LG_INSTALLER_FILE}" < /dev/null > "${out}" 2>&1 || rc=$?
+        elif _lg_has dnf || _lg_has yum || _lg_has zypper || _lg_has rpm; then
+            LIONGARDURL="${LG_INSTALL_HOST}" LIONGARDACCESSKEY="${AGENT_TOKEN_KEY}" LIONGARDACCESSSECRET="${AGENT_TOKEN_SECRET}" \
+                LIONGARDAGENTNAME="${name}" LIONGARDENVIRONMENT="${LG_INSTALL_ENVIRONMENT}" LIONGARDDESCRIPTION="${AGENT_DESCRIPTION}" \
+                rpm -Uvh "${LG_INSTALLER_FILE}" < /dev/null > "${out}" 2>&1 || rc=$?
         else
-            _RESOLVED_ENVIRONMENT="${ENVIRONMENT}"
-            log_info "Environment matching disabled; using value verbatim: ${_RESOLVED_ENVIRONMENT}"
-        fi
-        log_ok "Resolved environment: ${_RESOLVED_ENVIRONMENT}"
-    fi
-
-    # ── Step 7: Liongard agent API query for collision detection ───────
-    local escaped_machine_id="${local_machine_id//\'/\'\'}"
-    local machine_id_condition="MachineGuid = '${escaped_machine_id}'"
-    local agents_json="[]"
-    local api_ok=true
-
-    if ! agents_json="$(get_agents_filtered "${machine_id_condition}")"; then
-        api_ok=false
-        log_warn "Liongard agent API lookup failed."
-        if [[ "${API_FAILURE_BEHAVIOR}" == "conservative" ]]; then
-            log_error "API_FAILURE_BEHAVIOR=conservative. Cannot continue without collision detection. Aborting."
-            exit 4
-        else
-            log_warn "API_FAILURE_BEHAVIOR=permissive. Continuing without DEVICEID override."
+            log_error "No rpm command found for an .rpm installer."
+            rc=127
         fi
     fi
-
-    # ── Step 8: Optional remote platform agent deletion ────────────────
-    if [[ "${do_remote_deletion}" == true && "${api_ok}" == true ]]; then
-        log_step "Attempting remote platform agent deletion..."
-        invoke_remote_agent_removal "${agents_json}" "${local_machine_id}" "${local_hostnames[@]}"
-    fi
-
-    # ── Step 9: Collision detection → DEVICEID override ────────────────
-    if [[ "${api_ok}" == true ]]; then
-        resolve_device_guid_override "${local_machine_id}" "${agents_json}" "${local_hostnames[@]}"
-    fi
-
-    # Log the collision-detection decision.
-    if [[ -n "${_DEVICE_GUID_OVERRIDE}" ]]; then
-        log_info "DEVICEID override will be passed to installer: ${_DEVICE_GUID_OVERRIDE}"
-    else
-        log_info "No DEVICEID override required."
-    fi
-
-    # ── Step 10: Download installer ────────────────────────────────────
-    # download_installer writes to _INSTALLER_PATH (not stdout) to avoid
-    # log-line pollution when captured via $(...).
-    download_installer
-    local installer_path="${_INSTALLER_PATH}"
-
-    # ── Step 11: Install ───────────────────────────────────────────────
-    # Use || to capture the real exit code — avoid `if ! cmd` which inverts
-    # $? through the logical-NOT operator, making it always 0 in the body.
-    local install_exit=0
-    run_installer "${installer_path}" "${local_hostname}" || install_exit=$?
-    if [[ "${install_exit}" -ne 0 ]]; then
-        log_error "Installation failed (exit code ${install_exit})."
-        exit 6
-    fi
-
-    # Short pause to allow the service to initialise before validation.
-    sleep 3
-
-    # ── Step 12: Validate ──────────────────────────────────────────────
-    local validate_exit=0
-    validate_installation || validate_exit=$?
-    if [[ "${validate_exit}" -ne 0 ]]; then
-        log_warn "Post-install validation returned code ${validate_exit}."
-        exit 7
-    fi
-
-    log_step "============================================================"
-    log_ok   " Liongard Agent deployment complete."
-    log_step "============================================================"
-    exit 0
+    while IFS= read -r i; do log_info "installer: ${i}"; done < "${out}"
+    rm -f -- "${out}"
+    return "${rc}"
 }
 
-main "$@"
+# True when the agent service runs (waits up to 60 seconds) and the updater timer is registered.
+lg_validate_install() {
+    local i=0 timer
+    while ! lg_service_running && [ "${i}" -lt 12 ]; do sleep 5; i=$((i + 1)); done
+    timer="$(lg_unit_file "${LG_UPDATER_SERVICE}.timer")" || timer=""
+    log_info "Validation: ${LG_CORE_SERVICE} running: $(lg_service_running && echo true || echo false); updater timer: ${timer:-missing}"
+    lg_service_running && [ -n "${timer}" ]
+}
+
+lg_cleanup_work_dir() {
+    if [ -n "${LG_WORK_DIR}" ] && [ -d "${LG_WORK_DIR}" ]; then rm -rf -- "${LG_WORK_DIR}"; fi
+}
+
+# Usage: lg_install_main <simple|advanced|clean>
+lg_install_main() {
+    local mode="$1" installed="" available="" leftovers line
+    lg_require_root
+    lg_start_log "${LOG_DIRECTORY:-/var/log/liongard-agent}" LGAgentScript
+    lg_add_secret "${AGENT_TOKEN_KEY}"
+    lg_add_secret "${AGENT_TOKEN_SECRET}"
+    lg_add_secret "${API_TOKEN_KEY:-}"
+    lg_add_secret "${API_TOKEN_SECRET:-}"
+    log_step "Liongard Agent ${mode} install on $(hostname 2>/dev/null)."
+
+    lg_require INSTANCE_PREFIX "${INSTANCE_PREFIX}"
+    lg_require AGENT_TOKEN_KEY "${AGENT_TOKEN_KEY}"
+    lg_require AGENT_TOKEN_SECRET "${AGENT_TOKEN_SECRET}"
+    lg_require_bool INCLUDE_ENVIRONMENT_VALUE "${INCLUDE_ENVIRONMENT_VALUE}"
+    lg_require_bool RESET_IDENTITY "${RESET_IDENTITY}"
+    if [ "${INCLUDE_ENVIRONMENT_VALUE}" = true ]; then lg_require ENVIRONMENT "${ENVIRONMENT}"; fi
+    if [ "${mode}" = advanced ]; then
+        lg_require API_TOKEN_KEY "${API_TOKEN_KEY}"
+        lg_require API_TOKEN_SECRET "${API_TOKEN_SECRET}"
+    fi
+    LG_INSTALL_HOST="$(lg_instance_host "${INSTANCE_PREFIX}")" || lg_exit "${EXIT_CONFIG}" "INSTANCE_PREFIX '${INSTANCE_PREFIX}' is not a Liongard instance such as us1 or us1.app.liongard.com."
+    if [ -n "${DEVICE_GUID}" ] && ! [[ "${DEVICE_GUID}" =~ ${LG_MACHINE_GUID_PATTERN} ]]; then
+        lg_exit "${EXIT_CONFIG}" "DEVICE_GUID [${DEVICE_GUID}] is invalid. Allowed: letters, digits, '.', '_' and '-' (max 128, starts with a letter or digit)."
+    fi
+    INSTALLER_URL="$(lg_installer_url "${LINUX_ARCHITECTURE}" "${INSTALLER_URL}")" || exit $?
+    LG_INSTALLER_TYPE="$(lg_installer_type "${INSTALLER_FILE_NAME:-${INSTALLER_URL##*/}}")"
+    if [ -z "${LG_INSTALLER_TYPE}" ]; then lg_exit "${EXIT_CONFIG}" "Cannot tell the installer type from [${INSTALLER_URL}]. Use a .run, .sh, .deb or .rpm installer."; fi
+    if [ "${LG_INSTALLER_TYPE}" != sh ] && { [ -n "${PROXY_URL}" ] || [ -n "${DEVICE_GUID}" ] || [ "${RESET_IDENTITY}" = true ]; }; then
+        lg_exit "${EXIT_CONFIG}" "PROXY_URL, DEVICE_GUID and RESET_IDENTITY reach only the .run installer, not a .${LG_INSTALLER_TYPE} package."
+    fi
+    if ! _lg_has curl && ! _lg_has wget; then lg_exit "${EXIT_PREREQUISITE}" "curl or wget is required."; fi
+    if [ "${mode}" = advanced ] && { ! _lg_has curl || ! _lg_has jq; }; then lg_exit "${EXIT_PREREQUISITE}" "curl and jq are required for the environment check."; fi
+    log_info "Instance ${LG_INSTALL_HOST}; installer ${INSTALLER_URL}; agent name ${AGENT_NAME:-(hostname)}; environment ${ENVIRONMENT} (sent: ${INCLUDE_ENVIRONMENT_VALUE}); description ${AGENT_DESCRIPTION:-(none)}; proxy ${PROXY_URL:-(none)}; device GUID ${DEVICE_GUID:-(none)}; reset identity ${RESET_IDENTITY}"
+
+    if [ "${mode}" = clean ]; then lg_prepare_existing_agent; fi
+    lg_install_state "${mode}"
+    if [ "${LG_STATE}" = Stale ] && [ "${mode}" != clean ]; then
+        lg_exit "${EXIT_STALE}" "The installed agent is broken or not running (Stale). Nothing was changed. Run LGAgentCleanInstall-Linux-Simple.sh to repair it."
+    fi
+
+    LG_INSTALL_ENVIRONMENT=""
+    if [ "${INCLUDE_ENVIRONMENT_VALUE}" = true ]; then
+        LG_INSTALL_ENVIRONMENT="${ENVIRONMENT}"
+        if [ "${mode}" = advanced ]; then
+            lg_api_setup "${LG_INSTALL_HOST}" "${API_TOKEN_KEY}" "${API_TOKEN_SECRET}"
+            lg_resolve_environment "${ENVIRONMENT}" || lg_exit "${EXIT_ENVIRONMENT}" "The environment check failed (${LG_ENV_REASON}). Nothing was changed."
+            LG_INSTALL_ENVIRONMENT="${LG_ENV_NAME}"
+        fi
+    fi
+
+    LG_WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/liongard-agent.XXXXXXXX")" || lg_exit "${EXIT_PREREQUISITE}" "Could not create a private download folder."
+    trap lg_cleanup_work_dir EXIT
+    LG_INSTALLER_FILE="${LG_WORK_DIR}/${INSTALLER_FILE_NAME:-installer.${INSTALLER_URL##*.}}"
+    LG_INSTALLER_FILE="${LG_INSTALLER_FILE%%\?*}"
+    lg_download "${INSTALLER_URL}" "${LG_INSTALLER_FILE}" || lg_exit "${EXIT_DOWNLOAD}" "The installer download failed. Nothing was changed."
+
+    if [ "${LG_STATE}" = Healthy ]; then
+        installed="$(lg_installed_version)"
+        available="$(lg_installer_version "${LG_INSTALLER_FILE}")"
+        log_info "Installed agent version: ${installed:-unreadable}; installer version: ${available:-unreadable}."
+        if [ -z "${installed}" ] || [ -z "${available}" ]; then
+            lg_exit "${EXIT_DOWNLOAD}" "The versions can't be compared, so the agent was not upgraded. Nothing was changed."
+        fi
+        if ! lg_version_newer "${available}" "${installed}"; then
+            lg_exit "${EXIT_OK}" "Liongard Agent ${installed} is installed and running, and the installer (${available}) is not newer. Nothing to do."
+        fi
+        log_info "Upgrading the agent from ${installed} to ${available}. It keeps its registration."
+    elif [ "${mode}" = clean ]; then
+        lg_collect_identity
+        lg_save_identity_backup "${LOG_DIRECTORY:-/var/log/liongard-agent}"
+        if [ "${LG_STATE}" = Stale ]; then
+            lg_remove_local_agent
+            leftovers="$(lg_agent_leftovers)"
+            if [ -n "${leftovers}" ]; then
+                while IFS= read -r line; do log_error "  Still present: ${line}"; done <<< "${leftovers}"
+                lg_exit "${EXIT_REMOVAL}" "The broken agent could not be removed completely, so it was not reinstalled."
+            fi
+            lg_seed_identity
+        fi
+    fi
+
+    lg_run_installer || lg_exit "${EXIT_INSTALLER}" "The installer failed (exit $?)."
+    lg_validate_install || lg_exit "${EXIT_VALIDATION}" "The installer finished, but the agent service is not running or the updater timer is missing."
+    lg_exit "${EXIT_OK}" "The Liongard Agent is installed and running."
+}
+
+# Usage: lg_uninstall_main <simple|advanced>
+lg_uninstall_main() {
+    local mode="$1" leftovers line rc
+    local -a names=()
+    lg_require_root
+    lg_start_log "${LOG_DIRECTORY:-/var/log/liongard-agent}" LGAgentUninstall
+    if [ "${mode}" = advanced ]; then lg_check_platform_settings; fi
+    lg_collect_identity
+    lg_save_identity_backup "${LOG_DIRECTORY:-/var/log/liongard-agent}"
+    leftovers="$(lg_agent_leftovers)"
+    if [ -z "${leftovers}" ]; then
+        log_info "No Liongard Agent found on this machine. Nothing to remove locally."
+    else
+        while IFS= read -r line; do log_info "  Found: ${line}"; done <<< "${leftovers}"
+        lg_remove_local_agent
+        leftovers="$(lg_agent_leftovers)"
+        if [ -n "${leftovers}" ]; then
+            while IFS= read -r line; do log_error "  Still present: ${line}"; done <<< "${leftovers}"
+            lg_exit "${EXIT_REMOVAL}" "The Liongard Agent is still detected after the removal. The platform record was not touched."
+        fi
+        log_ok "The Liongard Agent is removed from this machine."
+    fi
+    if [ -f "${LG_GUID_FILE}" ]; then log_info "Agent identity ${LG_GUID_FILE} kept, so a reinstall re-attaches to the same record."; fi
+    if [ "${mode}" = advanced ] && [ "${REMOVE_AGENT_FROM_PLATFORM}" = true ]; then
+        while IFS= read -r line; do if [ -n "${line}" ]; then names+=("${line}"); fi; done <<< "$(lg_local_hostnames)"
+        rc=0
+        lg_remove_platform_record "${ENVIRONMENT}" ${names[@]+"${names[@]}"} || rc=$?
+        case "${rc}" in
+            0) ;;
+            2) log_warn "No platform record qualified; nothing was deleted. It may already be gone." ;;
+            *) lg_exit "${EXIT_PLATFORM}" "The platform record was not removed (see above). The agent was removed from this machine." ;;
+        esac
+    fi
+    lg_exit "${EXIT_OK}" "Uninstall finished."
+}
+
+# END SHARED BLOCK: Liongard Linux agent functions
+
+lg_install_main advanced

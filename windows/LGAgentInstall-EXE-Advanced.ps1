@@ -6,8 +6,11 @@
     For hosts that will run network discovery. Installs the agent, or upgrades it when the bundle is newer.
     Set your values in the "Partner configuration" block below. Exit codes, logs and
     troubleshooting are in the README under .LINK.
-    - Looks up the environment name through the Liongard API, corrects casing or punctuation, and stops if no match is found.
-    - Checks any existing agent (Healthy, Stale or NotInstalled) and removes Stale leftovers before installing.
+    - Looks up the environment name through the Liongard API: exact, then normalized, then prefix or contains
+      (6+ characters on both sides). No match, several matches or a failed lookup exits 4 and changes nothing.
+    - Healthy (installed and running): upgrades only when the bundle is newer, else exits 0.
+    - Stale (installed but broken or stopped): changes nothing and exits 8. Run
+      LGAgentCleanInstall-MSI-Simple.ps1 to repair it. This script never removes an agent.
     - Installs Npcap with the bundle by default ($InstallNpcap = $true); enables network discovery only if $EnableNetworkDiscovery = $true (off by default).
     - Checks proxy settings before installing, then confirms the service, the updater task and each bundle component.
     - Downloads the bundle to a folder only SYSTEM and Administrators can access, deletes it afterwards, and writes a transcript log and a JSON run summary.
@@ -16,7 +19,7 @@
     Requires:     Windows PowerShell 5.1 (64-bit), run as SYSTEM or an elevated administrator.
                   Liongard API token and agent install token (key and secret for each).
     Author:       Liongard Partner Support
-    Last updated: 2026-10-20
+    Last updated: 2026-10-23
 
 .LINK
     https://github.com/liongard/agent-scripts/blob/main/windows/README.md
@@ -35,6 +38,10 @@ $AgentTokenSecret           = "REPLACE_WITH_AGENT_TOKEN_SECRET"  # Liongard agen
 $Environment                = "REPLACE_WITH_ENVIRONMENT_NAME"    # Environment name (can be an RMM variable)
 $AgentDescription           = ""                                 # Optional agent description; passed as LiongardDescription when set
 $IncludeEnvironmentValue    = $true                              # Set to $false to omit the LiongardEnvironment value
+$AgentName                  = ""                                 # Optional LiongardAgentName; blank uses $env:COMPUTERNAME
+$DeviceGuid                 = ""                                 # Optional DeviceGuid: seeds the identity on a fresh install only (bundle 5.3.0+)
+$ResetDeviceGuid            = $false                             # $true passes ResetDeviceGuid=1: fresh install gets a new identity (bundle 5.5.0+)
+$InstallLocation            = ""                                 # Optional InstallLocation; blank uses the MSI default folder
 
 # Network discovery: when $true, after a successful install (or when the agent is
 # already present and up to date) the script flips the network discovery 'enabled'
@@ -45,8 +52,8 @@ $EnableNetworkDiscovery     = $false
 $Folder                     = $env:ProgramData                 # Parent folder; the script works in <Folder>\LiongardDeploy (SYSTEM/Administrators only)
 $InstallerUrl               = "https://agents.static.liongard.com/LiongardAgent-lts.exe"
 $InstallerFileName          = "LiongardAgent-lts.exe"          # File name only; the installer is staged in LiongardDeploy\Deploy\<guid>
-$InstallNpcap               = $true
-$EulaAccepted               = $true
+$InstallNpcap               = $true                            # Passed as InstallEnhancedNetworkDiscovery (bundle 5.3.1+) and InstallNpcap (5.3.0 and older)
+$EulaAccepted               = $true                            # Passed as EulaAcceptCheckbox (bundle 5.4.0+) and EulaAccepted (5.3.x and older)
 $SuppressRestart            = $true
 $PassiveMode                = $false
 $InstallerLogPath           = ""                               # Deprecated and ignored: installer logs are always written to LiongardDeploy
@@ -174,19 +181,26 @@ function Assert-ConfigurationValue {
     )
 
     if ([string]::IsNullOrWhiteSpace($Value) -or $Value -like 'REPLACE_WITH_*') {
-        throw "Configuration value [$Name] must be provided before running this script."
+        Stop-LiongardRun 2 "Configuration value [$Name] must be provided before running this script."
     }
+}
+
+$script:ExitCode = 1
+function Stop-LiongardRun([int]$Code, [string]$Message) {
+    # The catch block of the main try exits with this code.
+    $script:ExitCode = $Code
+    throw $Message
 }
 
 # ====================================================================
 # BEGIN SHARED BLOCK: Liongard install-state functions
-# Keep this block identical across LGAgentInstall-MSI-Advanced, LGAgentInstall-EXE-Advanced
-# and LGAgentUninstall. Edit one copy, then copy it to the other scripts.
+# Identical in LGAgentInstall-MSI-Advanced, LGAgentInstall-EXE-Advanced, LGAgentUninstall-Simple
+# and LGAgentUninstall-Advanced; tests/Test-SharedBlocks.ps1 checks it.
 # ====================================================================
 
 $script:LiongardServiceName       = 'roaragent.exe'
 $script:LiongardUpdaterTaskName   = '\Liongard\LiongardAgentUpdater'
-$script:LiongardInstallRoots      = @('C:\Program Files (x86)\LiongardInc', 'C:\Program Files\LiongardInc')
+$script:LiongardInstallRoots      = @(${env:ProgramFiles(x86)}, $env:ProgramFiles, $env:ProgramW6432 | Where-Object { $_ } | ForEach-Object { Join-Path $_ 'LiongardInc' } | Sort-Object -Unique)
 $script:LiongardLegacyProductCode = '{1D89F069-B48B-4191-8810-2364C29EC039}'   # Fallback only; the ProductCode changes per version.
 $script:LiongardCredentialUser    = 'LiongardAgent\AgentKey'
 
@@ -472,9 +486,9 @@ function Get-LiongardInstallFolders {
 }
 
 function Get-LiongardInstallState {
-    # Healthy      = uninstall entry AND roaragent.exe service AND its binary exists on disk.
+    # Healthy      = uninstall entry AND roaragent.exe service Running AND its binary exists on disk.
     # NotInstalled = no uninstall entry, no service and no install folder.
-    # Stale        = any other combination (folder only, orphaned service, entry without binaries).
+    # Stale        = any other combination (stopped service, folder only, orphaned service, entry without binaries).
     $products    = @(Get-LiongardInstalledProduct)
     $service     = Get-LiongardServiceInfo
     $folders     = @(Get-LiongardInstallFolders -Products $products)
@@ -502,7 +516,7 @@ function Get-LiongardInstallState {
     if ($folders.Count -eq 0 -and $roots.Count -eq 0) { $evidence.Add('Install folder: none') | Out-Null }
     $evidence.Add("Updater task '$($script:LiongardUpdaterTaskName)' present: $taskPresent") | Out-Null
 
-    $state = if ($products.Count -gt 0 -and $service.Exists -and $service.BinaryExists) {
+    $state = if ($products.Count -gt 0 -and $service.Exists -and $service.BinaryExists -and $service.Status -eq 'Running') {
         'Healthy'
     }
     elseif ($products.Count -eq 0 -and -not $service.Exists -and $folders.Count -eq 0 -and $roots.Count -eq 0) {
@@ -659,41 +673,6 @@ function Remove-LiongardServiceRegistration {
     }
 }
 
-function Invoke-LiongardMsiUninstallByCode {
-    # Always builds 'msiexec /x {ProductCode}' itself instead of replaying the registered
-    # UninstallString, which can be 'MsiExec.exe /I{code}' (a repair) on some builds.
-    param(
-        [Parameter(Mandatory)][string]$ProductCode,
-        [string]$LogPath
-    )
-
-    if ($ProductCode -notmatch '^\{[0-9A-Fa-f\-]{36}\}$') {
-        Write-LiongardStateLog WARN "Invalid ProductCode '$ProductCode'; MSI uninstall skipped."
-        return $null
-    }
-
-    $msiArgs = @('/x', $ProductCode, '/qn', '/norestart')
-    if ($LogPath) { $msiArgs += @('/L*V', "`"$LogPath`"") }
-
-    Write-LiongardStateLog INFO "Running: msiexec.exe $($msiArgs -join ' ')"
-    try {
-        $process = Start-Process -FilePath 'msiexec.exe' -ArgumentList $msiArgs -Wait -PassThru -WindowStyle Hidden
-        $code = $process.ExitCode
-    }
-    catch {
-        Write-LiongardStateLog WARN "Failed to launch msiexec for $($ProductCode): $($_.Exception.Message)"
-        return $null
-    }
-
-    switch ($code) {
-        0       { Write-LiongardStateLog INFO "MSI uninstall of $ProductCode succeeded." }
-        3010    { Write-LiongardStateLog INFO "MSI uninstall of $ProductCode succeeded (restart required)." }
-        1605    { Write-LiongardStateLog INFO "MSI uninstall of $ProductCode returned 1605 (product not registered with Windows Installer)." }
-        default { Write-LiongardStateLog WARN "MSI uninstall of $ProductCode returned exit code $code." }
-    }
-    return $code
-}
-
 function Remove-LiongardStoredCredentials {
     # Deletes the agent's stored secrets from Windows Credential Manager so a fresh install
     # cannot reuse them. Matches ONLY Generic credentials whose UserName is exactly
@@ -736,81 +715,6 @@ function Remove-LiongardStoredCredentials {
     $status = if ($found -eq 0) { 'NoneFound' } elseif ($failed -eq 0) { 'Removed' } else { 'Failed' }
     Write-LiongardStateLog INFO ("Credential Manager cleanup: found {0}, removed {1}, failed {2} Generic entries for user '{3}'." -f $found, $removed, $failed, $script:LiongardCredentialUser)
     return [pscustomobject]@{ Status = $status; Found = $found; Removed = $removed; Failed = $failed }
-}
-
-function Invoke-LiongardStaleCleanup {
-    # Cleans up a Stale install before a fresh install. Never call this for a Healthy
-    # install; a normal upgrade must stay a normal upgrade.
-    param(
-        [Parameter(Mandatory)][pscustomobject]$State,
-        [string]$LogFolder
-    )
-
-    if ($State.State -ne 'Stale') {
-        throw "Invoke-LiongardStaleCleanup called for install state '$($State.State)'; refusing."
-    }
-
-    Write-LiongardStateLog INFO 'Stale install detected. Cleaning up before a fresh install.'
-    $issues = New-Object System.Collections.Generic.List[string]
-
-    # 1. Orphaned service registration.
-    if ($State.Service.Exists) {
-        $null = Stop-LiongardProcesses
-        if (-not (Remove-LiongardServiceRegistration -Name $script:LiongardServiceName)) { $issues.Add('service') | Out-Null }
-    }
-
-    # 2. Stale uninstall entry: attempt msiexec /x with its ProductCode (failure tolerated).
-    foreach ($product in $State.Products) {
-        if ($product.IsBundle -or -not $product.ProductCode) {
-            Write-LiongardStateLog INFO "Skipping MSI uninstall for non-MSI entry '$($product.DisplayName)' ($($product.KeyPath))."
-            continue
-        }
-        $msiLog = if ($LogFolder) { Join-Path -Path $LogFolder -ChildPath ("StaleUninstall_{0}_{1}.log" -f $product.ProductCode.Trim('{}'), (Get-Date -Format 'yyyyMMdd_HHmmss')) } else { $null }
-        if ($msiLog) { Register-LiongardDeployLog -Label 'Stale uninstall log' -Path $msiLog -Redact }
-        $code = Invoke-LiongardMsiUninstallByCode -ProductCode $product.ProductCode -LogPath $msiLog
-        if ($null -eq $code -or ($code -ne 0 -and $code -ne 3010 -and $code -ne 1605)) {
-            $issues.Add("msi:$($product.ProductCode)=$code") | Out-Null
-        }
-    }
-
-    # 3. Rename the install folder so its appsettings-override.config cannot be reused.
-    $null = Stop-LiongardProcesses
-    $stamp = Get-Date -Format 'yyyyMMddHHmmss'
-    foreach ($folder in @(Get-LiongardInstallFolders -Products $State.Products)) {
-        $newName = '{0}.stale-{1}' -f (Split-Path -Path $folder -Leaf), $stamp
-        try {
-            Assert-NotProtectedPath -Path $folder
-            Rename-Item -LiteralPath $folder -NewName $newName -ErrorAction Stop
-            Write-LiongardStateLog INFO "Renamed stale install folder '$folder' to '$newName'."
-        }
-        catch {
-            Write-LiongardStateLog WARN "Rename of '$folder' failed ($($_.Exception.Message)); falling back to deletion."
-            try {
-                Remove-LiongardPathSafe -LiteralPath $folder -Recurse
-                Write-LiongardStateLog WARN "Deleted stale install folder '$folder' because it could not be renamed."
-            }
-            catch {
-                Write-LiongardStateLog WARN "Failed to delete stale install folder '$folder': $($_.Exception.Message)"
-                $issues.Add("folder:$folder") | Out-Null
-            }
-        }
-    }
-
-    # 4. Stored credentials.
-    $credentials = Remove-LiongardStoredCredentials
-    if ($credentials.Status -eq 'Failed') { $issues.Add('credentials') | Out-Null }
-
-    if ($issues.Count -eq 0) {
-        Write-LiongardStateLog INFO 'Stale-install cleanup completed.'
-    }
-    else {
-        Write-LiongardStateLog WARN ("Stale-install cleanup completed with issues: {0}" -f ($issues -join ', '))
-    }
-
-    return [pscustomobject]@{
-        Issues      = $issues.ToArray()
-        Credentials = $credentials
-    }
 }
 
 function Test-LiongardPostInstall {
@@ -879,15 +783,13 @@ function Write-LiongardIdentityStatus {
 }
 
 # ====================================================================
-# END SHARED BLOCK
+# END SHARED BLOCK: Liongard install-state functions
 # ====================================================================
 
 # ====================================================================
 # BEGIN SHARED BLOCK: Liongard deploy-folder functions
-# Keep this block identical across LGAgentInstall-MSI-Simple, LGAgentInstall-MSI-Advanced,
-# LGAgentInstall-EXE-Simple, LGAgentInstall-EXE-Advanced, LGAgentUninstall and
-# LGAgentCleanInstall-MSI-Simple.
-# Edit one copy, then copy it to the other scripts.
+# Identical in every windows/LGAgent*.ps1 script except LGAgentIdentity.ps1;
+# tests/Test-SharedBlocks.ps1 checks it.
 #
 # Every run works in <Folder>\LiongardDeploy. Before anything is written there, the folder
 # is created (or checked) and locked down to SYSTEM and Administrators. Installers are staged
@@ -1636,6 +1538,10 @@ function Write-ConfigurationSnapshot {
     Write-SectionValue -Label 'AgentTokenSecret (masked)' -Value (Mask-SecretValue -Value $AgentTokenSecret)
     Write-SectionValue -Label 'Environment' -Value $Environment
     Write-SectionValue -Label 'AgentDescription' -Value $AgentDescription
+    Write-SectionValue -Label 'AgentName' -Value $AgentName
+    Write-SectionValue -Label 'DeviceGuid' -Value $DeviceGuid
+    Write-SectionValue -Label 'ResetDeviceGuid' -Value $ResetDeviceGuid
+    Write-SectionValue -Label 'InstallLocation' -Value $InstallLocation
     Write-SectionValue -Label 'IncludeEnvironmentValue' -Value $IncludeEnvironmentValue
     Write-SectionValue -Label 'Folder' -Value $Folder
     Write-SectionValue -Label 'InstallerUrl' -Value $InstallerUrl
@@ -1683,188 +1589,74 @@ function Get-HttpErrorDetail {
     return $null
 }
 
-function Normalize-EnvironmentName {
+# BEGIN SHARED BLOCK: Liongard environment check functions
+# Identical in both Windows Install-Advanced scripts; same rules as lg_resolve_environment on Linux and macOS.
+
+function ConvertTo-LiongardEnvironmentKey {
+    # Uppercase letters and digits only, without a leading article, "&" or the word "and".
     param([string]$Value)
 
-    if ([string]::IsNullOrWhiteSpace($Value)) { return $null }
-
-    $trimmed = $Value.Trim()
-    $trimmed = $trimmed -replace '^(?i)\s*(the|a|an)\s+', ''
-    $trimmed = $trimmed -replace '&', ' and '
-    $trimmed = $trimmed -replace '(?i)\band\b', ' '
-
-    $formD = $trimmed.Normalize([Text.NormalizationForm]::FormD)
-    $chars = $formD.ToCharArray() | Where-Object {
-        [System.Globalization.CharUnicodeInfo]::GetUnicodeCategory($_) -ne [System.Globalization.UnicodeCategory]::NonSpacingMark
+    if ([string]::IsNullOrWhiteSpace($Value)) { return '' }
+    $text = $Value.Trim() -replace '^(?i)(the|an?)\s+', ''
+    $text = ($text -replace '&', ' and ') -replace '(?i)\band\b', ' '
+    $chars = $text.Normalize([Text.NormalizationForm]::FormD).ToCharArray() | Where-Object {
+        [Globalization.CharUnicodeInfo]::GetUnicodeCategory($_) -ne [Globalization.UnicodeCategory]::NonSpacingMark
     }
-    $folded = -join $chars
-
-    $normalized = ($folded -replace '[^0-9a-zA-Z]', '').ToUpperInvariant()
-    if ([string]::IsNullOrWhiteSpace($normalized)) { return $null }
-
-    return $normalized
+    return ((-join $chars) -replace '[^0-9a-zA-Z]', '').ToUpperInvariant()
 }
 
-function Get-LiongardEnvironmentNameValue {
-    param($Environment)
-
-    foreach ($key in @('Name','DisplayName','EnvironmentName','Environment')) {
-        $prop = $Environment.PSObject.Properties[$key]
-        if ($prop -and -not [string]::IsNullOrWhiteSpace($prop.Value)) {
-            return [string]$prop.Value
-        }
-    }
-
-    return $null
-}
-
-function Get-LiongardEnvironments {
-    param(
-        [Parameter(Mandatory)][string]$InstancePrefix,
-        [Parameter(Mandatory)][hashtable]$Headers
-    )
-
-    $uri = "https://$InstancePrefix.app.liongard.com/api/v1/environments"
-
-    try {
-        $response = Invoke-RestMethod -Uri $uri -Headers $Headers -ErrorAction Stop
-    }
-    catch {
-        $detail = Get-HttpErrorDetail -Exception $_.Exception
-        if ($detail) {
-            Write-Warning "Unable to retrieve Liongard environments: $($_.Exception.Message) | Response: $detail"
-        }
-        else {
-            Write-Warning "Unable to retrieve Liongard environments: $($_.Exception.Message)"
-        }
-        return @()
-    }
-
-    # The /environments endpoint returns a bare JSON array; the fallback below is
-    # defensive only and will not fire under normal operation.
-    if ($null -eq $response) { return @() }
-    if ($response -is [System.Array]) { return $response }
-    return @($response)
-}
-
-function Resolve-LiongardEnvironmentName {
+function Resolve-LiongardEnvironment {
+    # Returns Status Found (with Name), NotFound, Ambiguous or LookupFailed, and the Reason.
+    # Passes: exact, case-insensitive, normalized, then prefix and contains (6+ normalized characters on both sides).
     param(
         [Parameter(Mandatory)][string]$InputName,
-        [Parameter(Mandatory)][string]$InstancePrefix,
+        [Parameter(Mandatory)][string]$Uri,
         [Parameter(Mandatory)][hashtable]$Headers
     )
 
-    $script:EnvironmentResolutionReason = 'Unknown'
-    $minNormalizedLength = 4
-    $inputNormalized = Normalize-EnvironmentName -Value $InputName
-    if (-not $inputNormalized) { return $null }
-
-    if ($inputNormalized.Length -lt $minNormalizedLength) {
-        $script:EnvironmentResolutionReason = 'TooShort'
-        Write-Warning ("Provided environment value '{0}' normalized to '{1}', which is too short to match reliably (min {2})." -f $InputName, $inputNormalized, $minNormalizedLength)
-        return $null
+    try { $response = Invoke-RestMethod -Uri $Uri -Headers $Headers -TimeoutSec 120 -ErrorAction Stop }
+    catch {
+        Write-Warning "The environment lookup failed (GET /environments): $($_.Exception.Message)"
+        return [pscustomobject]@{ Status = 'LookupFailed'; Name = $null; Reason = 'LookupFailed' }
+    }
+    if ($response -is [System.Array]) { $items = $response }
+    elseif ($response -is [System.Management.Automation.PSCustomObject] -and $null -ne $response.PSObject.Properties['data']) { $items = @($response.data) }
+    elseif ($response -is [System.Management.Automation.PSCustomObject]) { $items = @($response) }   # PowerShell 7 unrolls a one-item array.
+    elseif ($null -eq $response) { $items = @() }
+    else {
+        Write-Warning 'The environment lookup returned an unexpected response.'
+        return [pscustomobject]@{ Status = 'LookupFailed'; Name = $null; Reason = 'LookupFailed' }
     }
 
-    $environments = Get-LiongardEnvironments -InstancePrefix $InstancePrefix -Headers $Headers
-    if (-not $environments -or $environments.Count -eq 0) {
-        $script:EnvironmentResolutionReason = 'NoEnvironmentsReturned'
-        return $null
+    $names = @(foreach ($item in $items) {
+        foreach ($key in 'Name', 'name', 'DisplayName') {
+            $prop = $item.PSObject.Properties[$key]
+            if ($prop -and -not [string]::IsNullOrWhiteSpace([string]$prop.Value)) { [string]$prop.Value; break }
+        }
+    })
+    $inputKey = ConvertTo-LiongardEnvironmentKey -Value $InputName
+    $passes = [ordered]@{
+        Exact           = @($names | Where-Object { $_ -ceq $InputName })
+        CaseInsensitive = @($names | Where-Object { $_ -eq $InputName })
+        Normalized      = @($names | Where-Object { $inputKey -and (ConvertTo-LiongardEnvironmentKey -Value $_) -ceq $inputKey })
+        Prefix          = @($names | Where-Object { $k = ConvertTo-LiongardEnvironmentKey -Value $_; $inputKey.Length -ge 6 -and $k.Length -ge 6 -and $k -cne $inputKey -and ($k.StartsWith($inputKey) -or $inputKey.StartsWith($k)) })
+        Contains        = @($names | Where-Object { $k = ConvertTo-LiongardEnvironmentKey -Value $_; $inputKey.Length -ge 6 -and $k.Length -ge 6 -and -not ($k.StartsWith($inputKey) -or $inputKey.StartsWith($k)) -and ($k.Contains($inputKey) -or $inputKey.Contains($k)) })
     }
-
-    $exact = $environments |
-        Where-Object {
-            $name = Get-LiongardEnvironmentNameValue -Environment $_
-            [string]::Equals($name, $InputName, [System.StringComparison]::InvariantCultureIgnoreCase)
-        } |
-        Select-Object -First 1
-
-    if ($exact) {
-        $script:EnvironmentResolutionReason = 'ExactMatch'
-        $exactName = Get-LiongardEnvironmentNameValue -Environment $exact
-        if (-not [string]::IsNullOrWhiteSpace($exactName)) {
-            return $exactName
+    foreach ($pass in $passes.GetEnumerator()) {
+        if ($pass.Value.Count -eq 1) {
+            Write-Host ("Environment '{0}' matched '{1}' ({2})." -f $InputName, $pass.Value[0], $pass.Key)
+            return [pscustomobject]@{ Status = 'Found'; Name = $pass.Value[0]; Reason = $pass.Key }
+        }
+        if ($pass.Value.Count -gt 1) {
+            Write-Warning ("More than one Liongard environment matches '{0}' by {1}: {2}." -f $InputName, $pass.Key, (($pass.Value | Select-Object -First 5) -join '; '))
+            return [pscustomobject]@{ Status = 'Ambiguous'; Name = $null; Reason = "Ambiguous$($pass.Key)" }
         }
     }
-
-    $normalizedCandidates = @()
-    foreach ($env in $environments) {
-        $name = Get-LiongardEnvironmentNameValue -Environment $env
-        $normalized = Normalize-EnvironmentName -Value $name
-        $normalizedCandidates += [pscustomobject]@{
-            Name       = $name
-            Normalized = $normalized
-            Data       = $env
-        }
-    }
-
-    $normalizedMatches = @($normalizedCandidates | Where-Object { $_.Normalized -and $_.Normalized -eq $inputNormalized })
-    if ($normalizedMatches.Count -eq 1) {
-        $script:EnvironmentResolutionReason = 'NormalizedMatch'
-        return $normalizedMatches[0].Name
-    }
-    elseif ($normalizedMatches.Count -gt 1) {
-        $script:EnvironmentResolutionReason = 'AmbiguousNormalized'
-        $sample = ($normalizedMatches | Select-Object -First 3).Name -join '; '
-        Write-Warning ("Multiple Liongard environments match provided name '{0}' after normalization; candidates: {1}. Skipping automatic mapping." -f $InputName, $sample)
-        return $null
-    }
-
-    $prefixMatches = @(
-        $normalizedCandidates |
-        Where-Object {
-            $_.Normalized -and (
-                $_.Normalized.StartsWith($inputNormalized) -or
-                $inputNormalized.StartsWith($_.Normalized)
-            )
-        }
-    )
-
-    if ($prefixMatches.Count -eq 1) {
-        $script:EnvironmentResolutionReason = 'PrefixMatch'
-        Write-Host ("Normalized environment prefix match: '{0}' -> '{1}'" -f $InputName, $prefixMatches[0].Name)
-        return $prefixMatches[0].Name
-    }
-    elseif ($prefixMatches.Count -gt 1) {
-        $script:EnvironmentResolutionReason = 'AmbiguousPrefix'
-        $sample = ($prefixMatches | Select-Object -First 3).Name -join '; '
-        Write-Warning ("Multiple Liongard environments partially match provided name '{0}' after normalization; candidates: {1}. Skipping automatic mapping." -f $InputName, $sample)
-        return $null
-    }
-
-    # Substring contains match. Both sides must meet a minimum length to avoid spurious
-    # hits from short environment names (e.g. "IT" matching "SMITH IT SERVICES").
-    $containsMinLength = 6
-    if ($inputNormalized.Length -ge $containsMinLength) {
-        $containsMatches = @(
-            $normalizedCandidates |
-            Where-Object {
-                $_.Normalized -and
-                $_.Normalized.Length -ge $containsMinLength -and (
-                    $_.Normalized.Contains($inputNormalized) -or
-                    $inputNormalized.Contains($_.Normalized)
-                )
-            }
-        )
-
-        if ($containsMatches.Count -eq 1) {
-            $script:EnvironmentResolutionReason = 'ContainsMatch'
-            Write-Host ("Normalized environment contains match: '{0}' -> '{1}'" -f $InputName, $containsMatches[0].Name)
-            return $containsMatches[0].Name
-        }
-        elseif ($containsMatches.Count -gt 1) {
-            $script:EnvironmentResolutionReason = 'AmbiguousContains'
-            $sample = ($containsMatches | Select-Object -First 3).Name -join '; '
-            Write-Warning ("Multiple Liongard environments partially match provided name '{0}' after normalization (contains); candidates: {1}. Skipping automatic mapping." -f $InputName, $sample)
-            return $null
-        }
-    }
-
-    $script:EnvironmentResolutionReason = 'NoMatch'
-    $knownNames = ($normalizedCandidates | Where-Object { -not [string]::IsNullOrWhiteSpace($_.Name) } | Select-Object -ExpandProperty Name)
-    $sampleNames = ($knownNames | Select-Object -First 5) -join '; '
-    Write-Warning ("No Liongard environment matched provided name '{0}' (normalized '{1}'). Known environments: {2}" -f $InputName, $inputNormalized, $sampleNames)
-    return $null
+    Write-Warning ("No Liongard environment matches '{0}' (normalized '{1}'). Known environments: {2}" -f $InputName, $inputKey, (($names | Select-Object -First 5) -join '; '))
+    return [pscustomobject]@{ Status = 'NotFound'; Name = $null; Reason = 'NotFound' }
 }
+
+# END SHARED BLOCK: Liongard environment check functions
 
 function Resolve-InstancePrefix {
     param([string]$Value)
@@ -1994,7 +1786,10 @@ function Get-ExeInstallArguments {
         [string]$LogPath,
         [string]$ProxyUrl,
         [Nullable[bool]]$AutoUpdate,
-        [string]$AutoUpdateArgumentName
+        [string]$AutoUpdateArgumentName,
+        [string]$DeviceGuid,
+        [bool]$ResetDeviceGuid,
+        [string]$InstallLocation
     )
 
     $arguments = New-Object System.Collections.Generic.List[string]
@@ -2006,7 +1801,9 @@ function Get-ExeInstallArguments {
         $arguments.Add("`"$LogPath`"")
     }
 
+    $arguments.Add("EulaAcceptCheckbox=$(Convert-BoolToBundleValue -Value $EulaAccepted)")
     $arguments.Add("EulaAccepted=$(Convert-BoolToBundleValue -Value $EulaAccepted)")
+    $arguments.Add("InstallEnhancedNetworkDiscovery=$(Convert-BoolToBundleValue -Value $InstallNpcap)")
     $arguments.Add("InstallNpcap=$(Convert-BoolToBundleValue -Value $InstallNpcap)")
     $arguments.Add("LiongardUrl=$LiongardHost")
     $arguments.Add("LiongardAccessKey=$AgentTokenKey")
@@ -2027,6 +1824,10 @@ function Get-ExeInstallArguments {
     if ($null -ne $AutoUpdate -and -not [string]::IsNullOrWhiteSpace($AutoUpdateArgumentName)) {
         $arguments.Add("$AutoUpdateArgumentName=$((Convert-BoolToBundleValue -Value ([bool]$AutoUpdate)))")
     }
+
+    if (-not [string]::IsNullOrWhiteSpace($DeviceGuid)) { $arguments.Add("DeviceGuid=$DeviceGuid") }
+    if ($ResetDeviceGuid) { $arguments.Add('ResetDeviceGuid=1') }
+    if (-not [string]::IsNullOrWhiteSpace($InstallLocation)) { $arguments.Add("InstallLocation=`"$InstallLocation`"") }
 
     return ,$arguments.ToArray()
 }
@@ -2856,7 +2657,7 @@ $exitCode = -1
 $agentDetected = $false
 $logPath = $null
 $environmentInput = $Environment
-$environmentNormalized = Normalize-EnvironmentName -Value $Environment
+$environmentNormalized = ConvertTo-LiongardEnvironmentKey -Value $Environment
 $resolvedEnvironmentValue = $null
 $localFqdn = $null
 $proxyEnvironmentSnapshot = @()
@@ -2868,7 +2669,8 @@ $postInstall = $null
 
 try {
     # Lock down the deploy folder before anything (including the transcript) is written.
-    $deployFolder = Initialize-LiongardDeployFolder -Folder $Folder -Secret $AgentTokenKey, $AgentTokenSecret, $ApiTokenKey, $ApiTokenSecret
+    try { $deployFolder = Initialize-LiongardDeployFolder -Folder $Folder -Secret $AgentTokenKey, $AgentTokenSecret, $ApiTokenKey, $ApiTokenSecret }
+    catch { Stop-LiongardRun 3 "Deploy folder check failed: $($_.Exception.Message)" }
 
     Assert-ConfigurationValue -Name 'InstancePrefix' -Value $InstancePrefix
     Assert-ConfigurationValue -Name 'ApiTokenKey' -Value $ApiTokenKey
@@ -2878,12 +2680,16 @@ try {
     if ($IncludeEnvironmentValue) {
         Assert-ConfigurationValue -Name 'Environment' -Value $Environment
     }
+    $parsedGuid = [guid]::Empty
+    if ($DeviceGuid -and -not [guid]::TryParse($DeviceGuid, [ref]$parsedGuid)) {
+        Stop-LiongardRun 2 "DeviceGuid '$DeviceGuid' is not a valid GUID."
+    }
 
     if ($InstancePrefix -match '[?*\[\]]') {
-        throw "InstancePrefix '$InstancePrefix' contains a placeholder character. Provide a valid instance prefix (e.g. us1, eu2)."
+        Stop-LiongardRun 2 "InstancePrefix '$InstancePrefix' contains a placeholder character. Provide a valid instance prefix (e.g. us1, eu2)."
     }
     if ([string]::IsNullOrWhiteSpace($InstallerFileName) -or $InstallerFileName -ne [System.IO.Path]::GetFileName($InstallerFileName)) {
-        throw "InstallerFileName '$InstallerFileName' must be a file name only, with no folder."
+        Stop-LiongardRun 2 "InstallerFileName '$InstallerFileName' must be a file name only, with no folder."
     }
 
     Start-LiongardTranscript -TargetFolder $deployFolder
@@ -2934,29 +2740,22 @@ try {
 
     $headers = Get-LiongardAuthHeader -ApiTokenKey $ApiTokenKey -ApiTokenSecret $ApiTokenSecret
 
+    # A Stale agent is never touched here; Clean Install repairs it.
+    Start-LogSection -Name 'Install State'
+    $installState = Get-LiongardInstallState
+    $installStateValue = $installState.State
+    Write-LiongardInstallState -State $installState
+    Complete-LogSection
+    if ($installState.State -eq 'Stale') { Stop-LiongardRun 8 'The installed agent is broken or not running (Stale). Nothing was changed. Run LGAgentCleanInstall-MSI-Simple.ps1 to repair it.' }
+
     Start-LogSection -Name 'Environment Resolution'
     Write-SectionValue -Label 'Environment Input' -Value $environmentInput
     Write-SectionValue -Label 'Environment Input Normalized' -Value $environmentNormalized
-    if ($IncludeEnvironmentValue -and -not [string]::IsNullOrWhiteSpace($Environment)) {
-        $script:EnvironmentResolutionReason = $null
-        $resolvedEnvironment = Resolve-LiongardEnvironmentName -InputName $Environment -InstancePrefix $instancePrefix -Headers $headers
-        if ($resolvedEnvironment -and -not [string]::Equals($resolvedEnvironment, $Environment, [System.StringComparison]::Ordinal)) {
-            Write-Host ("Matched provided environment to Liongard: '{0}' -> '{1}' (Reason: {2})" -f $Environment, $resolvedEnvironment, $script:EnvironmentResolutionReason)
-            $Environment = $resolvedEnvironment
-        }
-        elseif ($resolvedEnvironment) {
-            Write-Host ("Environment confirmed in Liongard: '{0}' (Reason: {1})" -f $Environment, $script:EnvironmentResolutionReason)
-        }
-        else {
-            $normalizedEnv = Normalize-EnvironmentName -Value $Environment
-            $reasonLabel = if ($script:EnvironmentResolutionReason) { $script:EnvironmentResolutionReason } else { 'Unknown' }
-            if ($reasonLabel -eq 'NoEnvironmentsReturned') {
-                Add-RunWarning ("Environment lookup API did not return environments for host '{0}'. Continuing with the supplied LiongardEnvironment value '{1}' without API confirmation." -f $liongardHost, $Environment)
-            }
-            else {
-                throw ("Environment '{0}' (normalized '{1}') could not be resolved in Liongard. Reason: {2}. Aborting installation because LiongardEnvironment is required." -f $Environment, $normalizedEnv, $reasonLabel)
-            }
-        }
+    if ($IncludeEnvironmentValue) {
+        $match = Resolve-LiongardEnvironment -InputName $Environment -Uri "https://$liongardHost/api/v1/environments" -Headers $headers
+        $script:EnvironmentResolutionReason = $match.Reason
+        if ($match.Status -ne 'Found') { Stop-LiongardRun 4 "The environment check failed for '$Environment' ($($match.Reason)). Nothing was changed." }
+        $Environment = $match.Name
     }
     $resolvedEnvironmentValue = $Environment
     Write-SectionValue -Label 'Resolution Reason' -Value $script:EnvironmentResolutionReason
@@ -2967,7 +2766,7 @@ try {
     # Stage the installer in a per-run folder; it is deleted at the end of the run.
     $installerPath = Join-Path -Path (Initialize-LiongardDeployStage) -ChildPath $InstallerFileName
     if (-not (Get-LiongardInstaller -Uri $InstallerUrl -DestinationPath $installerPath -MinimumBytes 1048576 -MaxAttempts 3)) {
-        throw "Failed to download installer from [$InstallerUrl] after multiple attempts."
+        Stop-LiongardRun 5 "Failed to download installer from [$InstallerUrl] after multiple attempts. Nothing was changed."
     }
     Write-SectionValue -Label 'Installer Path' -Value $installerPath
 
@@ -2977,22 +2776,6 @@ try {
     $logPath = Get-LiongardDeployLogPath -Prefix 'AgentInstall'
     Register-LiongardDeployLog -Label 'Installer log' -Path $logPath -Redact
     Write-SectionValue -Label 'Bootstrapper Log Path' -Value $logPath
-    Complete-LogSection
-
-    # Classify the existing install. Stale leftovers (folder only, orphaned service, uninstall
-    # entry without binaries) are cleaned up first so the new install cannot reuse an old
-    # appsettings-override.config or stored credentials. A Healthy install is never cleaned
-    # up; it goes through the normal version gate / upgrade path.
-    Start-LogSection -Name 'Install State'
-    $installState = Get-LiongardInstallState
-    $installStateValue = $installState.State
-    Write-LiongardInstallState -State $installState
-    if ($installState.State -eq 'Stale') {
-        $staleCleanup = Invoke-LiongardStaleCleanup -State $installState -LogFolder $deployFolder
-        foreach ($issue in $staleCleanup.Issues) {
-            Add-RunWarning "Stale-install cleanup issue: $issue"
-        }
-    }
     Complete-LogSection
 
     # Version gate: compare the downloaded bundle against a Healthy installed agent. Proceed
@@ -3013,15 +2796,13 @@ try {
         $networkDiscoveryStatus = Invoke-NetworkDiscoveryStep -Enable $EnableNetworkDiscovery
         exit 0
     }
-    elseif ($installedAgentVersion -and -not $installerBundleVersion) {
-        Write-SectionValue -Label 'Decision' -Value 'Bundle version unavailable; proceeding and relying on the installer''s built-in downgrade protection.'
-        Add-RunWarning "Could not read the installer bundle version; proceeding with installation. The EXE refuses a downgrade (exit code 1638) if the installed agent is newer."
+    elseif ($installState.State -eq 'Healthy' -and (-not $installedAgentVersion -or -not $installerBundleVersion)) {
+        Write-SectionValue -Label 'Decision' -Value 'Versions cannot be compared; not upgrading.'
+        Complete-LogSection
+        Stop-LiongardRun 5 "The versions can't be compared (installed '$installedAgentVersion', bundle '$installerBundleVersion'), so the agent was not upgraded. Nothing was changed."
     }
     elseif ($installedAgentVersion) {
         Write-SectionValue -Label 'Decision' -Value ("Bundle version {0} is newer than installed {1}; proceeding with upgrade." -f $installerBundleVersion, $installedAgentVersion)
-    }
-    elseif ($installState.State -eq 'Stale') {
-        Write-SectionValue -Label 'Decision' -Value 'Stale install was cleaned up; proceeding with a fresh installation.'
     }
     else {
         Write-SectionValue -Label 'Decision' -Value 'No existing Liongard Agent detected; proceeding with a fresh installation.'
@@ -3032,7 +2813,7 @@ try {
         -LiongardHost $liongardHost `
         -AgentTokenKey $AgentTokenKey `
         -AgentTokenSecret $AgentTokenSecret `
-        -AgentName $localHostname `
+        -AgentName $(if ($AgentName) { $AgentName } else { $localHostname }) `
         -Environment $(if ($IncludeEnvironmentValue) { $Environment } else { $null }) `
         -AgentDescription $AgentDescription `
         -EulaAccepted $EulaAccepted `
@@ -3042,7 +2823,10 @@ try {
         -LogPath $logPath `
         -ProxyUrl $ProxyUrl `
         -AutoUpdate $AutoUpdate `
-        -AutoUpdateArgumentName $AutoUpdateArgumentName
+        -AutoUpdateArgumentName $AutoUpdateArgumentName `
+        -DeviceGuid $DeviceGuid `
+        -ResetDeviceGuid $ResetDeviceGuid `
+        -InstallLocation $InstallLocation
 
     $maskedArguments = Get-MaskedInstallArguments -Arguments $exeArguments
 
@@ -3131,12 +2915,12 @@ try {
 
     if (($exitCode -eq 0 -or $exitCode -eq 3010) -and -not $agentDetected) {
         Add-RunWarning ("Installer returned success, but post-install validation failed (service '{0}' status: {1}; updater task present: {2})." -f $script:LiongardServiceName, $postInstall.ServiceStatus, $postInstall.TaskPresent)
-        throw "Post-install validation failed after installer exit code $exitCode ($(Get-ExitCodeText -Code $exitCode))."
+        Stop-LiongardRun 7 "Post-install validation failed after installer exit code $exitCode ($(Get-ExitCodeText -Code $exitCode))."
     }
 
     Add-RunWarning "Liongard Agent installation failed."
 
-    throw "Installer returned exit code $exitCode ($(Get-ExitCodeText -Code $exitCode))."
+    Stop-LiongardRun $(if ($exitCode -eq 1618) { 11 } else { 6 }) "Installer returned exit code $exitCode ($(Get-ExitCodeText -Code $exitCode))."
 }
 catch {
     $finalStatus = 'Failed'
@@ -3147,8 +2931,8 @@ catch {
     Write-SectionValue -Label 'Warnings' -Value @($script:RunWarnings)
     Write-SectionValue -Label 'Errors' -Value @($script:RunErrors)
     Complete-LogSection
-    Write-Error $_.Exception.Message
-    exit 1
+    Write-Error "$($_.Exception.Message) (exit $script:ExitCode)" -ErrorAction Continue
+    exit $script:ExitCode
 }
 finally {
     try {

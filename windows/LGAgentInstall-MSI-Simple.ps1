@@ -6,7 +6,10 @@
     Installs the Liongard Agent, or upgrades it when the MSI is newer than the installed agent.
     Set your values in the "Partner configuration" block below. Exit codes, logs and
     troubleshooting are in the README under .LINK.
-    - Checks any existing agent (Healthy, Stale or NotInstalled) and removes Stale leftovers before installing.
+    - Healthy (installed and running): upgrades only when the installer is newer, else exits 0.
+    - Stale (installed but broken or stopped): changes nothing and exits 8. Run
+      LGAgentCleanInstall-MSI-Simple.ps1 to repair it. This script never removes an agent.
+    - Validates the settings and downloads the installer before it changes anything.
     - Downloads the MSI to a folder only SYSTEM and Administrators can access, and deletes it afterwards.
     - Passes the environment name to the installer exactly as written.
     - Confirms the agent service is running and the updater task exists.
@@ -15,7 +18,7 @@
     Requires:     Windows PowerShell 5.1 (64-bit), run as SYSTEM or an elevated administrator.
                   Liongard agent install token (key and secret).
     Author:       Liongard Partner Support
-    Last updated: 2026-10-20
+    Last updated: 2026-10-23
 
 .LINK
     https://github.com/liongard/agent-scripts/blob/main/windows/README.md
@@ -29,43 +32,28 @@ $AgentTokenKey           = "REPLACE_WITH_AGENT_TOKEN_KEY"
 $AgentTokenSecret        = "REPLACE_WITH_AGENT_TOKEN_SECRET"
 $Environment             = "REPLACE_WITH_ENVIRONMENT_NAME"    # Passed straight through as LIONGARDENVIRONMENT
 $AgentDescription        = ""                                 # Optional LIONGARDDESCRIPTION
+$AgentName               = ""                                 # Optional LIONGARDAGENTNAME; blank uses $env:COMPUTERNAME
+$ProxyUrl                = ""                                 # Optional PROXYURL, e.g. http://proxy:8080; credentials in it are masked in logs
+$DeviceGuid              = ""                                 # Optional DEVICEGUID: seeds the identity on a fresh install only (MSI 5.2.0+)
+$ResetDeviceGuid         = $false                             # $true passes RESETDEVICEGUID=1: fresh install gets a new identity (MSI 5.5.0+)
+$AutoUpdate              = $null                              # $true / $false passes AUTOUPDATE=1/0; $null omits it (MSI default 1)
+$InstallLocation         = ""                                 # Optional INSTALLLOCATION; blank uses the MSI default folder
+$ServiceAccount          = ""                                 # Optional LIONGARDAGENTSERVICEACCOUNT (DOMAIN\user); blank runs as LocalSystem
+$ServiceAccountPassword  = ""                                 # LIONGARDAGENTSERVICEPASSWORD; required with $ServiceAccount, masked in logs
 $IncludeEnvironmentValue = $true
 $Folder                  = $env:ProgramData               # Parent folder; the script works in <Folder>\LiongardDeploy (SYSTEM/Administrators only)
 $InstallerUrl            = "https://agents.static.liongard.com/LiongardAgent-lts.msi"
 
-# ---- Install-state rules (compact equivalent of the advanced scripts' shared block) ----
-$Roots      = 'C:\Program Files (x86)\LiongardInc', 'C:\Program Files\LiongardInc'
+# ---- Install-state rules (same rules as the advanced scripts' shared block) ----
+$Roots      = @(${env:ProgramFiles(x86)}, $env:ProgramFiles, $env:ProgramW6432 | Where-Object { $_ } | ForEach-Object { Join-Path $_ 'LiongardInc' } | Sort-Object -Unique)
 $Service    = 'roaragent.exe'
 $Task       = '\Liongard\LiongardAgentUpdater'
 $LegacyCode = '{1D89F069-B48B-4191-8810-2364C29EC039}'   # Fallback only; the ProductCode changes per version.
-$Protected  = 'HKEY_LOCAL_MACHINE\SOFTWARE\WOW6432Node\Liongard', 'HKEY_LOCAL_MACHINE\SOFTWARE\Liongard'   # Agent identity: never modified.
-$CredSource = @'
-using System; using System.Collections.Generic; using System.Runtime.InteropServices;
-public static class LGCred {
-    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
-    struct CRED { public int Flags, Type; public IntPtr Target, Comment; public int WriteLow, WriteHigh, BlobSize; public IntPtr Blob; public int Persist, AttrCount; public IntPtr Attrs, Alias, User; }
-    [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern bool CredEnumerateW(string filter, int flags, out int count, out IntPtr creds);
-    [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern bool CredDeleteW(string target, int type, int flags);
-    [DllImport("advapi32.dll")] static extern void CredFree(IntPtr buffer);
-    public static string[] Find(string user) {   // Generic (type 1) entries whose UserName equals user exactly; secrets are never read.
-        List<string> list = new List<string>(); int n; IntPtr buf;
-        if (!CredEnumerateW(null, 0, out n, out buf)) { int e = Marshal.GetLastWin32Error(); if (e == 1168) return list.ToArray(); throw new System.ComponentModel.Win32Exception(e); }
-        try { for (int i = 0; i < n; i++) {
-            CRED c = (CRED)Marshal.PtrToStructure(Marshal.ReadIntPtr(buf, i * IntPtr.Size), typeof(CRED));
-            string t = c.Target == IntPtr.Zero ? null : Marshal.PtrToStringUni(c.Target);
-            if (c.Type == 1 && c.User != IntPtr.Zero && Marshal.PtrToStringUni(c.User) == user && !string.IsNullOrEmpty(t)) list.Add(t); } }
-        finally { CredFree(buf); }
-        return list.ToArray(); }
-    public static int Delete(string target) { return CredDeleteW(target, 1, 0) ? 0 : Marshal.GetLastWin32Error(); }
-}
-'@
 
 # ====================================================================
 # BEGIN SHARED BLOCK: Liongard deploy-folder functions
-# Keep this block identical across LGAgentInstall-MSI-Simple, LGAgentInstall-MSI-Advanced,
-# LGAgentInstall-EXE-Simple, LGAgentInstall-EXE-Advanced, LGAgentUninstall and
-# LGAgentCleanInstall-MSI-Simple.
-# Edit one copy, then copy it to the other scripts.
+# Identical in every windows/LGAgent*.ps1 script except LGAgentIdentity.ps1;
+# tests/Test-SharedBlocks.ps1 checks it.
 #
 # Every run works in <Folder>\LiongardDeploy. Before anything is written there, the folder
 # is created (or checked) and locked down to SYSTEM and Administrators. Installers are staged
@@ -492,7 +480,14 @@ function Write-LiongardDeployLogList {
 # END SHARED BLOCK: Liongard deploy-folder functions
 # ====================================================================
 
-function Write-LGLog([string]$Message) { Write-Host "[LGAgent] $Message" }
+function Write-LGLog([string]$Message) {   # Console plus the masked script log in the deploy folder.
+    $line = "[LGAgent] $(Hide-LiongardSecretText -Text $Message)"
+    Write-Host $line
+    if ($script:LGScriptLog) {
+        try { [IO.File]::AppendAllText($script:LGScriptLog, "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $line`r`n") }
+        catch { Write-Host "[LGAgent] WARN: script log [$script:LGScriptLog] not writable: $($_.Exception.Message)"; $script:LGScriptLog = $null }
+    }
+}
 function ConvertTo-LGVersion($Value) {   # Four-part version so 5.5.0 equals 5.5.0.0.
     if (-not ("$Value" -match '\d+(\.\d+){0,3}')) { return $null }
     $p = @($Matches[0].Split('.') | ForEach-Object { [int]$_ }); while ($p.Count -lt 4) { $p += 0 }
@@ -521,58 +516,15 @@ function Get-LGFolder($Products) {   # <root>\LiongardAgent, plus an InstallLoca
     $candidates = @($Roots | ForEach-Object { Join-Path $_ 'LiongardAgent' }) + @($Products | Where-Object Location | ForEach-Object { $_.Location.Trim().TrimEnd('\') } | Where-Object { $Roots -contains (Split-Path $_ -Parent) })
     $candidates | Sort-Object -Unique | Where-Object { Test-Path -LiteralPath $_ -PathType Container }
 }
-function Get-LGState {   # (b) Healthy = entry + service + binary; NotInstalled = none of them and no folder; else Stale.
+function Get-LGState {   # Healthy = entry + service Running + binary; NotInstalled = none of them and no folder; else Stale.
     $p = @(Get-LGProduct | Sort-Object Key -Unique); $s = Get-LGServiceInfo; $f = @(Get-LGFolder $p)
     $r = @($Roots | Where-Object { Test-Path -LiteralPath $_ -PathType Container })
-    $state = if ($p.Count -and $s.Exists -and $s.BinaryExists) { 'Healthy' } elseif (-not ($p.Count -or $s.Exists -or $f.Count -or $r.Count)) { 'NotInstalled' } else { 'Stale' }
+    $state = if ($p.Count -and $s.Exists -and $s.BinaryExists -and $s.Status -eq 'Running') { 'Healthy' } elseif (-not ($p.Count -or $s.Exists -or $f.Count -or $r.Count)) { 'NotInstalled' } else { 'Stale' }
     Write-LGLog "Install state: $state"
     Write-LGLog ("  entries: {0}" -f $(if ($p.Count) { ($p | ForEach-Object { "$($_.Key) v$($_.Version) code=$($_.Code) bundle=$($_.Bundle)" }) -join '; ' } else { 'none' }))
     Write-LGLog "  service: exists=$($s.Exists) status=$($s.Status) binary=$($s.Binary) binaryExists=$($s.BinaryExists)"
     Write-LGLog "  folders: $(@($f) + @($r) -join '; ')"
     [pscustomobject]@{ State = $state; Products = $p; Service = $s }
-}
-function Assert-LGNotProtected([string]$Path) {   # (e) Refuse the identity key, its children, or any parent of it.
-    $p = $Path.Trim() -replace '^(?i)(Microsoft\.PowerShell\.Core\\)?Registry::', ''
-    if (-not ($p -match '^(?i)(HKEY_LOCAL_MACHINE|HKLM|HKEY_CLASSES_ROOT|HKCR|HKEY_CURRENT_USER|HKCU|HKEY_USERS|HKU):?(\\(.*))?$')) { return }
-    $hive = @{ HKLM = 'HKEY_LOCAL_MACHINE'; HKCR = 'HKEY_CLASSES_ROOT'; HKCU = 'HKEY_CURRENT_USER'; HKU = 'HKEY_USERS' }[$Matches[1]]
-    $n = ("$(if ($hive) { $hive } else { $Matches[1].ToUpper() })\$($Matches[3])" -replace '\\+', '\').TrimEnd('\')
-    foreach ($x in $Protected) { if ($n.Equals($x, 'OrdinalIgnoreCase') -or $n.StartsWith("$x\", 'OrdinalIgnoreCase') -or $x.StartsWith("$n\", 'OrdinalIgnoreCase')) { throw "Refusing to modify protected Liongard identity path [$Path]." } }
-}
-function Remove-LGPath([string]$Path) { Assert-LGNotProtected $Path; Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop }
-function Stop-LGProcess {   # Processes running from a Liongard root (agent, updater, node.exe/prowl.exe job children).
-    try { $procs = @(Get-CimInstance Win32_Process -ErrorAction Stop | Where-Object { $e = $_.ExecutablePath; $e -and @($Roots | Where-Object { $e.StartsWith("$_\", 'OrdinalIgnoreCase') }).Count }) }
-    catch { $procs = @(Get-Process LiongardAgentSVC, LiongardAgent, LiongardAgentUpdater, roaragent -ErrorAction SilentlyContinue | ForEach-Object { [pscustomobject]@{ ProcessId = $_.Id; Name = $_.ProcessName } }) }
-    foreach ($proc in $procs) { try { Stop-Process -Id $proc.ProcessId -Force -ErrorAction Stop; Write-LGLog "Stopped $($proc.Name) (PID $($proc.ProcessId))" } catch { Write-LGLog "WARN: could not stop $($proc.Name): $($_.Exception.Message)" } }
-    if ($procs.Count) { Start-Sleep -Seconds 2 }
-}
-function Remove-LGStoredCredential {   # (d) TODO: pending developer confirmation that fresh installs always issue new credentials.
-    $id = [Security.Principal.WindowsIdentity]::GetCurrent()
-    if ("$($id.User.Value)" -ne 'S-1-5-18') { Write-LGLog "WARN: not running as SYSTEM ($($id.Name)); agent credentials are not visible, cleanup skipped."; return }
-    try { if (-not ('LGCred' -as [type])) { Add-Type -TypeDefinition $CredSource -ErrorAction Stop }; $store = 'LGCred' -as [type]; $targets = @($store::Find('LiongardAgent\AgentKey')) }
-    catch { Write-LGLog "WARN: Credential Manager enumeration failed: $($_.Exception.Message)"; return }
-    $failed = @($targets | Where-Object { $store::Delete($_) -notin 0, 1168 }).Count
-    Write-LGLog "Credential Manager cleanup: found $($targets.Count), removed $($targets.Count - $failed), failed $failed (Generic, UserName 'LiongardAgent\AgentKey')."
-}
-function Invoke-LGStaleCleanup($State) {   # (c) Never for a Healthy install.
-    if ($State.State -ne 'Stale') { throw "Stale cleanup refused for state '$($State.State)'." }
-    Write-LGLog 'Stale install detected: cleaning up before a fresh install.'
-    if ($State.Service.Exists) {
-        Stop-LGProcess; Assert-LGNotProtected "HKLM:\SYSTEM\CurrentControlSet\Services\$Service"
-        try { $svc = Get-Service $Service -ErrorAction Stop; if ($svc.Status -ne 'Stopped') { Stop-Service $Service -Force -ErrorAction Stop; $svc.WaitForStatus('Stopped', [TimeSpan]::FromSeconds(30)) } } catch { Write-LGLog "WARN: service stop: $($_.Exception.Message)" }
-        $null = & sc.exe delete $Service 2>&1; Write-LGLog "sc.exe delete $Service exit $LASTEXITCODE (0, 1060 and 1072 are fine)"
-    }
-    foreach ($p in @($State.Products | Where-Object Code)) {
-        $staleLog = Join-Path $script:LiongardDeploy.Root ("StaleUninstall_{0}_{1}.log" -f $p.Code.Trim('{}'), (Get-Date -Format 'yyyyMMdd_HHmmss'))
-        Register-LiongardDeployLog -Label 'Stale uninstall log' -Path $staleLog -Redact
-        $proc = Start-Process msiexec.exe -ArgumentList '/x', $p.Code, '/qn', '/norestart', '/L*V', "`"$staleLog`"" -Wait -PassThru -WindowStyle Hidden
-        Write-LGLog "msiexec /x $($p.Code) exit $($proc.ExitCode) (failure tolerated)"
-    }
-    Stop-LGProcess; $stamp = Get-Date -Format 'yyyyMMddHHmmss'
-    foreach ($f in @(Get-LGFolder $State.Products)) {
-        try { Assert-LGNotProtected $f; Rename-Item -LiteralPath $f -NewName "$(Split-Path $f -Leaf).stale-$stamp" -ErrorAction Stop; Write-LGLog "Renamed $f to *.stale-$stamp" }
-        catch { Write-LGLog "WARN: rename of $f failed ($($_.Exception.Message)); deleting instead."; try { Remove-LGPath $f; Write-LGLog "Deleted $f" } catch { Write-LGLog "WARN: could not delete ${f}: $($_.Exception.Message)" } }
-    }
-    Remove-LGStoredCredential
 }
 function Test-LGInstall {   # (f) Service Running (retry ~60s) and updater task registered.
     $deadline = (Get-Date).AddSeconds(60)
@@ -607,37 +559,49 @@ function Get-LGMsiVersion([string]$Path) {   # ProductVersion via Windows Instal
 trap { Exit-LG 1 "Unexpected error: $($_.Exception.Message)" }
 $ProgressPreference = 'SilentlyContinue'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-try { [void](Initialize-LiongardDeployFolder -Folder $Folder -Secret $AgentTokenKey, $AgentTokenSecret) } catch { Exit-LG 1 "Deploy folder check failed: $($_.Exception.Message)" }
-foreach ($name in 'InstancePrefix', 'AgentTokenKey', 'AgentTokenSecret') { if ((Get-Variable $name -ValueOnly) -match '^(REPLACE_WITH_|\s*$)') { Exit-LG 1 "Configuration value [$name] must be set." } }
-if ($IncludeEnvironmentValue -and $Environment -match '^(REPLACE_WITH_|\s*$)') { Exit-LG 1 'Configuration value [Environment] must be set.' }
-if ($InstancePrefix -match '[?*\[\]]') { Exit-LG 1 "InstancePrefix '$InstancePrefix' contains a placeholder character." }
+try { [void](Initialize-LiongardDeployFolder -Folder $Folder -Secret $AgentTokenKey, $AgentTokenSecret, $ServiceAccountPassword) } catch { Exit-LG 3 "Deploy folder check failed: $($_.Exception.Message)" }
+$script:LGScriptLog = Get-LiongardDeployLogPath -Prefix 'LGAgentScript'; Register-LiongardDeployLog -Label 'Script log' -Path $script:LGScriptLog
+foreach ($name in 'InstancePrefix', 'AgentTokenKey', 'AgentTokenSecret') { if ((Get-Variable $name -ValueOnly) -match '^(REPLACE_WITH_|\s*$)') { Exit-LG 2 "Configuration value [$name] must be set." } }
+if ($IncludeEnvironmentValue -and $Environment -match '^(REPLACE_WITH_|\s*$)') { Exit-LG 2 'Configuration value [Environment] must be set.' }
+$parsedGuid = [guid]::Empty
+if ($DeviceGuid -and -not [guid]::TryParse($DeviceGuid, [ref]$parsedGuid)) { Exit-LG 2 "DeviceGuid '$DeviceGuid' is not a valid GUID." }
+if ([bool]$ServiceAccount -ne [bool]$ServiceAccountPassword) { Exit-LG 2 'Set both ServiceAccount and ServiceAccountPassword, or neither.' }
+if ($InstancePrefix -match '[?*\[\]]') { Exit-LG 2 "InstancePrefix '$InstancePrefix' contains a placeholder character." }
 $LGHost = ($InstancePrefix.Trim() -replace '^https?://', '' -replace '/.*$', '' -replace '\.app\.liongard\.com$', '') + '.app.liongard.com'
 Invoke-LiongardLegacyCleanup
+$state = Get-LGState
+if ($state.State -eq 'Stale') { Exit-LG 8 'The installed agent is broken or not running (Stale). Nothing was changed. Run LGAgentCleanInstall-MSI-Simple.ps1 to repair it.' }
 $msi = Join-Path (Initialize-LiongardDeployStage) 'LiongardAgent-lts.msi'; $log = Get-LiongardDeployLogPath -Prefix 'AgentInstall'
 foreach ($i in 1..3) {
-    try { if (Test-Path -LiteralPath $msi) { Remove-LGPath $msi }; Invoke-WebRequest -Uri $InstallerUrl -OutFile $msi -UseBasicParsing -ErrorAction Stop; if ((Get-Item -LiteralPath $msi).Length -ge 1MB) { break } }
+    try { if (Test-Path -LiteralPath $msi) { Remove-Item -LiteralPath $msi -Force -ErrorAction Stop }; Invoke-WebRequest -Uri $InstallerUrl -OutFile $msi -UseBasicParsing -ErrorAction Stop; if ((Get-Item -LiteralPath $msi).Length -ge 1MB) { break } }
     catch { Write-LGLog "WARN: download attempt $i failed: $($_.Exception.Message)" }
-    if ($i -eq 3) { Exit-LG 1 "Installer download from $InstallerUrl failed." }
+    if ($i -eq 3) { Exit-LG 5 "Installer download from $InstallerUrl failed. Nothing was changed." }
 }
 
-$state = Get-LGState
-if ($state.State -eq 'Stale') { Invoke-LGStaleCleanup $state }
-elseif ($state.State -eq 'Healthy') {   # Normal upgrade path: install only when the MSI is strictly newer.
+if ($state.State -eq 'Healthy') {   # Normal upgrade path: install only when the MSI is strictly newer.
     $installed = ConvertTo-LGVersion (@($state.Products | Where-Object { -not $_.Bundle }) | Select-Object -First 1).Version
     $new = Get-LGMsiVersion $msi
-    if ($installed -and $new -and $new -le $installed) { Exit-LG 0 "Liongard Agent $installed is installed and the MSI ($new) is not newer. Nothing to do." }
+    if (-not $installed -or -not $new) { Exit-LG 5 "The versions can't be compared (installed '$installed', MSI '$new'), so the agent was not upgraded. Nothing was changed." }
+    if ($new -le $installed) { Exit-LG 0 "Liongard Agent $installed is installed and running, and the MSI ($new) is not newer. Nothing to do." }
     Write-LGLog "Proceeding with install/upgrade: installed=$installed msi=$new"
 }
 
-$msiArgs = @('/i', "`"$msi`"", "LIONGARDURL=$LGHost", "LIONGARDACCESSKEY=$AgentTokenKey", "LIONGARDACCESSSECRET=$AgentTokenSecret", "LIONGARDAGENTNAME=`"$env:COMPUTERNAME`"")
+$msiArgs = @('/i', "`"$msi`"", "LIONGARDURL=$LGHost", "LIONGARDACCESSKEY=$AgentTokenKey", "LIONGARDACCESSSECRET=$AgentTokenSecret", "LIONGARDAGENTNAME=`"$(if ($AgentName) { $AgentName } else { $env:COMPUTERNAME })`"")
 if ($IncludeEnvironmentValue -and $Environment) { $msiArgs += "LIONGARDENVIRONMENT=`"$Environment`"" }
 if ($AgentDescription) { $msiArgs += "LIONGARDDESCRIPTION=`"$AgentDescription`"" }
+if ($ProxyUrl) { $msiArgs += "PROXYURL=`"$ProxyUrl`"" }
+if ($DeviceGuid) { $msiArgs += "DEVICEGUID=$DeviceGuid" }
+if ($ResetDeviceGuid) { $msiArgs += 'RESETDEVICEGUID=1' }
+if ($null -ne $AutoUpdate) { $msiArgs += "AUTOUPDATE=$([int][bool]$AutoUpdate)" }
+if ($InstallLocation) { $msiArgs += "INSTALLLOCATION=`"$InstallLocation`"" }
+if ($ServiceAccount) { $msiArgs += "LIONGARDAGENTSERVICEACCOUNT=`"$ServiceAccount`"", "LIONGARDAGENTSERVICEPASSWORD=`"$ServiceAccountPassword`"" }
 $msiArgs += '/qn', '/norestart', '/L*V', "`"$log`""
 Register-LiongardDeployLog -Label 'Installer log' -Path $log -Redact
 Write-LGLog "Installing Liongard Agent for $LGHost ..."
 $code = (Start-Process msiexec.exe -ArgumentList $msiArgs -Wait -PassThru).ExitCode
 Protect-LiongardInstallerLog -Path $log
 Write-LGLog "msiexec exit code: $code"
-if ($code -ne 0 -and $code -ne 3010) { Exit-LG $code "msiexec returned $code." $log }
-if (-not (Test-LGInstall)) { Exit-LG 1 'Post-install validation failed (service not Running or updater task missing).' $log }
+if ($code -eq 1618) { Exit-LG 11 'Another installation is in progress (msiexec 1618). Nothing was changed; run the script again later.' $log }
+if ($code -ne 0 -and $code -ne 3010) { Exit-LG 6 "msiexec returned $code." $log }
+if (-not (Test-LGInstall)) { Exit-LG 7 'Post-install validation failed (service not Running or updater task missing).' $log }
 Exit-LG 0 "Liongard Agent installed and validated (msiexec exit $code)."
