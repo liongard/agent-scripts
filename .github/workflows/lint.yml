@@ -40,6 +40,15 @@ jobs:
         shell: pwsh
         run: ./tests/Run-Tests.ps1
 
+  # Blocking: the shared blocks must be identical in every Windows script that has them.
+  shared-blocks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Check shared blocks
+        shell: pwsh
+        run: ./tests/Test-SharedBlocks.ps1
+
   gitleaks:
     runs-on: ubuntu-latest
     continue-on-error: true
