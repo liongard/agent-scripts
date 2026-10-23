@@ -19,7 +19,7 @@
 # NOTES
 #   Requires:     root, Bash. No tokens.
 #   Author:       Liongard Partner Support
-#   Last updated: 2026-10-22
+#   Last updated: 2026-10-23
 #
 # LINK
 #   https://github.com/liongard/agent-scripts/blob/main/linux/README.md
@@ -56,6 +56,29 @@ log_warn() { printf '[Uninstall][WARN] %s\n' "$*" >&2; }
 log_error() { printf '[Uninstall][ERROR] %s\n' "$*" >&2; }
 
 _has_cmd() { command -v "$1" &>/dev/null; }
+
+# On merged-/usr systems /lib is a link to /usr/lib, so two entries in UNIT_DIRS are the same
+# folder. Keep each real folder once, so every unit is listed and removed once.
+resolve_unit_dirs() {
+    local dir real seen=" " resolved=()
+    for dir in "${UNIT_DIRS[@]}"; do
+        real="$(readlink -f -- "${dir}" 2>/dev/null)" || real="${dir}"
+        [[ -n "${real}" ]] || real="${dir}"
+        [[ "${seen}" == *" ${real} "* ]] && continue
+        seen+="${real} "
+        resolved+=("${real}")
+    done
+    UNIT_DIRS=("${resolved[@]}")
+}
+
+# Removes a path; on failure the WARN carries rm's reason instead of rm's own stderr line.
+remove_path() {
+    local err
+    if ! err="$(rm -rf -- "$1" 2>&1)"; then
+        err="${err##*$'\n'}"
+        log_warn "Could not remove $1${err:+: ${err##*: }}."
+    fi
+}
 
 # Every unit name the script stops, disables and removes.
 unit_names() {
@@ -171,7 +194,7 @@ remove_units() {
         for dir in "${UNIT_DIRS[@]}"; do
             if [[ -e "${dir}/${unit}" || -L "${dir}/${unit}" ]]; then
                 log_info "Removing unit file ${dir}/${unit}"
-                rm -f -- "${dir}/${unit}" || log_warn "Could not remove ${dir}/${unit}."
+                remove_path "${dir}/${unit}"
             fi
         done
         # Enable symlinks left behind if the unit couldn't be disabled.
@@ -200,7 +223,7 @@ remove_files() {
     for path in "${BINARY_PATHS[@]}" "${INSTALL_DIRS[@]}"; do
         if [[ -e "${path}" || -L "${path}" ]]; then
             log_info "Removing ${path}"
-            rm -rf -- "${path}" || log_warn "Could not remove ${path}."
+            remove_path "${path}"
         fi
     done
 }
@@ -215,6 +238,7 @@ if [[ "${EUID}" -ne 0 ]]; then
 fi
 
 log_info "Local removal only: no Liongard API calls, and the platform record is kept."
+resolve_unit_dirs
 
 before="$(agent_leftovers)"
 if [[ -z "${before}" ]]; then
