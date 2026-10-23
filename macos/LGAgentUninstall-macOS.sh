@@ -18,7 +18,7 @@
 # NOTES
 #   Requires:     root, macOS on Intel or Apple Silicon. No tokens.
 #   Author:       Liongard Partner Support
-#   Last updated: 2026-10-22
+#   Last updated: 2026-10-23
 #
 # LINK
 #   https://github.com/liongard/agent-scripts/blob/main/macos/README.md
@@ -84,6 +84,13 @@ agent_leftovers() {
   done
 }
 
+# True when the group or other users can write to the path, or its mode can't be read.
+writable_by_others() {
+  local mode
+  mode=$(stat -f %Lp "$1" 2>/dev/null) || return 0
+  [ $(( 8#$mode & 8#022 )) -ne 0 ]
+}
+
 if [ "$EUID" -ne 0 ]
 then
   log_error "run this script as root (for example with sudo)."
@@ -101,9 +108,13 @@ else
   echo "$before" | while read -r line; do log_info "  - $line"; done
 
   # The package's own script stops and removes both services only when they're loaded, so the
-  # steps after it always run. It's run only when it's a root-owned file nobody else can change.
-  if [ -f "$PKG_UNINSTALL" ] && [ ! -L "$PKG_UNINSTALL" ] && [ -O "$PKG_UNINSTALL" ] \
-    && [ -z "$(find "$PKG_UNINSTALL" -perm -022 2>/dev/null)" ]
+  # steps after it always run. It's run only when it's a root-owned file nobody else can change,
+  # in a folder nobody else can change.
+  if [ -e "$PKG_UNINSTALL" ] && { [ -L "$AGENT_DIR" ] || writable_by_others "$AGENT_DIR"; }
+  then
+    log_warn "$AGENT_DIR is a symlink or can be changed by users other than root, so $PKG_UNINSTALL was not run."
+  elif [ -f "$PKG_UNINSTALL" ] && [ ! -L "$PKG_UNINSTALL" ] && [ -O "$PKG_UNINSTALL" ] \
+    && ! writable_by_others "$PKG_UNINSTALL"
   then
     log_info "Running $PKG_UNINSTALL"
     /bin/zsh "$PKG_UNINSTALL" < /dev/null

@@ -23,7 +23,7 @@ What the install script does, in order:
 
 What the uninstall script does, in order:
 
-1. Runs the package's own `/Library/Liongard/uninstall.sh` when it's there and is a root-owned file only root can change. That script removes the LaunchDaemons only when they're loaded, so the next steps always run.
+1. Runs the package's own `/Library/Liongard/uninstall.sh` when it's there and is a root-owned file only root can change, and `/Library/Liongard` is not a symlink and is not writable by the group or other users. That script removes the LaunchDaemons only when they're loaded, so the next steps always run.
 2. Stops `system/com.liongard.liongard-agent` and `system/com.liongard.liongard-agent-updater` (`launchctl bootout`) and removes both plists from `/Library/LaunchDaemons`.
 3. Stops leftover processes running from `/Library/Liongard`, then removes `/Library/Liongard`.
 4. Forgets the package receipts `com.liongard.LiongardAgent` and `com.liongard.liongard-agent.app` (`pkgutil --forget`).
@@ -118,6 +118,7 @@ Logs can contain sensitive details, so check them before you share them.
 | `the installer exited with <code>` | Read `/tmp/liongard-agent-installer.log` and `/var/log/install.log`. |
 | `the Liongard Agent is still detected` (uninstall, exit `1`) | The lines after it list what's left. Check that your MDM isn't reinstalling the agent, then run the script again. |
 | `/Library/Liongard/uninstall.sh isn't a root-owned file ...` (uninstall) | The script skipped the package's own uninstall script and removed the agent itself. Check who changed the file. |
+| `/Library/Liongard is a symlink or can be changed by users other than root ...` (uninstall) | The script skipped the package's own uninstall script and removed the agent itself. Check who changed the folder. |
 | `the installer succeeded, but the agent isn't running` | Check `sudo launchctl print system/com.liongard.liongard-agent` and the package log. |
 
 For anything else, contact Liongard Partner Support with the logs above.
