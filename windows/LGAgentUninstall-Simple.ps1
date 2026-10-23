@@ -6,7 +6,7 @@
     Uninstalls the Liongard Agent and removes what it leaves behind on this endpoint.
     There are no required settings. Exit codes, logs and troubleshooting are in the README
     under .LINK.
-    - Removes the updater task, the EXE bundle or MSI install, processes, services, uninstall entries and the LiongardInc folders, then reports anything that's left.
+    - Removes the updater task, the EXE bundle or MSI install, processes, services, uninstall entries, orphaned Windows Installer registrations (msiexec /x) and the LiongardInc folders, then reports anything that's left.
     - Makes no Liongard API calls and keeps the agent's record on the platform. To delete the record too, use LGAgentUninstall-Advanced.ps1.
     - Leaves the agent's Credential Manager entries in place; that cleanup is disabled until the dev team confirms it is safe (#8).
     - Never modifies the agent identity key, so a later reinstall re-attaches to the same platform record.
@@ -15,7 +15,7 @@
 .NOTES
     Requires:     Windows PowerShell 5.1, run as SYSTEM or an elevated administrator. No tokens.
     Author:       Liongard Partner Support
-    Last updated: 2026-10-22
+    Last updated: 2026-10-23
 
 .LINK
     https://github.com/liongard/agent-scripts/blob/main/windows/README.md
@@ -78,6 +78,7 @@ function Get-AgentEntry {
                         DisplayName = $displayName
                         ProductCode = $code
                         IsBundle    = $isBundle
+                        IsRegistration = $false
                         Command     = @([string]$key.GetValue('QuietUninstallString'), $uninstall) | Where-Object { $_ } | Select-Object -First 1
                         Label       = "'$displayName' ($view $name)"
                     })
@@ -88,7 +89,32 @@ function Get-AgentEntry {
         }
         finally { $base.Close() }
     }
+    # Windows Installer registrations with no uninstall entry (deleted by hand or by a failed
+    # uninstall). HKCR\Installer is shared by both views, so Registry64 serves a 32-bit host too.
+    $classes = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::ClassesRoot, [Microsoft.Win32.RegistryView]::Registry64)
+    try {
+        $products = $classes.OpenSubKey('Installer\Products')
+        foreach ($packed in @(if ($products) { $products.GetSubKeyNames() })) {
+            $key = if ($packed -match '^[0-9A-Fa-f]{32}$') { $products.OpenSubKey($packed) }
+            if (-not $key) { continue }
+            $name = [string]$key.GetValue('ProductName')
+            $key.Close()
+            if ($script:DisplayNames -notcontains $name) { continue }
+            # Packed form: the first three GUID groups reversed, then each byte's two hex digits swapped.
+            $hex  = -join (@($packed[7..0]) + @($packed[11..8]) + @($packed[15..12]) + @(16..31 | ForEach-Object { $packed[$_ -bxor 1] }))
+            $code = ('{' + $hex.Insert(20, '-').Insert(16, '-').Insert(12, '-').Insert(8, '-') + '}').ToUpper()
+            if (@($entries | Where-Object { $_.ProductCode -eq $code }).Count) { continue }
+            $entries.Add([pscustomobject]@{ View = 'Installer'; Name = $packed; DisplayName = $name; ProductCode = $code; IsBundle = $false; IsRegistration = $true; Command = $null; Label = "'$name' (Windows Installer $code)" })
+        }
+        if ($products) { $products.Close() }
+    }
+    finally { $classes.Close() }
     return @($entries | Sort-Object { -not $_.IsBundle })
+}
+
+function Get-AgentService {
+    # Exact Name match: Get-Service -Name also matches display names, which listed one service twice.
+    return @(Get-Service -ErrorAction SilentlyContinue | Where-Object { $script:ServiceNames -contains $_.Name })
 }
 
 function Invoke-AgentEntryKeyRemoval {
@@ -202,9 +228,7 @@ function Get-AgentLeftover {
     # Everything that still marks this endpoint as having the agent.
     $left = New-Object System.Collections.Generic.List[string]
     foreach ($entry in Get-AgentEntry) { $left.Add("Uninstall entry $($entry.Label)") }
-    foreach ($name in $script:ServiceNames) {
-        if (Get-Service -Name $name -ErrorAction SilentlyContinue) { $left.Add("Service '$name'") }
-    }
+    foreach ($service in Get-AgentService) { $left.Add("Service '$($service.Name)'") }
     if (Test-UpdaterTask) { $left.Add("Scheduled task '$($script:UpdaterTaskName)'") }
     foreach ($root in $script:InstallRoots) {
         if (Test-Path -LiteralPath $root) { $left.Add("Folder [$root]") }
@@ -334,9 +358,7 @@ foreach ($pass in @($true, $false)) {
 # 3. Processes and services.
 Write-UninstallLog STEP 'Stopping Liongard processes and removing services.'
 Invoke-AgentProcessStop
-foreach ($name in $script:ServiceNames) {
-    $service = Get-Service -Name $name -ErrorAction SilentlyContinue
-    if (-not $service) { continue }
+foreach ($service in Get-AgentService) {
     if ($service.Status -ne 'Stopped') {
         try { Stop-Service -Name $service.Name -Force -ErrorAction Stop }
         catch { Write-UninstallLog WARN "Service '$($service.Name)' did not stop cleanly: $($_.Exception.Message)" }
@@ -348,7 +370,7 @@ foreach ($name in $script:ServiceNames) {
 Invoke-AgentProcessStop
 
 # 4. Leftover uninstall entries whose uninstall succeeded or that were orphaned.
-foreach ($entry in @(Get-AgentEntry)) {
+foreach ($entry in @(Get-AgentEntry | Where-Object { -not $_.IsRegistration })) {
     if ($failedKeys.Contains("$($entry.View)\$($entry.Name)")) { continue }
     try {
         Invoke-AgentEntryKeyRemoval -Entry $entry
@@ -377,5 +399,6 @@ if ($after.Count -eq 0) {
 
 Write-UninstallLog WARN 'The Liongard Agent is still detected. Left on this endpoint:'
 foreach ($item in $after) { Write-UninstallLog WARN "  - $item" }
+if ($after -like '*(Windows Installer *') { Write-UninstallLog WARN 'To clear a Windows Installer registration that msiexec cannot remove, run LGAgentCleanInstall-MSI-Simple.ps1.' }
 Close-UninstallLog
 exit 1
