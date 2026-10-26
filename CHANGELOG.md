@@ -43,6 +43,7 @@ All notable changes to these scripts are documented here.
 
 ### Tests and CI
 
+- CI: the report-only `gitleaks` job now scans only the commits being checked (a pull request's commits, a pushed branch's commits that aren't on main, or main's history on a push to main), so a finding on another branch no longer fails every run (#61).
 - Added `tests/` with the proxy-masking tests for EXE Advanced (`Test-ProxyMasking.ps1`), a runner (`Run-Tests.ps1`) and a README. A new blocking `tests` job in the lint workflow runs them on every push and pull request.
 
 ## Initial import (Windows scripts dated 2026-10-10, Linux script dated 2026-06-24)
