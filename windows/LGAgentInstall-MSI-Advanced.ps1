@@ -16,7 +16,7 @@
     Requires:     Windows PowerShell 5.1 (64-bit), run as SYSTEM or an elevated administrator.
                   Liongard API token and agent install token (key and secret for each).
     Author:       Liongard Partner Support
-    Last updated: 2026-10-20
+    Last updated: 2026-10-21
 
 .LINK
     https://github.com/liongard/agent-scripts/blob/main/windows/README.md
@@ -579,8 +579,11 @@ function Remove-LiongardStoredCredentials {
     # cannot reuse them. Matches ONLY Generic credentials whose UserName is exactly
     # 'LiongardAgent\AgentKey'; target names are random and are never used for matching.
     # Secret values are never read or logged.
-    # TODO: Pending developer confirmation that a fresh install always issues new
-    # credentials, so removing these entries can never strand a working agent.
+    # Disabled until dev confirms that a fresh install always issues new credentials (#8, dev Q1).
+    # The cleanup below is kept unchanged; it runs again once this early return is removed.
+    Write-LiongardStateLog INFO 'Credential Manager cleanup is disabled until dev confirms that a fresh install always issues new credentials (#8). No entries were changed.'
+    return [pscustomobject]@{ Status = 'Disabled'; Found = 0; Removed = 0; Failed = 0 }
+
     $found   = 0
     $removed = 0
     $failed  = 0
@@ -676,7 +679,7 @@ function Invoke-LiongardStaleCleanup {
         }
     }
 
-    # 4. Stored credentials.
+    # 4. Stored credentials. Currently disabled (Status 'Disabled', never an issue); see #8.
     $credentials = Remove-LiongardStoredCredentials
     if ($credentials.Status -eq 'Failed') { $issues.Add('credentials') | Out-Null }
 
@@ -1772,8 +1775,8 @@ if (-not (Get-LiongardInstaller -Uri $InstallerUrl -DestinationPath $installerPa
 
 # Classify the existing install. Stale leftovers (folder only, orphaned service, uninstall
 # entry without binaries) are cleaned up first so the new install cannot reuse an old
-# appsettings-override.config or stored credentials. A Healthy install is never cleaned
-# up; it goes through the normal version gate / upgrade path.
+# appsettings-override.config (Credential Manager cleanup is disabled for now, #8). A Healthy
+# install is never cleaned up; it goes through the normal version gate / upgrade path.
 $installState = Get-LiongardInstallState
 Write-LiongardInstallState -State $installState
 

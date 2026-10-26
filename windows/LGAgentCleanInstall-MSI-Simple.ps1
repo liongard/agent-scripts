@@ -616,7 +616,8 @@ function Stop-LGProcess {   # Processes running from a Liongard root (agent, upd
     foreach ($proc in $procs) { try { Stop-Process -Id $proc.ProcessId -Force -ErrorAction Stop; Write-LGLog "Stopped $($proc.Name) (PID $($proc.ProcessId))" } catch { Write-LGLog "WARN: could not stop $($proc.Name): $($_.Exception.Message)" } }
     if ($procs.Count) { Start-Sleep -Seconds 2 }
 }
-function Remove-LGStoredCredential {   # (d) TODO: pending developer confirmation that fresh installs always issue new credentials.
+function Remove-LGStoredCredential {   # (d) Disabled until dev confirms that a fresh install always issues new credentials (#8, dev Q1). The cleanup below is kept.
+    Write-LGLog 'Credential Manager cleanup is disabled until dev confirms that a fresh install always issues new credentials (#8). No entries were changed.'; return
     $id = [Security.Principal.WindowsIdentity]::GetCurrent()
     if ("$($id.User.Value)" -ne 'S-1-5-18') { Write-LGLog "WARN: not running as SYSTEM ($($id.Name)); agent credentials are not visible, cleanup skipped."; return }
     try { if (-not ('LGCred' -as [type])) { Add-Type -TypeDefinition $CredSource -ErrorAction Stop }; $store = 'LGCred' -as [type]; $targets = @($store::Find('LiongardAgent\AgentKey')) }
@@ -624,7 +625,7 @@ function Remove-LGStoredCredential {   # (d) TODO: pending developer confirmatio
     $failed = @($targets | Where-Object { $store::Delete($_) -notin 0, 1168 }).Count
     Write-LGLog "Credential Manager cleanup: found $($targets.Count), removed $($targets.Count - $failed), failed $failed (Generic, UserName 'LiongardAgent\AgentKey')."
 }
-function Invoke-LGStaleCleanup($State, [switch]$Simple) {   # (c) Never for a Healthy install. -Simple: only MSI Simple's steps (service, MSI uninstall entries, folder, credentials).
+function Invoke-LGStaleCleanup($State, [switch]$Simple) {   # (c) Never for a Healthy install. -Simple: only MSI Simple's steps (service, MSI uninstall entries, folder; credentials step disabled, #8).
     if ($State.State -ne 'Stale') { throw "Stale cleanup refused for state '$($State.State)'." }
     Write-LGLog "Stale install detected: cleaning up before a fresh install$(if ($Simple) { ' (MSI Simple cleanup only)' })."
     if ($State.Service.Exists) {
