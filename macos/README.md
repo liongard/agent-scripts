@@ -30,6 +30,8 @@ What the uninstall script does, in order:
 5. Removes the six `/tmp/liongard_*` settings files and `/tmp/temporary-liongard-values.txt` if an earlier install left them.
 6. Checks what's left and lists it.
 
+Tested on macOS 26.7.1 (Apple Silicon) with agent 5.5.0. Intel Macs haven't been tested yet.
+
 It never touches the agent identity `/etc/liongard-agent/.machine-guid`, so a reinstall re-attaches to the same platform record. Delete that folder by hand only if the Mac should register as a new agent, for example before capturing a golden image. Platform removal isn't included.
 
 ## Requirements
