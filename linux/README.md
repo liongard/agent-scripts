@@ -26,6 +26,8 @@ What the uninstall script does, in order:
 4. Removes the unit files, runs the agent's own uninstall script if one exists, and removes the agent binaries and install folders (`/opt/liongard`, `/opt/liongard-agent`, `/usr/local/liongard`).
 5. Checks what's left and lists it.
 
+Tested on Ubuntu 24.04 (x86_64) with agent 5.5.0. Other distributions and aarch64 haven't been tested yet.
+
 It never touches the agent identity `/etc/liongard-agent/.machine-guid`, so a reinstall re-attaches to the same platform record, or the log folders. It leaves `/etc/liongard` in place with a warning until the dev team confirms what it holds. Platform removal isn't included.
 
 ## Requirements
