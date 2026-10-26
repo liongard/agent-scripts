@@ -1,14 +1,15 @@
 # Linux
 
-`LGAgentInstall-Linux.sh` installs the Liongard Agent on Linux. For other platforms, and for what you need before you start, see the [main README](../README.md).
+`LGAgentInstall-Linux.sh` installs the Liongard Agent on Linux, and `LGAgentUninstall-Linux.sh` removes it. For other platforms, and for what you need before you start, see the [main README](../README.md).
 
-## Script
+## Scripts
 
 | Script | What it does | Use it when |
 |---|---|---|
 | `LGAgentInstall-Linux.sh` | Removes any existing agent (by default), matches the environment name and checks for machine-ID collisions through the Liongard API, then downloads, installs and validates the agent. | Installing or reinstalling the agent on a Linux endpoint. |
+| `LGAgentUninstall-Linux.sh` | Removes the agent from the endpoint: services and updater timer, package, processes, unit files, binaries and install folders. No Liongard API calls and no settings to fill in. The agent's record stays on the platform. | Removing the agent from a Linux endpoint. |
 
-What it does, in order:
+What the install script does, in order:
 
 1. Checks the configuration and prerequisites, and picks the x64 or arm64 installer from `uname -m`.
 2. **Removes any existing Liongard Agent by default** (`ENABLE_PRE_UNINSTALL=true`), including leftover install folders and config files. With `ENABLE_PRE_UNINSTALL=false`, an installed agent is left as it is, and the script exits `0`. The agent's platform record is kept unless `REMOVE_AGENT_FROM_PLATFORM=true`.
@@ -17,9 +18,22 @@ What it does, in order:
 5. Downloads the installer to a private temporary folder, which is deleted when the script exits, and installs it with the package manager (`.deb`, `.rpm`) or the installer itself (`.run`, `.sh`).
 6. Confirms the agent service is running.
 
+What the uninstall script does, in order:
+
+1. Stops and disables the agent service and the updater timer (`liongard-agent`, `liongard-agent-updater` and the older names the install script also looks for).
+2. Removes any installed `.deb` or `.rpm` Liongard package with the package manager (`remove`, not `purge`). A package that's only left as config (`rc`) doesn't count as installed.
+3. Stops leftover agent processes, including those running from `/opt/liongard`.
+4. Removes the unit files, runs the agent's own uninstall script if one exists, and removes the agent binaries and install folders (`/opt/liongard`, `/opt/liongard-agent`, `/usr/local/liongard`).
+5. Checks what's left and lists it.
+
+Tested on Ubuntu 24.04 (x86_64) with agent 5.5.0. Other distributions and aarch64 haven't been tested yet.
+
+It never touches the agent identity `/etc/liongard-agent/.machine-guid`, so a reinstall re-attaches to the same platform record, or the log folders. It leaves `/etc/liongard` in place with a warning until the dev team confirms what it holds. Platform removal isn't included.
+
 ## Requirements
 
 - Run as **root** (or with `sudo`).
+- The uninstall script needs only root and Bash: no tokens, no network access and no settings. The rest of this section applies to the install script.
 - Bash 4.0 or later.
 - `curl` or `wget`, plus `sed`, `awk`, `grep` and `hostname`.
 - `jq` when environment matching or platform removal is on. Environment matching is on by default.
@@ -29,7 +43,7 @@ What it does, in order:
 
 ## Settings
 
-The configuration block at the top of the script has three sections. The script stops with exit code `2` if a required value is blank or a `REPLACE_WITH_*` placeholder.
+These are the install script's settings. The uninstall script has none. The configuration block at the top of the install script has three sections. The script stops with exit code `2` if a required value is blank or a `REPLACE_WITH_*` placeholder.
 
 ### A. Required
 
@@ -70,7 +84,7 @@ Leave these alone unless Liongard Support asks you to change them.
 
 ## Running through an RMM or MDM
 
-- **Run as root.** For example: `sudo bash LGAgentInstall-Linux.sh`.
+- **Run as root.** For example: `sudo bash LGAgentInstall-Linux.sh` or `sudo bash LGAgentUninstall-Linux.sh`.
 - **Run it with Bash**, not `sh`.
 - **Passing values with RMM variables:** set the value in the configuration block from the variable your RMM provides, for example `ENVIRONMENT="${LIONGARD_ENVIRONMENT}"` if your RMM exports it as an environment variable. Use your RMM's secure variable type for tokens. Native support for `LIONGARD_*` environment variables is planned in [#10](https://github.com/liongard/agent-scripts/issues/10).
 - **Timeouts:** allow several minutes. The script may uninstall an existing agent, makes several API calls, downloads the installer and waits for the service to start.
@@ -79,6 +93,15 @@ Leave these alone unless Liongard Support asks you to change them.
 ## Exit codes
 
 Current behavior. Standard exit codes across all scripts are planned in [#11](https://github.com/liongard/agent-scripts/issues/11).
+
+**Uninstall script** (the same as the Windows uninstall scripts):
+
+| Code | Meaning |
+|---|---|
+| `0` | The agent was removed and nothing is left, or no agent was installed. |
+| `1` | Something is still detected afterwards (the script lists it), or the script isn't run as root. |
+
+**Install script:**
 
 | Code | Meaning |
 |---|---|
@@ -94,7 +117,8 @@ Current behavior. Standard exit codes across all scripts are planned in [#11](ht
 
 ## Logs and files
 
-- **Script log:** `LOG_DIRECTORY/LGAgentScript_<timestamp>.log` (default `/var/log/liongard-agent`). A missing folder is created with mode `0700`, and the log with mode `0600`.
+- **Uninstall script:** writes no log file. Progress goes to stdout, and warnings and errors to stderr, so your RMM's script output shows everything.
+- **Script log** (install script): `LOG_DIRECTORY/LGAgentScript_<timestamp>.log` (default `/var/log/liongard-agent`). A missing folder is created with mode `0700`, and the log with mode `0600`.
 - **Console:** the same lines go to stderr, so your RMM's script output shows them.
 - **Installer:** downloaded to a private temporary folder (`mktemp -d`), which is deleted when the script exits. The API key is passed to `curl` or `wget` without appearing on the command line.
 
@@ -113,6 +137,9 @@ Logs can contain sensitive details, so check them before you share them.
 | `Installer download failed` (exit `5`) | Check HTTPS access to `agents.static.liongard.com`, or to your `INSTALLER_URL`. |
 | `Installation failed` (exit `6`) | Read the installer output in the script log. On Debian and Ubuntu the script runs `apt-get install -f` after a `dpkg` failure. |
 | Validation failed (exit `7`) | The agent service isn't running. Check `systemctl status roaragent` and the script log. |
+| `Run this script as root` (uninstall, exit `1`) | Run it as root. |
+| `The Liongard Agent is still detected` (uninstall, exit `1`) | The lines after it list what's left. Check that nothing else (a configuration management tool, for example) reinstalls the agent, remove the items by hand, and run the script again. |
+| `/etc/liongard was left in place ...` (uninstall) | Not an error. Remove `/etc/liongard` by hand if you don't need it. Never remove `/etc/liongard-agent` unless you want the next install to register as a new agent. |
 | `Liongard Agent is still detected after uninstall` (exit `8`) | Remove the existing agent by hand, then run the script again. |
 
 For anything else, contact Liongard Partner Support with the script log.

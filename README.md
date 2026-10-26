@@ -15,6 +15,7 @@ Scripts that install, upgrade and remove the Liongard Agent on Windows, Linux an
 | Windows | Remove the agent from the endpoint | `LGAgentUninstall-Simple.ps1` | [Windows](windows/README.md) |
 | Windows | Remove the agent and also delete its record from the Liongard platform | `LGAgentUninstall-Advanced.ps1` | [Windows](windows/README.md) |
 | Linux | Install (x64 or arm64; `.deb`, `.rpm`, `.run` or `.sh`) | `LGAgentInstall-Linux.sh` | [Linux](linux/README.md) |
+| Linux | Remove the agent from the endpoint | `LGAgentUninstall-Linux.sh` | [Linux](linux/README.md) |
 | macOS | Install (Intel or Apple Silicon) | `LGAgentInstall-macOS.sh` | [macOS](macos/README.md) |
 
 - **Simple or Advanced (Windows):** Simple scripts make no Liongard API calls and need only an agent install token (Uninstall Simple needs none). Advanced scripts also need an API token, which they use to match the environment name before installing, or, for Uninstall Advanced, to delete the agent's platform record.
