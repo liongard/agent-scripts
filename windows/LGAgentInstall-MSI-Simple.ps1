@@ -63,7 +63,7 @@ public static class LGCred {
 # ====================================================================
 # BEGIN SHARED BLOCK: Liongard deploy-folder functions
 # Keep this block identical across LGAgentInstall-MSI-Simple, LGAgentInstall-MSI-Advanced,
-# LGAgentInstall-EXE-Simple, LGAgentInstall-EXE-Advanced, LGAgentUninstall and
+# LGAgentInstall-EXE-Simple, LGAgentInstall-EXE-Advanced, LGAgentUninstall-Advanced and
 # LGAgentCleanInstall-MSI-Simple.
 # Edit one copy, then copy it to the other scripts.
 #

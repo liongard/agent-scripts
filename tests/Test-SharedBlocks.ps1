@@ -11,14 +11,14 @@ $blocks = @(
         Begin    = '# BEGIN SHARED BLOCK: Liongard deploy-folder functions'
         End      = @('# END SHARED BLOCK: Liongard deploy-folder functions')
         Expected = 'LGAgentCleanInstall-MSI-Simple.ps1', 'LGAgentInstall-EXE-Advanced.ps1', 'LGAgentInstall-EXE-Simple.ps1',
-                   'LGAgentInstall-MSI-Advanced.ps1', 'LGAgentInstall-MSI-Simple.ps1', 'LGAgentUninstall.ps1'
+                   'LGAgentInstall-MSI-Advanced.ps1', 'LGAgentInstall-MSI-Simple.ps1', 'LGAgentUninstall-Advanced.ps1'
     },
     @{
         # The end marker is bare today; the named form is accepted too.
         Name     = 'install-state functions'
         Begin    = '# BEGIN SHARED BLOCK: Liongard install-state functions'
         End      = @('# END SHARED BLOCK', '# END SHARED BLOCK: Liongard install-state functions')
-        Expected = 'LGAgentInstall-EXE-Advanced.ps1', 'LGAgentInstall-MSI-Advanced.ps1', 'LGAgentUninstall.ps1'
+        Expected = 'LGAgentInstall-EXE-Advanced.ps1', 'LGAgentInstall-MSI-Advanced.ps1', 'LGAgentUninstall-Advanced.ps1'
     }
 )
 

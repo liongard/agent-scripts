@@ -32,7 +32,8 @@ body:
         - windows/LGAgentInstall-MSI-Advanced.ps1
         - windows/LGAgentInstall-EXE-Simple.ps1
         - windows/LGAgentInstall-EXE-Advanced.ps1
-        - windows/LGAgentUninstall.ps1
+        - windows/LGAgentUninstall-Simple.ps1
+        - windows/LGAgentUninstall-Advanced.ps1
         - linux/LGAgentInstall-Linux.sh
         - macos/LGAgentInstall-macOS.sh
     validations:
