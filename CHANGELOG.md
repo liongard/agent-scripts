@@ -35,6 +35,7 @@ All notable changes to these scripts are documented here.
 - (#2) The installer now downloads to a private `mktemp -d` folder that is deleted on exit; the log moves to `LOG_DIRECTORY` (default `/var/log/liongard-agent`), and `DOWNLOAD_DIRECTORY` is deprecated (ignored with a warning, to be removed in a later release).
 - (#7) The API token no longer appears in the process list; curl reads the auth header from a stdin config, and wget from a 0600 temp file (via `WGETRC`) that is removed on exit.
 - (#31) The installer is picked by CPU architecture. The new `LINUX_ARCHITECTURE` setting (`auto`, `x64` or `arm64`; default `auto`) maps `uname -m` `x86_64` and `aarch64` to the x64 and arm64 LTS installers and stops with exit 3 on any other machine type. `INSTALLER_URL` now defaults to empty; when set, it is used as-is.
+- (#16) `INSTANCE_PREFIX` now defaults to `REPLACE_WITH_INSTANCE_PREFIX` instead of `us?`. The script stops with exit 2 if the value contains `?`, `*`, `[` or `]`, or if the normalized prefix isn't letters, digits and hyphens only. A prefix, host or URL is still accepted, now in any case and with `http://`, a path or surrounding spaces, and the instance is checked right after the configuration, before the prerequisite checks.
 
 ### macOS
 
