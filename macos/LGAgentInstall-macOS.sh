@@ -18,7 +18,7 @@
 #   Requires:     root, macOS on Intel or Apple Silicon.
 #                 Liongard agent install token (key and secret).
 #   Author:       Liongard Partner Support
-#   Last updated: 2026-10-20
+#   Last updated: 2026-10-21
 #
 # LINK
 #   https://github.com/liongard/agent-scripts/blob/main/macos/README.md
@@ -29,10 +29,12 @@
 
 # Enter the corresponding values for the following variables:
 #
-# INSTANCE_URL (required):The instance URL of your liongard instance. Should be in the format
-#   <instance>.app.liongard.com (ex: us1.app.liongard.com)
+# INSTANCE_URL (required): your Liongard instance. Accepts us1, us1.app.liongard.com or
+#   https://us1.app.liongard.com, and is passed to the package as us1.app.liongard.com.
 # ACCESS_KEY_ID (required): The access key ID generated in the platform for agent installs
 # ACCESS_KEY_SECRET (required): The access key secret generated in the platform for agent installs
+#   The three required values are needed only for a new install. A value still set to its
+#   REPLACE_WITH_* placeholder counts as blank.
 # NAME (optional): The name you would like to give to the agent. If one is not provided, then the
 #   agent's name will default to the hostname
 # ENVIRONMENT (optional): The name of the environment you would like the agent to be assigned to.
@@ -40,6 +42,8 @@
 #   agent will be registered without an environment assignment.
 # AGENT_DESCRIPTION (optional): A free-text description for the agent. Requires an agent package
 #   of version 5.5.0 or newer.
+#   Leave the optional values blank if you don't use them. The script stops if one starts with
+#   REPLACE_WITH_.
 #
 # NAME, ENVIRONMENT and AGENT_DESCRIPTION only apply to a new install. The package skips
 # registration when /Library/Liongard/.config.json already exists.
@@ -50,9 +54,9 @@
 # PKG_PATH (optional): full path to a .pkg already on this Mac, for example one staged by your MDM.
 #   When set, the script installs it instead of downloading.
 
-INSTANCE_URL=
-ACCESS_KEY_ID=
-ACCESS_KEY_SECRET=
+INSTANCE_URL=REPLACE_WITH_INSTANCE_URL
+ACCESS_KEY_ID=REPLACE_WITH_ACCESS_KEY_ID
+ACCESS_KEY_SECRET=REPLACE_WITH_ACCESS_KEY_SECRET
 NAME=
 ENVIRONMENT=
 AGENT_DESCRIPTION=
@@ -132,11 +136,68 @@ then
   exit 0
 fi
 
+# Optional values default to blank, so a REPLACE_WITH_* value there is a mistake.
+for setting in NAME ENVIRONMENT AGENT_DESCRIPTION
+do
+  case "${!setting}" in
+    REPLACE_WITH_*)
+      log_error "$setting is still set to a REPLACE_WITH_* placeholder. Set a value or leave it blank."
+      exit 1
+      ;;
+  esac
+done
+
+# A required value still set to its placeholder counts as blank.
+for setting in INSTANCE_URL ACCESS_KEY_ID ACCESS_KEY_SECRET
+do
+  case "${!setting}" in
+    REPLACE_WITH_*) printf -v "$setting" '%s' "" ;;
+  esac
+done
+
 # Without an existing config the package registers a new agent, which needs all three values.
-if [ ! -f "$AGENT_CONFIG" ] && { [ -z "$INSTANCE_URL" ] || [ -z "$ACCESS_KEY_ID" ] || [ -z "$ACCESS_KEY_SECRET" ]; }
+if [ ! -f "$AGENT_CONFIG" ]
 then
-  log_error "INSTANCE_URL, ACCESS_KEY_ID and ACCESS_KEY_SECRET are required for a new install."
-  exit 1
+  missing=""
+  for setting in INSTANCE_URL ACCESS_KEY_ID ACCESS_KEY_SECRET
+  do
+    if [ -z "${!setting}" ]
+    then
+      missing="${missing:+$missing, }$setting"
+    fi
+  done
+  if [ -n "$missing" ]
+  then
+    log_error "$missing must be set for a new install (blank or still a REPLACE_WITH_* placeholder)."
+    exit 1
+  fi
+fi
+
+# The package expects the instance host (us1.app.liongard.com). Accepts us1,
+# us1.app.liongard.com or https://us1.app.liongard.com in any case, with surrounding
+# spaces, http:// or a trailing slash or path.
+if [ -n "$INSTANCE_URL" ]
+then
+  case "$INSTANCE_URL" in
+    *[?*[\]]*)
+      log_error "INSTANCE_URL '$INSTANCE_URL' contains a placeholder character. Provide a valid instance (e.g. us1.app.liongard.com)."
+      exit 1
+      ;;
+  esac
+  instance=$(printf '%s' "$INSTANCE_URL" | tr '[:upper:]' '[:lower:]')
+  instance="${instance#"${instance%%[![:space:]]*}"}"
+  instance="${instance%"${instance##*[![:space:]]}"}"
+  instance="${instance#https://}"
+  instance="${instance#http://}"
+  instance="${instance%%/*}"
+  instance="${instance%.app.liongard.com}"
+  if ! [[ "$instance" =~ ^[a-z0-9-]+$ ]]
+  then
+    log_error "INSTANCE_URL '$INSTANCE_URL' is not a Liongard instance such as us1, us1.app.liongard.com or https://us1.app.liongard.com."
+    exit 1
+  fi
+  INSTANCE_URL="${instance}.app.liongard.com"
+  log_info "Liongard instance: $INSTANCE_URL"
 fi
 
 if [ "$(sysctl -n hw.optional.arm64 2>/dev/null)" = "1" ]
