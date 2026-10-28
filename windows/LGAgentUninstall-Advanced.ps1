@@ -9,7 +9,8 @@
     - Uninstalls the agent and removes its services, processes, folders and uninstall entries.
     - Leaves the agent's Credential Manager entries in place; that cleanup is disabled until the dev team confirms it is safe (#8).
     - Never modifies the agent identity key, so a later reinstall re-attaches to the same platform record.
-    - Keeps the agent's record on the Liongard platform by default; set $RemoveAgentFromPlatform = $true to delete the matching record through the API.
+    - Keeps the agent's record on the Liongard platform by default; set $RemoveAgentFromPlatform = $true to delete it through the API.
+      The record is deleted only when exactly one agent has the same environment ($Environment) and hostname.
     - Writes a full transcript log of the run.
 
 .NOTES
@@ -31,7 +32,8 @@ $RemoveAgentFromPlatform    = $false                            # Set to $true t
 $InstancePrefix             = "REPLACE_WITH_INSTANCE_PREFIX"   # Example: us1, us2, us3, eu1, etc.
 $ApiTokenKey                = "REPLACE_WITH_API_TOKEN_KEY"     # Liongard API token key (required for remote deletion)
 $ApiTokenSecret             = "REPLACE_WITH_API_TOKEN_SECRET"  # Liongard API token secret (required for remote deletion)
-$MinimumRemoteDeletionScore = 50                               # Minimum confidence score before deleting the agent record via API
+$Environment                = ""                               # Environment the agent is registered in; used to pick the record to delete. Leave blank for an agent with no environment
+$MinimumRemoteDeletionScore = 50                               # DEPRECATED: ignored, and a WARN is logged if changed. Will be removed in a later release
 $LogFolder                  = $env:ProgramData                 # Parent folder; the transcript goes to <LogFolder>\LiongardDeploy (SYSTEM/Administrators only)
 
 function Assert-ConfigurationValue {
@@ -1830,7 +1832,8 @@ function Resolve-InstancePrefix {
 }
 
 function Get-LiongardAgentsFiltered {
-    # Retrieves agents matching a specific conditions filter.
+    # Retrieves agents matching a specific conditions filter. Throws when the lookup fails, so a
+    # failed lookup is never mistaken for "no agents".
     # The /agents endpoint returns a bare JSON array; no envelope unwrapping is needed.
     param(
         [string]$InstancePrefix,
@@ -1844,195 +1847,182 @@ function Get-LiongardAgentsFiltered {
     $uri     = "https://$InstancePrefix.app.liongard.com/api/v1/agents?conditions=$encoded"
     Write-Host "Fetching filtered agents using conditions: $Conditions"
 
-    try {
-        $response = Invoke-RestMethod -Uri $uri -Headers $Headers -ErrorAction Stop
-    }
-    catch {
-        Write-Warning "Filtered agent lookup failed: $($_.Exception.Message)"
-        return @()
-    }
+    $response = Invoke-RestMethod -Uri $uri -Headers $Headers -ErrorAction Stop
 
     if ($null -eq $response) { return @() }
     if ($response -is [System.Array]) { return $response }
     return @($response)
 }
 
-function Get-LiongardAgentsByHostnames {
-    # Retrieves agents by matching their Hostname field against provided local hostnames.
+function Get-LiongardAgentCandidate {
+    # Looks up the agents whose Hostname or Name equals one of the local names. The API filter only
+    # narrows the list; Find-LiongardAgentMatch checks every candidate again, exactly.
+    # Returns $null when any lookup fails, so a partial list can never lead to a deletion.
     param(
         [string]$InstancePrefix,
         [hashtable]$Headers,
         [string[]]$Hostnames
     )
 
-    if (-not $Hostnames -or $Hostnames.Count -eq 0) { return @() }
-
-    $results = @()
+    $results = New-Object System.Collections.Generic.List[object]
     $seenIds = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
 
     foreach ($hostname in $Hostnames) {
         if ([string]::IsNullOrWhiteSpace($hostname)) { continue }
-        $escaped      = $hostname -replace "'", "''"
-        $conditions   = "Hostname = '$escaped'"
-        $agentMatches = Get-LiongardAgentsFiltered -InstancePrefix $InstancePrefix -Headers $Headers -Conditions $conditions
-        foreach ($agent in $agentMatches) {
-            if (-not $agent) { continue }
-            $agentId = Get-ObjectPropertyValue -Object $agent -Name 'ID'
-            if ($agentId) {
-                if ($seenIds.Add([string]$agentId)) {
-                    $results += $agent
-                }
-                continue
+        $escaped = $hostname -replace "'", "''"
+        foreach ($field in 'Hostname', 'Name') {
+            try {
+                $agentMatches = @(Get-LiongardAgentsFiltered -InstancePrefix $InstancePrefix -Headers $Headers -Conditions "$field = '$escaped'")
+            }
+            catch {
+                Write-Warning ("Agent lookup [{0} = '{1}'] failed: {2}" -f $field, $hostname, $_.Exception.Message)
+                return $null
             }
 
-            $results += $agent
+            foreach ($agent in $agentMatches) {
+                if (-not $agent) { continue }
+                $agentId = Get-ObjectPropertyValue -Object $agent -Name 'ID'
+                if ($agentId -and -not $seenIds.Add([string]$agentId)) { continue }
+                $results.Add($agent)
+            }
         }
     }
 
-    return $results
+    return ,$results.ToArray()
 }
 
 function Get-AgentHostIdentifiers {
-    # Builds a set of hostname variants (Hostname, Name, FQDN, truncated NETBIOS) for an agent record.
+    # The agent's Hostname, Name and Data.FQDN values that are not blank. No truncated variants.
     param(
         [Parameter(Mandatory = $true)]
         $Agent
     )
 
-    $candidates = @()
-
-    if (-not [string]::IsNullOrWhiteSpace($Agent.Hostname)) { $candidates += $Agent.Hostname }
-    if (-not [string]::IsNullOrWhiteSpace($Agent.Name))     { $candidates += $Agent.Name }
-
-    if ($Agent.PSObject.Properties.Match('Data').Count -gt 0) {
-        $fqdn = $Agent.Data.FQDN
-        if (-not [string]::IsNullOrWhiteSpace($fqdn)) { $candidates += $fqdn }
+    $data   = Get-ObjectPropertyValue -Object $Agent -Name 'Data'
+    $values = @()
+    foreach ($value in @((Get-ObjectPropertyValue -Object $Agent -Name 'Hostname'), (Get-ObjectPropertyValue -Object $Agent -Name 'Name'), (Get-ObjectPropertyValue -Object $data -Name 'FQDN'))) {
+        if (-not [string]::IsNullOrWhiteSpace([string]$value)) { $values += [string]$value }
     }
-
-    $variants = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::InvariantCultureIgnoreCase)
-    foreach ($candidate in ($candidates | Sort-Object -Unique)) {
-        if (-not [string]::IsNullOrWhiteSpace($candidate)) {
-            $variants.Add($candidate) | Out-Null
-            if ($candidate.Length -gt 15) {
-                $variants.Add($candidate.Substring(0, 15)) | Out-Null
-            }
-        }
-    }
-
-    return @($variants)
+    return $values
 }
 
-function Normalize-MacAddress {
-    param([string]$Value)
-
-    if ([string]::IsNullOrWhiteSpace($Value)) { return $null }
-    $clean = ($Value -replace '[^0-9a-fA-F]', '').ToUpperInvariant()
-    if ($clean.Length -lt 12) { return $null }
-    return $clean.Substring(0, 12)
-}
-
-function Get-LocalMacAddresses {
-    $set = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-    try {
-        $adapters = Get-CimInstance -ClassName Win32_NetworkAdapterConfiguration -Filter "IPEnabled = True" -ErrorAction Stop
-        foreach ($adapter in $adapters) {
-            $mac = Normalize-MacAddress -Value $adapter.MACAddress
-            if ($mac) { $set.Add($mac) | Out-Null }
-        }
-    }
-    catch {
-        Write-Warning "Unable to enumerate NIC MAC addresses: $($_.Exception.Message)"
-    }
-    return $set
-}
-
-function Get-AgentMacAddresses {
+function Get-AgentEnvironmentInfo {
+    # The agent's environment as Name and ID ($null when not set). The API returns an Environment
+    # object with Name and ID, or null when the agent has no environment. EnvironmentName, a plain
+    # Environment string and EnvironmentID are also read in case the shape differs.
     param($Agent)
 
-    $set = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-    if (-not $Agent) { return $set }
-    if ($Agent.PSObject.Properties.Match('Data').Count -eq 0) { return $set }
+    $name        = $null
+    $id          = $null
+    $environment = Get-ObjectPropertyValue -Object $Agent -Name 'Environment'
+    if ($environment -is [string]) {
+        $name = $environment
+    }
+    elseif ($null -ne $environment) {
+        $name = Get-ObjectPropertyValue -Object $environment -Name 'Name'
+        $id   = Get-ObjectPropertyValue -Object $environment -Name 'ID'
+    }
+    if ([string]::IsNullOrWhiteSpace([string]$name)) { $name = Get-ObjectPropertyValue -Object $Agent -Name 'EnvironmentName' }
+    if ([string]::IsNullOrWhiteSpace([string]$id))   { $id   = Get-ObjectPropertyValue -Object $Agent -Name 'EnvironmentID' }
 
-    $data          = $Agent.Data
-    $potentialKeys = @('MACAddress','MacAddress','MACAddresses','Mac','Macs')
-    foreach ($key in $potentialKeys) {
-        $prop = $data.PSObject.Properties[$key]
-        if (-not $prop) { continue }
-        $raw = $prop.Value
-        if ($null -eq $raw) { continue }
+    $name = if ([string]::IsNullOrWhiteSpace([string]$name)) { $null } else { [string]$name }
+    $id   = if ([string]::IsNullOrWhiteSpace([string]$id) -or "$id" -eq '0') { $null } else { [string]$id }
+    return [pscustomobject]@{
+        Name = $name
+        ID   = $id
+    }
+}
 
-        if ($raw -is [System.Collections.IEnumerable] -and -not ($raw -is [string])) {
-            foreach ($entry in $raw) {
-                $mac = Normalize-MacAddress -Value $entry
-                if ($mac) { $set.Add($mac) | Out-Null }
-            }
-            continue
-        }
+function Get-LiongardEnvironmentId {
+    # IDs of the environments whose name equals $Name (case-insensitive, whole string). Only needed
+    # when an agent reports an environment ID without a name. Returns an empty set on failure.
+    param(
+        [string]$InstancePrefix,
+        [hashtable]$Headers,
+        [string]$Name
+    )
 
-        $parts = ($raw -split '[,; ]') | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
-        foreach ($part in $parts) {
-            $mac = Normalize-MacAddress -Value $part
-            if ($mac) { $set.Add($mac) | Out-Null }
-        }
+    $ids = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $uri = "https://$InstancePrefix.app.liongard.com/api/v1/environments"
+    try {
+        # Assigned first: in Windows PowerShell 5.1, @(Invoke-RestMethod ...) would wrap the JSON array.
+        $environments = Invoke-RestMethod -Uri $uri -Headers $Headers -ErrorAction Stop
+    }
+    catch {
+        Write-Warning "Unable to retrieve Liongard environments: $($_.Exception.Message)"
+        return ,$ids
     }
 
-    return $set
+    foreach ($environment in @($environments)) {
+        $environmentName = Get-ObjectPropertyValue -Object $environment -Name 'Name'
+        $environmentId   = Get-ObjectPropertyValue -Object $environment -Name 'ID'
+        if ($null -ne $environmentId -and [string]::Equals([string]$environmentName, $Name, [System.StringComparison]::OrdinalIgnoreCase)) {
+            $ids.Add([string]$environmentId) | Out-Null
+        }
+    }
+    return ,$ids
 }
 
 function Find-LiongardAgentMatch {
+    # Checks every candidate against the deletion rule: the agent is in the configured environment
+    # (or neither has one) and its Hostname, Name or Data.FQDN equals a local name (case-insensitive,
+    # whole string). Returns one row per candidate with Matched and Reason.
     param(
         [array]$Agents,
-        $HostIdentity
+        [string[]]$LocalHostnames,
+        [string]$Environment,
+        [string]$InstancePrefix,
+        [hashtable]$Headers
     )
 
-    if (-not $Agents -or -not $HostIdentity) { return $null }
+    $nameSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($entry in $LocalHostnames) {
+        if (-not [string]::IsNullOrWhiteSpace($entry)) { $nameSet.Add($entry) | Out-Null }
+    }
+    $wanted         = "$Environment".Trim()
+    $environmentIds = $null
 
-    $nameSet = if ($HostIdentity.Hostnames)    { $HostIdentity.Hostnames }    else { [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::InvariantCultureIgnoreCase) }
-    $macSet  = if ($HostIdentity.MacAddresses) { $HostIdentity.MacAddresses } else { [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase) }
-
-    $candidates = @()
+    $rows = @()
     foreach ($agent in $Agents) {
         if (-not $agent) { continue }
 
-        $score   = 0
-        $signals = @()
+        $agentNames = @(Get-AgentHostIdentifiers -Agent $agent)
+        $nameHits   = @($agentNames | Where-Object { $nameSet.Contains($_) })
+        $envInfo    = Get-AgentEnvironmentInfo -Agent $agent
+        $envLabel   = if ($envInfo.Name) { $envInfo.Name } elseif ($envInfo.ID) { "ID $($envInfo.ID)" } else { '(none)' }
 
-        $agentNames  = Get-AgentHostIdentifiers -Agent $agent
-        $nameMatches = @()
-        foreach ($candidateName in $agentNames) {
-            if ($nameSet.Contains($candidateName)) {
-                $nameMatches += $candidateName
+        if (-not $wanted) {
+            $envMatch = (-not $envInfo.Name -and -not $envInfo.ID)
+        }
+        elseif ($envInfo.Name) {
+            $envMatch = [string]::Equals($envInfo.Name, $wanted, [System.StringComparison]::OrdinalIgnoreCase)
+        }
+        elseif ($envInfo.ID) {
+            if ($null -eq $environmentIds) {
+                $environmentIds = Get-LiongardEnvironmentId -InstancePrefix $InstancePrefix -Headers $Headers -Name $wanted
             }
+            $envMatch = $environmentIds.Contains($envInfo.ID)
         }
-        if ($nameMatches.Count -gt 0) {
-            # Hostname match is the primary signal for remote deletion matching.
-            $score += 60 + [Math]::Min(20, 5 * ($nameMatches.Count - 1))
-            $signals += "Hostname(s): $($nameMatches -join ', ')"
-        }
-
-        $agentMacs  = Get-AgentMacAddresses -Agent $agent
-        $macMatches = @()
-        foreach ($mac in $agentMacs) {
-            if ($macSet.Contains($mac)) {
-                $macMatches += $mac
-            }
-        }
-        if ($macMatches.Count -gt 0) {
-            $score += 40 + [Math]::Min(10, 5 * ($macMatches.Count - 1))
-            $signals += "MAC(s): $($macMatches -join ', ')"
+        else {
+            $envMatch = $false
         }
 
-        if ($score -gt 0) {
-            $candidates += [pscustomobject]@{
-                Agent   = $agent
-                Score   = $score
-                Reasons = $signals
-            }
+        $reasons = @()
+        if ($nameHits.Count -eq 0) { $reasons += 'no Hostname, Name or FQDN equals a local name' }
+        if (-not $envMatch) { $reasons += 'environment differs' }
+        $reason = if ($reasons.Count -eq 0) { "hostname [$($nameHits[0])] and environment match" } else { $reasons -join '; ' }
+
+        $rows += [pscustomobject]@{
+            Agent       = $agent
+            AgentId     = Get-ObjectPropertyValue -Object $agent -Name 'ID'
+            Names       = $agentNames
+            Environment = $envLabel
+            Matched     = ($reasons.Count -eq 0)
+            Reason      = $reason
         }
     }
 
-    if (-not $candidates) { return $null }
-    return ($candidates | Sort-Object Score -Descending | Select-Object -First 1)
+    return $rows
 }
 
 function Remove-LiongardAgentRecord {
@@ -2067,12 +2057,14 @@ function Remove-LiongardAgentRecord {
 }
 
 function Invoke-LiongardRemoteAgentRemoval {
+    # Deletes the platform record only when exactly one candidate matches; otherwise logs every
+    # candidate and why it did or didn't match, and skips the deletion.
     param(
         [string]$InstancePrefix,
         [hashtable]$Headers,
         [array]$Agents,
         [string[]]$LocalHostnames,
-        [int]$MinimumScore = 50
+        [string]$Environment
     )
 
     $result = [pscustomobject]@{
@@ -2085,42 +2077,27 @@ function Invoke-LiongardRemoteAgentRemoval {
         return $result
     }
 
-    if (-not $Agents -or $Agents.Count -eq 0) {
-        Write-Host "Remote agent deletion skipped because no Liongard agents were returned."
+    $rows    = @(Find-LiongardAgentMatch -Agents $Agents -LocalHostnames $LocalHostnames -Environment $Environment -InstancePrefix $InstancePrefix -Headers $Headers)
+    $matched = @($rows | Where-Object { $_.Matched })
+
+    Write-Host ("Liongard agent candidates found: {0}" -f $rows.Count)
+    foreach ($row in $rows) {
+        Write-Host ("  Agent ID {0}: names [{1}], environment [{2}] -> {3}: {4}" -f $row.AgentId, ($row.Names -join ', '), $row.Environment, $(if ($row.Matched) { 'match' } else { 'no match' }), $row.Reason)
+    }
+
+    if ($matched.Count -ne 1) {
+        Write-Warning ("Remote agent deletion skipped: {0} agent records match this environment and hostname, and exactly one is required. See the candidates above." -f $matched.Count)
         return $result
     }
 
-    $hostnameSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::InvariantCultureIgnoreCase)
-    foreach ($entry in $LocalHostnames) {
-        if (-not [string]::IsNullOrWhiteSpace($entry)) {
-            $hostnameSet.Add($entry) | Out-Null
-        }
-    }
-
-    $hostIdentity = [pscustomobject]@{
-        Hostnames    = $hostnameSet
-        MacAddresses = Get-LocalMacAddresses
-    }
-
-    $match = Find-LiongardAgentMatch -Agents $Agents -HostIdentity $hostIdentity
-    if (-not $match) {
-        Write-Host "No Liongard agent record matched the local host identity profile; remote deletion skipped."
-        return $result
-    }
-
-    if ($match.Score -lt $MinimumScore) {
-        Write-Warning ("Remote agent deletion skipped because match score {0} is below the minimum threshold ({1}). Signals: {2}" -f $match.Score, $MinimumScore, ($match.Reasons -join '; '))
-        return $result
-    }
-
-    $agentId = Get-ObjectPropertyValue -Object $match.Agent -Name 'ID'
+    $agentId = $matched[0].AgentId
     if (-not $agentId) {
         Write-Warning "Matched Liongard agent record is missing an ID; remote deletion skipped."
         return $result
     }
 
-    Write-Host ("Attempting to delete Liongard agent ID {0} (score {1}). Signals: {2}" -f $agentId, $match.Score, ($match.Reasons -join '; '))
-    $deleted = Remove-LiongardAgentRecord -InstancePrefix $InstancePrefix -Headers $Headers -Agent $match.Agent
+    Write-Host ("Attempting to delete Liongard agent ID {0} ({1})." -f $agentId, $matched[0].Reason)
+    $deleted = Remove-LiongardAgentRecord -InstancePrefix $InstancePrefix -Headers $Headers -Agent $matched[0].Agent
     if ($deleted) {
         Write-Host ("Remote Liongard agent ID {0} deleted successfully." -f $agentId)
         return [pscustomobject]@{
@@ -2134,41 +2111,32 @@ function Invoke-LiongardRemoteAgentRemoval {
 }
 
 function Get-LocalHostnameVariants {
-    # Collects relevant local hostname values (NETBIOS, DNS, FQDN) and their NETBIOS truncations.
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$PrimaryName
-    )
-
-    $names = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::InvariantCultureIgnoreCase)
-
-    foreach ($entry in @($PrimaryName, [System.Net.Dns]::GetHostName())) {
-        if (-not [string]::IsNullOrWhiteSpace($entry)) {
-            $names.Add($entry) | Out-Null
-        }
-    }
+    # The names this computer can be registered under, compared whole (no truncated variants):
+    # $env:COMPUTERNAME (the NetBIOS name, at most 15 characters; the install scripts register the
+    # agent under it through LIONGARDAGENTNAME), the DNS host name and the FQDN. "localhost" is
+    # never used.
+    $names      = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $candidates = @($env:COMPUTERNAME)
 
     try {
-        $cimHost = (Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop).DNSHostName
-        if (-not [string]::IsNullOrWhiteSpace($cimHost)) {
-            $names.Add($cimHost) | Out-Null
+        $ipProperties = [System.Net.NetworkInformation.IPGlobalProperties]::GetIPGlobalProperties()
+        $candidates  += $ipProperties.HostName
+        if (-not [string]::IsNullOrWhiteSpace($ipProperties.DomainName)) {
+            $candidates += "$($ipProperties.HostName).$($ipProperties.DomainName)"
         }
     }
     catch { }
 
     try {
-        $fqdn = [System.Net.Dns]::GetHostEntry('localhost').HostName
-        if (-not [string]::IsNullOrWhiteSpace($fqdn)) {
-            $names.Add($fqdn) | Out-Null
-        }
+        $candidates += (Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop).DNSHostName
     }
     catch { }
 
-    $existing = @($names)
-    foreach ($value in $existing) {
-        if ($value.Length -gt 15) {
-            $names.Add($value.Substring(0, 15)) | Out-Null
-        }
+    foreach ($entry in $candidates) {
+        if ([string]::IsNullOrWhiteSpace($entry)) { continue }
+        $value = $entry.Trim().TrimEnd('.')
+        if ($value -in 'localhost', 'localhost.localdomain') { continue }
+        $names.Add($value) | Out-Null
     }
 
     return @($names)
@@ -2201,6 +2169,10 @@ catch {
 Start-LiongardTranscript -TargetFolder $deployFolder
 Invoke-LiongardLegacyCleanup
 
+if ($MinimumRemoteDeletionScore -ne 50) {
+    Write-Warning "`$MinimumRemoteDeletionScore is deprecated and ignored. Remote deletion now needs exactly one agent with the same environment and hostname."
+}
+
 $uninstallResult = Invoke-LiongardAgentUninstall
 if (-not $uninstallResult.Success) {
     Write-Warning "Liongard Agent uninstall completed with issues: $($uninstallResult.Issues -join ', ')"
@@ -2231,15 +2203,16 @@ if ($RemoveAgentFromPlatform) {
         $instancePrefix = Resolve-InstancePrefix -Value $InstancePrefix
         $headers        = Get-LiongardAuthHeader -ApiTokenKey $ApiTokenKey -ApiTokenSecret $ApiTokenSecret
 
-        $localHostname  = $env:COMPUTERNAME
-        $localHostnames = Get-LocalHostnameVariants -PrimaryName $localHostname
+        $localHostnames = Get-LocalHostnameVariants
+        Write-Host ("Remote deletion matches environment [{0}] and hostname [{1}]." -f $(if ([string]::IsNullOrWhiteSpace($Environment)) { '(none)' } else { $Environment.Trim() }), ($localHostnames -join ', '))
 
-        $agents = Get-LiongardAgentsByHostnames -InstancePrefix $instancePrefix -Headers $headers -Hostnames $localHostnames
-        if (-not $agents -or $agents.Count -eq 0) {
-            Write-Host "No agents returned for filtered hostname lookup; skipping pagination by design."
+        $agents = Get-LiongardAgentCandidate -InstancePrefix $instancePrefix -Headers $headers -Hostnames $localHostnames
+        if ($null -eq $agents) {
+            Write-Warning "Remote agent deletion skipped because the Liongard agent lookup failed."
         }
-
-        Invoke-LiongardRemoteAgentRemoval -InstancePrefix $instancePrefix -Headers $headers -Agents $agents -LocalHostnames $localHostnames -MinimumScore $MinimumRemoteDeletionScore | Out-Null
+        else {
+            Invoke-LiongardRemoteAgentRemoval -InstancePrefix $instancePrefix -Headers $headers -Agents $agents -LocalHostnames $localHostnames -Environment $Environment | Out-Null
+        }
     }
 }
 

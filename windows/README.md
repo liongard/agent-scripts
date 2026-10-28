@@ -63,9 +63,21 @@ Set these in the configuration block at the top of the script. A script stops wi
 | `$AutoUpdateArgumentName` | EXE Advanced | `AUTOUPDATE` | Property name used for `$AutoUpdate`. |
 | `$InstallerLogPath` | EXE Advanced | `""` | Deprecated and ignored. Installer logs always go to the working folder. |
 | `$CleanupPreviousAgents` | Clean install | `$true` | Removes broken, incomplete or corrupt installs before installing. `$false` makes the script behave like MSI Simple. |
-| `$RemoveAgentFromPlatform` | Uninstall Advanced | `$false` | `$true` also deletes the matching agent record from Liongard, after the local uninstall succeeds. Matching is being tightened in [#6](https://github.com/liongard/agent-scripts/issues/6), so leave it off unless you need it. |
-| `$MinimumRemoteDeletionScore` | Uninstall Advanced | `50` | Minimum match score a platform record needs before it's deleted. |
+| `$RemoveAgentFromPlatform` | Uninstall Advanced | `$false` | `$true` also deletes the agent's record from Liongard after the local uninstall succeeds, but only when exactly one record matches. See [How remote deletion picks the agent](#how-remote-deletion-picks-the-agent). |
+| `$Environment` | Uninstall Advanced | `""` | The environment the agent is registered in, used only to pick the record to delete. Leave it blank for an agent with no environment. |
+| `$MinimumRemoteDeletionScore` | Uninstall Advanced | `50` | Deprecated and ignored. A warning is logged if it's changed. |
 | `$LogFolder` | Uninstall Simple and Advanced | `$env:ProgramData` | Same as `$Folder`, for the uninstall scripts. Uninstall Simple only writes its log there if `LiongardDeploy` already exists; see [Logs and files](#logs-and-files). |
+
+## How remote deletion picks the agent
+
+With `$RemoveAgentFromPlatform = $true`, Uninstall Advanced deletes a record only when exactly one agent matches both of these:
+
+- **Environment:** the agent's environment has the same name as `$Environment` (not case-sensitive). When `$Environment` is blank, only agents with no environment match.
+- **Hostname:** the agent's Hostname, Name or FQDN is the same as one of this computer's names: `$env:COMPUTERNAME`, the DNS host name or the FQDN. The whole name must match (not case-sensitive); a partial or prefix match doesn't count.
+
+`$env:COMPUTERNAME` is the NetBIOS name, which Windows cuts to 15 characters. The install scripts register the agent under `$env:COMPUTERNAME`, so a computer with a longer name is still matched by its 15-character name. The script doesn't make other shortened names.
+
+The machine ID and MAC addresses aren't used. If no agent matches, or more than one does, nothing is deleted: the script logs a warning and lists every candidate with its ID, names, environment and why it did or didn't match. If the agent lookup fails, nothing is deleted.
 
 ## Running through an RMM or MDM
 
@@ -148,6 +160,7 @@ After the installer exits, the scripts redact the installer logs in place, wheth
 | Installer download failed | Check HTTPS access to `agents.static.liongard.com` from the endpoint. For a proxy, set `$ProxyUrl` (EXE scripts). |
 | `Environment '<name>' ... could not be resolved in Liongard` (Advanced) | Check the name and that the environment exists in your instance, or set `$IncludeEnvironmentValue = $false`. |
 | Environment problems (Simple, Clean install) | These scripts pass `$Environment` exactly as written and don't check it. Make sure it matches the name in Liongard exactly. Handling of a missing environment is tracked in [#9](https://github.com/liongard/agent-scripts/issues/9). |
+| `Remote agent deletion skipped: <n> agent records match this environment and hostname` (Uninstall Advanced) | Nothing was deleted from Liongard. Check the candidates listed above the warning. Set `$Environment` to the agent's environment (or blank for none), or delete the record in Liongard yourself. |
 | Exit code `1618` | Another Windows Installer operation was running. Run the script again later. |
 | `An agent update is still in progress after waiting 2 minutes` (Clean install) | The agent updates itself once a day, around midnight local time. Nothing was changed. Run the script again later. |
 | Exit code `1638` (EXE) | A newer agent is already installed. The bundle doesn't downgrade. |
