@@ -12,13 +12,15 @@
 #     Liongard signature.
 #   - Installs Rosetta 2 only when the Intel package is used on Apple Silicon.
 #   - Hands the settings to the package in root-only files in /tmp and deletes them on exit.
+#   - If registration fails because ENVIRONMENT does not exist in Liongard, installs once more
+#     without it and logs a WARN.
 #   - Confirms the agent is running after the install.
 #
 # NOTES
 #   Requires:     root, macOS on Intel or Apple Silicon.
 #                 Liongard agent install token (key and secret).
 #   Author:       Liongard Partner Support
-#   Last updated: 2026-10-21
+#   Last updated: 2026-10-29
 #
 # LINK
 #   https://github.com/liongard/agent-scripts/blob/main/macos/README.md
@@ -39,7 +41,8 @@
 #   agent's name will default to the hostname
 # ENVIRONMENT (optional): The name of the environment you would like the agent to be assigned to.
 #   This must match the environment name in the platform exactly. If one is not provided, then the
-#   agent will be registered without an environment assignment.
+#   agent will be registered without an environment assignment. If it does not exist in the
+#   platform, the script installs the agent without an environment and logs a WARN.
 # AGENT_DESCRIPTION (optional): A free-text description for the agent. Requires an agent package
 #   of version 5.5.0 or newer.
 #   Leave the optional values blank if you don't use them. The script stops if one starts with
@@ -99,8 +102,18 @@ LG_INSTALL_LOG=/tmp/liongard-agent-installer.log
 LG_TMP=""
 WORK_DIR=""
 
+# Missing-environment retry. UNCONFIRMED: the exact registration error for an environment that
+# does not exist in Liongard is not known yet; this pattern is a best guess and will be tightened
+# once QA captures the real message. Only a failed install whose package log matches it is retried
+# (once, without the environment).
+MISSING_ENVIRONMENT_PATTERN="environment.{0,80}(does[[:space:]]*not|doesn'?t|not)[[:space:]]+exist"
+
 log_info() {
   echo "INFO: $1"
+}
+
+log_warn() {
+  echo "WARN: $1"
 }
 
 log_error() {
@@ -421,53 +434,103 @@ then
   fi
 fi
 
-if [ -n "$INSTANCE_URL" ]
-then
-  lg_write "${INSTANCE_URL}" /tmp/liongard_instance_url
-fi
+# Writes the handoff files. $1 is the environment to hand over ("" leaves it out).
+lg_write_settings() {
+  if [ -n "$INSTANCE_URL" ]
+  then
+    lg_write "${INSTANCE_URL}" /tmp/liongard_instance_url
+  fi
 
-if [ -n "$ACCESS_KEY_ID" ]
-then
-  lg_write "${ACCESS_KEY_ID}" /tmp/liongard_access_key_id
-fi
+  if [ -n "$ACCESS_KEY_ID" ]
+  then
+    lg_write "${ACCESS_KEY_ID}" /tmp/liongard_access_key_id
+  fi
 
-if [ -n "$ACCESS_KEY_SECRET" ]
-then
-  lg_write "${ACCESS_KEY_SECRET}" /tmp/liongard_access_key_secret
-fi
+  if [ -n "$ACCESS_KEY_SECRET" ]
+  then
+    lg_write "${ACCESS_KEY_SECRET}" /tmp/liongard_access_key_secret
+  fi
 
-if [ -n "$NAME" ]
-then
-  lg_write "${NAME}" /tmp/liongard_name
-fi
+  if [ -n "$NAME" ]
+  then
+    lg_write "${NAME}" /tmp/liongard_name
+  fi
 
-if [ -n "$ENVIRONMENT" ]
-then
-  lg_write "${ENVIRONMENT}" /tmp/liongard_environment
-fi
+  if [ -n "$1" ]
+  then
+    lg_write "$1" /tmp/liongard_environment
+  fi
 
-if [ -n "$AGENT_DESCRIPTION" ]
-then
-  lg_write "${AGENT_DESCRIPTION}" /tmp/liongard_description
-fi
+  if [ -n "$AGENT_DESCRIPTION" ]
+  then
+    lg_write "${AGENT_DESCRIPTION}" /tmp/liongard_description
+  fi
 
+  if [ -e "$LG_VALUES_FILE" ] || [ -L "$LG_VALUES_FILE" ]
+  then
+    log_error "$LG_VALUES_FILE appeared during the run. Refusing to continue."
+    exit 1
+  fi
+}
+
+# Runs installer and sets $status. LG_LOG_START is the package log's size before the run, so
+# only this run's lines are searched afterwards.
+lg_run_installer() {
+  LG_LOG_START=$(stat -f%z "$LG_INSTALL_LOG" 2>/dev/null || echo 0)
+  installer -pkg "$PKG" -target /
+  status=$?
+}
+
+# Prints the first line this run added to the package log that matches
+# MISSING_ENVIRONMENT_PATTERN. Lines echoing the registration request are skipped, so an
+# environment name that itself contains the words can't trigger a retry.
+lg_missing_environment_line() {
+  tail -c +"$((LG_LOG_START + 1))" "$LG_INSTALL_LOG" 2>/dev/null \
+    | grep -v 'API Request:' \
+    | grep -Ei -m 1 "$MISSING_ENVIRONMENT_PATTERN" \
+    | cut -c 1-300
+}
+
+lg_write_settings "$ENVIRONMENT"
+
+had_config=0
 if [ -f "$AGENT_CONFIG" ]
 then
+  had_config=1
   log_info "An agent config already exists, so the package will keep the existing registration."
 fi
 
-if [ -e "$LG_VALUES_FILE" ] || [ -L "$LG_VALUES_FILE" ]
+environment_warning=""
+log_info "Running the installer."
+lg_run_installer
+
+# A failed registration removes /Library/Liongard (so no agent config is left) and the handoff
+# files, and the package registers again on the next run. So when the package log says the
+# environment does not exist, it's safe to install once more without it.
+if [ "$status" -ne 0 ] && [ -n "$ENVIRONMENT" ] && [ "$had_config" = "0" ] && [ ! -e "$AGENT_CONFIG" ]
 then
-  log_error "$LG_VALUES_FILE appeared during the run. Refusing to continue."
-  exit 1
+  missing_line=$(lg_missing_environment_line)
+  if [ -n "$missing_line" ]
+  then
+    log_warn "Environment '$ENVIRONMENT' was not found in Liongard ($missing_line). Installing again without an environment; assign it in Liongard afterwards."
+    environment_warning="Environment '$ENVIRONMENT' was not found in Liongard. The agent was installed without an environment; assign it in Liongard."
+    for f in "${LG_FILES[@]}"
+    do
+      lg_remove_checked "$f"
+    done
+    lg_write_settings ""
+    log_info "Running the installer again without an environment."
+    lg_run_installer
+  fi
 fi
 
-log_info "Running the installer."
-installer -pkg "$PKG" -target /
-status=$?
 if [ "$status" -ne 0 ]
 then
   log_error "the installer exited with $status. See $LG_INSTALL_LOG and /var/log/install.log."
+  if [ -n "$environment_warning" ]
+  then
+    log_error "the retry without environment '$ENVIRONMENT' failed too."
+  fi
   exit "$status"
 fi
 
@@ -484,4 +547,8 @@ do
 done
 
 log_info "The Liongard Agent is installed and running (version $(installed_version))."
+if [ -n "$environment_warning" ]
+then
+  log_warn "$environment_warning"
+fi
 exit 0

@@ -8,14 +8,15 @@
     troubleshooting are in the README under .LINK.
     - Checks any existing agent (Healthy, Stale or NotInstalled) and removes Stale leftovers before installing.
     - Downloads the MSI to a folder only SYSTEM and Administrators can access, and deletes it afterwards.
-    - Passes the environment name to the installer exactly as written.
+    - Passes the environment name to the installer exactly as written. If the install fails because the
+      environment does not exist in Liongard, installs once more without it and logs a WARN.
     - Confirms the agent service is running and the updater task exists.
 
 .NOTES
     Requires:     Windows PowerShell 5.1 (64-bit), run as SYSTEM or an elevated administrator.
                   Liongard agent install token (key and secret).
     Author:       Liongard Partner Support
-    Last updated: 2026-10-21
+    Last updated: 2026-10-29
 
 .LINK
     https://github.com/liongard/agent-scripts/blob/main/windows/README.md
@@ -39,6 +40,11 @@ $Service    = 'roaragent.exe'
 $Task       = '\Liongard\LiongardAgentUpdater'
 $LegacyCode = '{1D89F069-B48B-4191-8810-2364C29EC039}'   # Fallback only; the ProductCode changes per version.
 $Protected  = 'HKEY_LOCAL_MACHINE\SOFTWARE\WOW6432Node\Liongard', 'HKEY_LOCAL_MACHINE\SOFTWARE\Liongard'   # Agent identity: never modified.
+# Missing-environment retry. UNCONFIRMED: the installer's exact error text for an environment that
+# does not exist in Liongard is not known yet; this pattern is a best guess and will be tightened once
+# QA captures the real message. Only a failed install whose log matches it is retried (once, without
+# the environment).
+$MissingEnvironmentPattern = '(?i)environment.{0,80}(does\s*not|doesn''?t|not)\s+exist'
 $CredSource = @'
 using System; using System.Collections.Generic; using System.Runtime.InteropServices;
 public static class LGCred {
@@ -604,6 +610,26 @@ function Get-LGMsiVersion([string]$Path) {   # ProductVersion via Windows Instal
     finally { if ($view) { try { [void](& $call $view 'Close' $null) } catch { Write-LGLog 'WARN: MSI view close failed.' } }; foreach ($o in $rec, $view, $db, $wi) { if ($o) { [void][Runtime.InteropServices.Marshal]::ReleaseComObject($o) } } }
 }
 
+function Find-LGMissingEnvironmentError([string]$LogPath) {   # First line of the (already redacted) installer log(s) that matches $MissingEnvironmentPattern, masked; $null if none.
+    foreach ($file in @(Get-LiongardRelatedLog -Path $LogPath)) {
+        # MSI logs are UTF-16LE with a BOM; bundle logs are UTF-8 or ANSI.
+        try { $bytes = [IO.File]::ReadAllBytes($file) } catch { Write-LGLog "WARN: could not read ${file}: $($_.Exception.Message)"; continue }
+        $enc = if ($bytes.Length -ge 2 -and $bytes[0] -eq 0xFF -and $bytes[1] -eq 0xFE) { [Text.Encoding]::Unicode }
+               elseif ($bytes.Length -ge 2 -and $bytes[0] -eq 0xFE -and $bytes[1] -eq 0xFF) { [Text.Encoding]::BigEndianUnicode }
+               elseif ($bytes.Length -ge 4 -and $bytes[1] -eq 0 -and $bytes[3] -eq 0) { [Text.Encoding]::Unicode }
+               else { [Text.Encoding]::UTF8 }
+        foreach ($line in ($enc.GetString($bytes) -split '\r?\n')) { if ($line -match $MissingEnvironmentPattern) { return (Hide-LiongardSecretText -Text $line.Trim()) } }
+    }
+    $null
+}
+function Get-LGRetryLogPath {   # A new AgentInstall_<timestamp>.log for the retry; log retention counts it as its own run.
+    while ($true) {
+        $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'; $path = Join-Path $script:LiongardDeploy.Root "AgentInstall_$stamp.log"
+        if ($stamp -ne $script:LiongardDeploy.Stamp -and -not (Test-Path -LiteralPath $path)) { return $path }
+        Start-Sleep -Seconds 1
+    }
+}
+
 # ---- Main ----
 trap { Exit-LG 1 "Unexpected error: $($_.Exception.Message)" }
 $ProgressPreference = 'SilentlyContinue'
@@ -630,15 +656,25 @@ elseif ($state.State -eq 'Healthy') {   # Normal upgrade path: install only when
     Write-LGLog "Proceeding with install/upgrade: installed=$installed msi=$new"
 }
 
-$msiArgs = @('/i', "`"$msi`"", "LIONGARDURL=$LGHost", "LIONGARDACCESSKEY=$AgentTokenKey", "LIONGARDACCESSSECRET=$AgentTokenSecret", "LIONGARDAGENTNAME=`"$env:COMPUTERNAME`"")
-if ($IncludeEnvironmentValue -and $Environment) { $msiArgs += "LIONGARDENVIRONMENT=`"$Environment`"" }
-if ($AgentDescription) { $msiArgs += "LIONGARDDESCRIPTION=`"$AgentDescription`"" }
-$msiArgs += '/qn', '/norestart', '/L*V', "`"$log`""
-Register-LiongardDeployLog -Label 'Installer log' -Path $log -Redact
-Write-LGLog "Installing Liongard Agent for $LGHost ..."
-$code = (Start-Process msiexec.exe -ArgumentList $msiArgs -Wait -PassThru).ExitCode
-Protect-LiongardInstallerLog -Path $log
-Write-LGLog "msiexec exit code: $code"
-if ($code -ne 0 -and $code -ne 3010) { Exit-LG $code "msiexec returned $code." $log }
-if (-not (Test-LGInstall)) { Exit-LG 1 'Post-install validation failed (service not Running or updater task missing).' $log }
-Exit-LG 0 "Liongard Agent installed and validated (msiexec exit $code)."
+$withEnvironment = [bool]($IncludeEnvironmentValue -and $Environment); $envWarning = $null
+foreach ($attempt in 1, 2) {   # A second attempt only when the first failed because the environment does not exist.
+    $msiArgs = @('/i', "`"$msi`"", "LIONGARDURL=$LGHost", "LIONGARDACCESSKEY=$AgentTokenKey", "LIONGARDACCESSSECRET=$AgentTokenSecret", "LIONGARDAGENTNAME=`"$env:COMPUTERNAME`"")
+    if ($withEnvironment) { $msiArgs += "LIONGARDENVIRONMENT=`"$Environment`"" }
+    if ($AgentDescription) { $msiArgs += "LIONGARDDESCRIPTION=`"$AgentDescription`"" }
+    $msiArgs += '/qn', '/norestart', '/L*V', "`"$log`""
+    Register-LiongardDeployLog -Label $(if ($attempt -eq 1) { 'Installer log' } else { 'Installer log (retry without environment)' }) -Path $log -Redact
+    Write-LGLog "Installing Liongard Agent for $LGHost$(if (-not $withEnvironment -and $envWarning) { ' without an environment' }) ..."
+    $code = (Start-Process msiexec.exe -ArgumentList $msiArgs -Wait -PassThru).ExitCode
+    Protect-LiongardInstallerLog -Path $log
+    Write-LGLog "msiexec exit code: $code"
+    if (($code -in 0, 3010) -or -not $withEnvironment) { break }
+    $hit = Find-LGMissingEnvironmentError $log
+    if (-not $hit) { break }
+    Write-LGLog "WARN: Environment '$Environment' was not found in Liongard (installer log: $hit). Installing again without an environment; assign it in Liongard afterwards."
+    $envWarning = "Environment '$Environment' was not found in Liongard. The agent was installed without an environment; assign it in Liongard."
+    $withEnvironment = $false; $log = Get-LGRetryLogPath
+}
+if ($code -ne 0 -and $code -ne 3010) { Exit-LG $code "msiexec returned $code.$(if ($envWarning) { " The retry without environment '$Environment' failed too." })" $log }
+if (-not (Test-LGInstall)) { Exit-LG 1 "Post-install validation failed (service not Running or updater task missing).$(if ($envWarning) { ' Installed without an environment.' })" $log }
+if ($envWarning) { Write-LGLog "WARN: $envWarning" }
+Exit-LG 0 "Liongard Agent installed and validated (msiexec exit $code)$(if ($envWarning) { ' without an environment' })."

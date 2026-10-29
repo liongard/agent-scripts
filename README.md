@@ -29,7 +29,7 @@ You need:
 - **Your Liongard instance:** its prefix or address, for example `us1` or `us1.app.liongard.com`.
 - **An agent install token** (key and secret). Every install script needs one.
 - **An API token** (key and secret) for the Windows Advanced scripts, the Linux script, and `LGAgentUninstall-Advanced.ps1` when it also removes the agent from the platform. The Simple uninstall scripts need no token.
-- **The environment name**, if you assign agents to an environment. It must match the name in Liongard.
+- **The environment name**, if you assign agents to an environment. It must match the name in Liongard. If it doesn't exist there, the scripts install the agent without an environment and log a WARN, so you can assign it in Liongard afterwards.
 
 Keep tokens in your RMM's or MDM's secure variables or script fields. Don't save them in a copy of the script that other people can read.
 
