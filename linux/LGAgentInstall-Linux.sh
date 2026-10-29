@@ -21,7 +21,7 @@
 #   Requires:     root, Bash 4+, curl or wget, and jq for environment matching or platform removal.
 #                 Liongard API token and agent install token (key and secret for each).
 #   Author:       Liongard Partner Support
-#   Last updated: 2026-10-21
+#   Last updated: 2026-10-29
 #
 # LINK
 #   https://github.com/liongard/agent-scripts/blob/main/linux/README.md
@@ -1571,8 +1571,12 @@ run_installer() {
                 log_info "  ${flag} ${val}"
             done
 
-            log_info "Running shell installer with command-line flags..."
-            _run_logged "installer" "${pkg_file}" "${_sh_args[@]}" || install_exit=$?
+            # --nox11 is a makeself option, so it goes before the '--' that starts
+            # _sh_args. Without it, a DISPLAY with no tty (sudo from a desktop
+            # session) makes the wrapper re-run itself in xterm: multi-word values
+            # are split and the exit code is xterm's, not the installer's.
+            log_info "Running shell installer with --nox11 and command-line flags..."
+            _run_logged "installer" "${pkg_file}" --nox11 "${_sh_args[@]}" || install_exit=$?
             ;;
         *)
             log_error "Unsupported package type: ${_PKG_TYPE}"
