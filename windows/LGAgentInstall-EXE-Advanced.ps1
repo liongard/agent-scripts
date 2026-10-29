@@ -18,7 +18,7 @@
     Requires:     Windows PowerShell 5.1 (64-bit), run as SYSTEM or an elevated administrator.
                   Liongard API token and agent install token (key and secret for each).
     Author:       Liongard Partner Support
-    Last updated: 2026-10-21
+    Last updated: 2026-10-29
 
 .LINK
     https://github.com/liongard/agent-scripts/blob/main/windows/README.md
