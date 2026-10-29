@@ -6,17 +6,19 @@
 
 | Script | What it does | Use it when |
 |---|---|---|
-| `LGAgentInstall-Linux.sh` | Removes any existing agent (by default), matches the environment name and checks for machine-ID collisions through the Liongard API, then downloads, installs and validates the agent. | Installing or reinstalling the agent on a Linux endpoint. |
+| `LGAgentInstall-Linux.sh` | Checks for an existing agent, removes a broken or incomplete one, matches the environment name and checks for machine-ID collisions through the Liongard API, then downloads, installs and validates the agent. A healthy agent is upgraded only when the installer is newer. | Installing, repairing or upgrading the agent on a Linux endpoint. |
 | `LGAgentUninstall-Linux.sh` | Removes the agent from the endpoint: services and updater timer, package, processes, unit files, binaries and install folders. No Liongard API calls and no settings to fill in. The agent's record stays on the platform. | Removing the agent from a Linux endpoint. |
 
 What the install script does, in order:
 
 1. Checks the configuration and prerequisites, and picks the x64 or arm64 installer from `uname -m`.
-2. **Removes any existing Liongard Agent by default** (`ENABLE_PRE_UNINSTALL=true`), including leftover install folders and config files. With `ENABLE_PRE_UNINSTALL=false`, an installed agent is left as it is, and the script exits `0`. The agent's platform record is kept unless `REMOVE_AGENT_FROM_PLATFORM=true` (see [How remote deletion picks the agent](#how-remote-deletion-picks-the-agent)).
-3. Matches the environment name against your instance (`ENABLE_ENVIRONMENT_MATCHING=true` by default). If no environment matches, the agent is installed without one and a WARN is logged. See [Missing environment](#missing-environment).
-4. Looks up the machine ID in Liongard. If it's already registered under a different hostname, the script gives the new agent its own device ID, so it doesn't overwrite the other record.
-5. Downloads the installer to a private temporary folder, which is deleted when the script exits, and installs it with the package manager (`.deb`, `.rpm`) or the installer itself (`.run`, `.sh`).
-6. Confirms the agent service is running.
+2. Checks that the API token works. If it doesn't, the script stops with exit `4` before changing anything.
+3. Checks for an existing agent (see [Existing install](#existing-install)). A healthy agent is never removed: it's upgraded in place only when the installer is newer, otherwise the script exits `0` without changes.
+4. Matches the environment name against your instance (`ENABLE_ENVIRONMENT_MATCHING=true` by default). If no environment matches, the agent is installed without one and a WARN is logged. See [Missing environment](#missing-environment).
+5. Looks up the machine ID in Liongard. If it's already registered under a different hostname, the script gives the new agent its own device ID, so it doesn't overwrite the other record.
+6. Removes the leftovers of a broken or incomplete install, only after the checks above have passed. The agent's platform record is kept unless `REMOVE_AGENT_FROM_PLATFORM=true` (see [How remote deletion picks the agent](#how-remote-deletion-picks-the-agent)).
+7. Downloads the installer to a private temporary folder, which is deleted when the script exits, and installs it with the package manager (`.deb`, `.rpm`) or the installer itself (`.run`, `.sh`).
+8. Confirms the agent service is running.
 
 What the uninstall script does, in order:
 
@@ -29,6 +31,16 @@ What the uninstall script does, in order:
 Tested on Ubuntu 24.04 (x86_64) with agent 5.5.0. Other distributions and aarch64 haven't been tested yet.
 
 It never touches the agent identity `/etc/liongard-agent/.machine-guid`, so a reinstall re-attaches to the same platform record, or the log folders. It leaves `/etc/liongard` in place with a warning until the dev team confirms what it holds. Platform removal isn't included.
+
+## Existing install
+
+The install script checks for an existing agent before it changes anything:
+
+- **Healthy** (the `liongard-agent` systemd unit is registered, and `/opt/liongard/LiongardAgent` and the agent config `/opt/liongard/.config` exist): it upgrades in place only when the installer is newer. The upgrade keeps the agent's registration and identity, so environment matching and the collision check are skipped. Otherwise it exits `0` without changes, and the agent's own updater keeps it current. The service doesn't have to be running.
+- **Stale** (any leftover of an earlier install without the full set above: a service unit, binary, package, process, install folder or updater unit): after the API, environment and collision checks pass, it removes the leftovers, then installs. With `REMOVE_AGENT_FROM_PLATFORM=true`, it also deletes the platform record when the cleanup removed an agent.
+- **NotInstalled:** it installs.
+
+The installed version comes from `AGENT_VERSION` in `/opt/liongard/.config`, and the installer's version from the `version.txt` inside the `.run` installer. If either can't be read, or for `.deb` and `.rpm` installers, a healthy agent is left as it is. The agent identity in `/etc/liongard-agent` is never removed, so a reinstalled agent registers as the same agent.
 
 ## Requirements
 
@@ -61,14 +73,14 @@ These are the install script's settings. The uninstall script has none. The conf
 | `INCLUDE_ENVIRONMENT_VALUE` | `true` | `false` registers the agent without an environment, and `ENVIRONMENT` isn't needed. |
 | `ENABLE_ENVIRONMENT_MATCHING` | `true` | Matches `ENVIRONMENT` against your instance and corrects casing or punctuation. `false` uses the value exactly as written, without checking it. |
 | `CREATE_ENVIRONMENT_IF_MISSING` | `false` | `true` creates the environment in Liongard when it doesn't exist, using `ENVIRONMENT` as written. Only an exact name match (ignoring case) counts as existing. Needs `ENABLE_ENVIRONMENT_MATCHING=true` and an API token that is allowed to create environments. If creating fails, the agent is installed without an environment. |
-| `ENABLE_PRE_UNINSTALL` | `true` | Removes any existing agent before installing. `false` leaves an installed agent as it is. |
-| `REMOVE_AGENT_FROM_PLATFORM` | `false` | After a successful pre-uninstall, also deletes the agent's record from Liongard, but only when exactly one record matches. See [How remote deletion picks the agent](#how-remote-deletion-picks-the-agent). Ignored when `ENABLE_PRE_UNINSTALL=false`. |
+| `REMOVE_AGENT_FROM_PLATFORM` | `false` | When the script removes a stale local agent, also deletes the agent's record from Liongard, but only when exactly one record matches. See [How remote deletion picks the agent](#how-remote-deletion-picks-the-agent). Never applies to a healthy agent. |
 | `AGENT_DESCRIPTION` | `""` | Agent description, passed only when set. |
 | `LOG_DIRECTORY` | `/var/log/liongard-agent` | Where the script log goes. Created root-only when missing. |
 | `LINUX_ARCHITECTURE` | `auto` | `auto` picks the installer from `uname -m` (`x86_64` → x64, `aarch64` → arm64). `x64` or `arm64` forces one. |
 | `INSTALLER_URL` | `""` | Leave empty to use the LTS installer for the architecture. When set, it's used as-is, `LINUX_ARCHITECTURE` is ignored, and the package type comes from the file extension. |
 | `INSTALLER_FILE_NAME` | `""` | Name of the downloaded installer. Empty takes it from the URL. |
 | `DOWNLOAD_DIRECTORY` | `""` | Deprecated and no longer used. If set, the script logs a warning and carries on. It will be removed in a later release. |
+| `ENABLE_PRE_UNINSTALL` | `""` | Deprecated and no longer used: the script now decides from the [existing install](#existing-install). If set, the script logs a warning and carries on. It will be removed in a later release. |
 
 ### C. Advanced
 
@@ -108,7 +120,7 @@ The machine ID and MAC addresses aren't used. If no agent matches, or more than 
 - **Run it with Bash**, not `sh`.
 - **Desktop sessions:** the script runs the `.run` installer in place (`--nox11`), so it never opens an XTerm window, even when `sudo` keeps a desktop session's `DISPLAY`.
 - **Passing values with RMM variables:** set the value in the configuration block from the variable your RMM provides, for example `ENVIRONMENT="${LIONGARD_ENVIRONMENT}"` if your RMM exports it as an environment variable. Use your RMM's secure variable type for tokens. Native support for `LIONGARD_*` environment variables is planned in [#10](https://github.com/liongard/agent-scripts/issues/10).
-- **Timeouts:** allow several minutes. The script may uninstall an existing agent, makes several API calls, downloads the installer and waits for the service to start.
+- **Timeouts:** allow several minutes. The script may remove a stale agent, makes several API calls, downloads the installer and waits for the service to start.
 - **Check the exit code**, not just the RMM's "completed" status. See [Exit codes](#exit-codes).
 
 ## Exit codes
@@ -126,15 +138,15 @@ Current behavior. Standard exit codes across all scripts are planned in [#11](ht
 
 | Code | Meaning |
 |---|---|
-| `0` | Installed and validated, or the agent was already installed and `ENABLE_PRE_UNINSTALL=false`. |
+| `0` | Installed (or upgraded) and validated, or a healthy agent is already installed and wasn't changed. |
 | `1` | Unexpected failure. |
 | `2` | A required setting is missing or invalid. |
 | `3` | A prerequisite is missing (not root, no `curl` or `wget`, no `jq` when needed, unsupported architecture or installer type). |
-| `4` | The environment name matches more than one environment, the environment API call failed, or the collision check's API call failed with `API_FAILURE_BEHAVIOR=conservative`. |
+| `4` | The API token check failed, the environment name matches more than one environment, the environment API call failed, or the collision check's API call failed with `API_FAILURE_BEHAVIOR=conservative`. Nothing on the machine has been changed. |
 | `5` | The installer download failed. |
 | `6` | The install command failed. |
 | `7` | The install finished, but validation failed: the agent service isn't running. |
-| `8` | The pre-uninstall failed: the agent is still detected afterwards. |
+| `8` | The stale-install cleanup failed: the agent is still detected afterwards. |
 
 ## Logs and files
 
@@ -154,6 +166,7 @@ Logs can contain sensitive details, so check them before you share them.
 | `Neither curl nor wget is available` or `jq is required ...` (exit `3`) | Install the missing tool, or turn off environment matching and platform removal if you don't need them. |
 | `Unsupported CPU architecture` (exit `3`) | Installers exist for x86_64 and aarch64 only. |
 | `Environment '<name>' was not found in Liongard. The agent was installed without an environment` | The agent is installed. Assign it to its environment in Liongard, and fix `ENVIRONMENT` for future installs. |
+| `The Liongard API call failed. Check API_TOKEN_KEY, API_TOKEN_SECRET ...` (exit `4`) | The API token is wrong or expired, or the instance can't be reached. Nothing was changed on the machine, including an existing agent. Fix the token or the network, then run the script again. |
 | `Environment '<name>' ... matches more than one Liongard environment` (exit `4`) | Set `ENVIRONMENT` to the exact name of the environment in Liongard. |
 | `Environment '<name>' could not be checked because the Liongard API call failed` (exit `4`) | Check the API token and HTTPS access to your instance. Or set `ENABLE_ENVIRONMENT_MATCHING=false` to pass the name as written, or `INCLUDE_ENVIRONMENT_VALUE=false` to skip it. |
 | `Could not create environment '<name>' in Liongard` | The API token may not be allowed to create environments. Create the environment in Liongard, or use a token that can. The agent was installed without an environment. |
@@ -165,6 +178,7 @@ Logs can contain sensitive details, so check them before you share them.
 | `The Liongard Agent is still detected` (uninstall, exit `1`) | The lines after it list what's left. Check that nothing else (a configuration management tool, for example) reinstalls the agent, remove the items by hand, and run the script again. |
 | `/etc/liongard was left in place ...` (uninstall) | Not an error. Remove `/etc/liongard` by hand if you don't need it. Never remove `/etc/liongard-agent` unless you want the next install to register as a new agent. |
 | `Remote deletion skipped: <n> agent records match this environment and hostname` | Nothing was deleted from Liongard, and the install carried on. Check the candidates listed above the warning, and delete the old record in Liongard yourself if needed. |
-| `Liongard Agent is still detected after uninstall` (exit `8`) | Remove the existing agent by hand, then run the script again. |
+| `Liongard Agent is still detected after stale cleanup` (exit `8`) | Remove the existing agent by hand, then run the script again. |
+| `A healthy Liongard Agent ... is installed` or `... the installer (...) is not newer` (exit `0`) | Expected: a healthy agent is left as it is. Its own updater keeps it current. |
 
 For anything else, contact Liongard Partner Support with the script log.
