@@ -95,6 +95,7 @@ The machine ID and MAC addresses aren't used. If no agent matches, or more than 
 
 - **Run as root.** For example: `sudo bash LGAgentInstall-Linux.sh` or `sudo bash LGAgentUninstall-Linux.sh`.
 - **Run it with Bash**, not `sh`.
+- **Desktop sessions:** the script runs the `.run` installer in place (`--nox11`), so it never opens an XTerm window, even when `sudo` keeps a desktop session's `DISPLAY`.
 - **Passing values with RMM variables:** set the value in the configuration block from the variable your RMM provides, for example `ENVIRONMENT="${LIONGARD_ENVIRONMENT}"` if your RMM exports it as an environment variable. Use your RMM's secure variable type for tokens. Native support for `LIONGARD_*` environment variables is planned in [#10](https://github.com/liongard/agent-scripts/issues/10).
 - **Timeouts:** allow several minutes. The script may uninstall an existing agent, makes several API calls, downloads the installer and waits for the service to start.
 - **Check the exit code**, not just the RMM's "completed" status. See [Exit codes](#exit-codes).
