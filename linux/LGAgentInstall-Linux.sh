@@ -8,7 +8,8 @@
 #   Set your values in sections A and B of the configuration block below. Exit codes, logs
 #   and troubleshooting are in the README under LINK.
 #   - Checks prerequisites and picks the x64 or arm64 installer.
-#   - Checks the API token, then the existing agent. A healthy agent is never removed: it's
+#   - Checks the existing agent, then the API token (a failure stops the run before any
+#     change, or is a WARN for a healthy agent). A healthy agent is never removed: it's
 #     upgraded in place only when the installer is newer, otherwise the script exits 0
 #     without changes. A broken or incomplete install is removed before installing, after
 #     the environment and collision checks. The platform record is kept unless
@@ -961,9 +962,16 @@ get_agents_filtered() {
 
 # Stops the run before anything changes when the API token doesn't work, so a
 # bad token or an unreachable instance never leaves the machine without an agent.
+# With "warn" (a healthy install, which the script changes without the API) a
+# failure is logged and the run continues.
 check_api_access() {
+    local mode="${1:-}"
     log_step "Checking access to the Liongard API..."
     if ! _api_get "/environments" >/dev/null 2>&1; then
+        if [[ "${mode}" == "warn" ]]; then
+            log_warn "The Liongard API call failed. Check API_TOKEN_KEY, API_TOKEN_SECRET and HTTPS access to ${_INSTANCE_HOST}. A healthy agent doesn't need the API, so the run continues."
+            return 0
+        fi
         log_error "The Liongard API call failed. Check API_TOKEN_KEY, API_TOKEN_SECRET and HTTPS access to ${_INSTANCE_HOST}. Nothing was changed. Aborting."
         exit 4
     fi
@@ -1279,6 +1287,10 @@ is_agent_installed() {
             return 0
         fi
     done
+    if pgrep -f '^/opt/liongard/' &>/dev/null; then
+        log_info "A process is running from /opt/liongard."
+        return 0
+    fi
 
     # Installed package check.
     if _has_cmd dpkg && dpkg -l 2>/dev/null | grep -qi liongard; then return 0; fi
@@ -1488,15 +1500,23 @@ invoke_liongard_agent_uninstall() {
     _stop_liongard_services
     _remove_liongard_package
 
-    # Kill any lingering processes.
+    # Kill any lingering processes: by name, then anything running from
+    # /opt/liongard (the LiongardAgent binary and its node and prowl children),
+    # which nothing else stops once the service unit is gone.
     local proc_name
-    for proc_name in roaragent liongardagent; do
+    for proc_name in roaragent liongardagent LiongardAgent; do
         if pgrep -x "${proc_name}" &>/dev/null; then
             log_info "Terminating lingering process: ${proc_name}"
             pkill -x "${proc_name}" 2>/dev/null || true
             sleep 1
         fi
     done
+    if pgrep -f '^/opt/liongard/' &>/dev/null; then
+        log_info "Terminating processes running from /opt/liongard"
+        pkill -f '^/opt/liongard/' 2>/dev/null || true
+        sleep 2
+        pkill -9 -f '^/opt/liongard/' 2>/dev/null || true
+    fi
 
     # Remove stale, Liongard-specific systemd unit files.
     local svc_file
@@ -1937,11 +1957,8 @@ main() {
     # ── Step 2: Detect distro ──────────────────────────────────────────
     detect_distro
 
-    # ── Step 3: Build API auth header and check the token ──────────────
-    # The token is checked before anything changes on this machine, so a bad
-    # token never leaves it without an agent, healthy or stale.
+    # ── Step 3: Build API auth header ──────────────────────────────────
     build_auth_header
-    check_api_access
 
     # ── Step 4: Collect local identity signals ─────────────────────────
     local local_hostname
@@ -1965,6 +1982,16 @@ main() {
     local upgrade_in_place=false
 
     get_install_state
+
+    # The token is checked before anything changes on this machine. A stale
+    # or missing agent stops here (exit 4) on a failure; a healthy agent is
+    # only upgraded or left alone, neither of which needs the API.
+    if [[ "${_INSTALL_STATE}" == "Healthy" ]]; then
+        check_api_access warn
+    else
+        check_api_access
+    fi
+
     if [[ "${_INSTALL_STATE}" == "Healthy" ]]; then
         local installed_version="" installer_version=""
         installed_version="$(get_installed_agent_version)" || installed_version=""

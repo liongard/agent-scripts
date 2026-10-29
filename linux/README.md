@@ -12,8 +12,8 @@
 What the install script does, in order:
 
 1. Checks the configuration and prerequisites, and picks the x64 or arm64 installer from `uname -m`.
-2. Checks that the API token works. If it doesn't, the script stops with exit `4` before changing anything.
-3. Checks for an existing agent (see [Existing install](#existing-install)). A healthy agent is never removed: it's upgraded in place only when the installer is newer, otherwise the script exits `0` without changes.
+2. Checks for an existing agent (see [Existing install](#existing-install)). A healthy agent is never removed: it's upgraded in place only when the installer is newer, otherwise the script exits `0` without changes.
+3. Checks that the API token works. If it doesn't, the script stops with exit `4` before changing anything. For a healthy agent, which needs no API call, it logs a WARN and carries on.
 4. Matches the environment name against your instance (`ENABLE_ENVIRONMENT_MATCHING=true` by default). If no environment matches, the agent is installed without one and a WARN is logged. See [Missing environment](#missing-environment).
 5. Looks up the machine ID in Liongard. If it's already registered under a different hostname, the script gives the new agent its own device ID, so it doesn't overwrite the other record.
 6. Removes the leftovers of a broken or incomplete install, only after the checks above have passed. The agent's platform record is kept unless `REMOVE_AGENT_FROM_PLATFORM=true` (see [How remote deletion picks the agent](#how-remote-deletion-picks-the-agent)).
@@ -37,7 +37,7 @@ It never touches the agent identity `/etc/liongard-agent/.machine-guid`, so a re
 The install script checks for an existing agent before it changes anything:
 
 - **Healthy** (the `liongard-agent` systemd unit is registered, and `/opt/liongard/LiongardAgent` and the agent config `/opt/liongard/.config` exist): it upgrades in place only when the installer is newer. The upgrade keeps the agent's registration and identity, so environment matching and the collision check are skipped. Otherwise it exits `0` without changes, and the agent's own updater keeps it current. The service doesn't have to be running.
-- **Stale** (any leftover of an earlier install without the full set above: a service unit, binary, package, process, install folder or updater unit): after the API, environment and collision checks pass, it removes the leftovers, then installs. With `REMOVE_AGENT_FROM_PLATFORM=true`, it also deletes the platform record when the cleanup removed an agent.
+- **Stale** (any leftover of an earlier install without the full set above: a service unit, binary, package, process, install folder or updater unit): after the API, environment and collision checks pass, it stops any agent processes still running from `/opt/liongard`, removes the leftovers, then installs. With `REMOVE_AGENT_FROM_PLATFORM=true`, it also deletes the platform record when the cleanup removed an agent.
 - **NotInstalled:** it installs.
 
 The installed version comes from `AGENT_VERSION` in `/opt/liongard/.config`, and the installer's version from the `version.txt` inside the `.run` installer. If either can't be read, or for `.deb` and `.rpm` installers, a healthy agent is left as it is. The agent identity in `/etc/liongard-agent` is never removed, so a reinstalled agent registers as the same agent.
@@ -142,7 +142,7 @@ Current behavior. Standard exit codes across all scripts are planned in [#11](ht
 | `1` | Unexpected failure. |
 | `2` | A required setting is missing or invalid. |
 | `3` | A prerequisite is missing (not root, no `curl` or `wget`, no `jq` when needed, unsupported architecture or installer type). |
-| `4` | The API token check failed, the environment name matches more than one environment, the environment API call failed, or the collision check's API call failed with `API_FAILURE_BEHAVIOR=conservative`. Nothing on the machine has been changed. |
+| `4` | The API token check failed (except for a healthy agent, where it's a WARN), the environment name matches more than one environment, the environment API call failed, or the collision check's API call failed with `API_FAILURE_BEHAVIOR=conservative`. Nothing on the machine has been changed. |
 | `5` | The installer download failed. |
 | `6` | The install command failed. |
 | `7` | The install finished, but validation failed: the agent service isn't running. |
@@ -166,7 +166,7 @@ Logs can contain sensitive details, so check them before you share them.
 | `Neither curl nor wget is available` or `jq is required ...` (exit `3`) | Install the missing tool, or turn off environment matching and platform removal if you don't need them. |
 | `Unsupported CPU architecture` (exit `3`) | Installers exist for x86_64 and aarch64 only. |
 | `Environment '<name>' was not found in Liongard. The agent was installed without an environment` | The agent is installed. Assign it to its environment in Liongard, and fix `ENVIRONMENT` for future installs. |
-| `The Liongard API call failed. Check API_TOKEN_KEY, API_TOKEN_SECRET ...` (exit `4`) | The API token is wrong or expired, or the instance can't be reached. Nothing was changed on the machine, including an existing agent. Fix the token or the network, then run the script again. |
+| `The Liongard API call failed. Check API_TOKEN_KEY, API_TOKEN_SECRET ...` (exit `4`, or a WARN for a healthy agent) | The API token is wrong or expired, or the instance can't be reached. Nothing was changed on the machine, including an existing agent. Fix the token or the network, then run the script again. |
 | `Environment '<name>' ... matches more than one Liongard environment` (exit `4`) | Set `ENVIRONMENT` to the exact name of the environment in Liongard. |
 | `Environment '<name>' could not be checked because the Liongard API call failed` (exit `4`) | Check the API token and HTTPS access to your instance. Or set `ENABLE_ENVIRONMENT_MATCHING=false` to pass the name as written, or `INCLUDE_ENVIRONMENT_VALUE=false` to skip it. |
 | `Could not create environment '<name>' in Liongard` | The API token may not be allowed to create environments. Create the environment in Liongard, or use a token that can. The agent was installed without an environment. |
