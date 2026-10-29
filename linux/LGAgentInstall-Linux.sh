@@ -8,10 +8,13 @@
 #   Set your values in sections A and B of the configuration block below. Exit codes, logs
 #   and troubleshooting are in the README under LINK.
 #   - Checks prerequisites and picks the x64 or arm64 installer.
-#   - Removes any existing agent first by default (ENABLE_PRE_UNINSTALL=true; set it to false
-#     to skip, and an installed agent is then left as it is). The platform record is kept
-#     unless REMOVE_AGENT_FROM_PLATFORM=true, and is then deleted only when exactly one
-#     agent has the same environment and hostname.
+#   - Checks the existing agent, then the API token (a failure stops the run before any
+#     change, or is a WARN for a healthy agent). A healthy agent is never removed: it's
+#     upgraded in place only when the installer is newer, otherwise the script exits 0
+#     without changes. A broken or incomplete install is removed before installing, after
+#     the environment and collision checks. The platform record is kept unless
+#     REMOVE_AGENT_FROM_PLATFORM=true, and is then deleted only when exactly one agent has
+#     the same environment and hostname.
 #   - Matches the environment name through the Liongard API by default
 #     (ENABLE_ENVIRONMENT_MATCHING=true) and checks for machine-ID collisions. An
 #     environment that does not exist is left out with a WARN (or created when
@@ -86,11 +89,9 @@ ENABLE_ENVIRONMENT_MATCHING=true
 # without an environment.
 CREATE_ENVIRONMENT_IF_MISSING=false
 
-# Remove any existing Liongard Agent on this machine before installing.
-ENABLE_PRE_UNINSTALL=true
-
-# After a successful pre-uninstall, also delete the matching agent record from
-# the Liongard platform via the API. Only applies when ENABLE_PRE_UNINSTALL=true.
+# After the script removes a stale (broken or incomplete) local agent, also
+# delete the matching agent record from the Liongard platform via the API.
+# Never applies to a healthy agent, which is not removed.
 REMOVE_AGENT_FROM_PLATFORM=false
 
 # Optional free-text description for the agent. Passed only when non-empty.
@@ -103,6 +104,12 @@ LOG_DIRECTORY="/var/log/liongard-agent"
 # installer now downloads to a private temporary directory that is removed on
 # exit, and the log transcript goes to LOG_DIRECTORY. A WARN is logged if set.
 DOWNLOAD_DIRECTORY=""
+
+# DEPRECATED: no longer used and will be removed in a later release. The
+# script now checks the existing install first: a healthy agent is left as it
+# is or upgraded in place, and only a stale install is removed before
+# installing. A WARN is logged if set.
+ENABLE_PRE_UNINSTALL=""
 
 # CPU architecture of the installer to download. "auto" picks it from
 # uname -m (x86_64 → x64, aarch64 → arm64) and stops with an error on any
@@ -160,6 +167,13 @@ readonly PARAM_AGENT_NAME="LIONGARDAGENTNAME"
 readonly PARAM_ENVIRONMENT="LIONGARDENVIRONMENT"
 readonly PARAM_DESCRIPTION="LIONGARDDESCRIPTION"
 
+# Paths and unit names used by the current .run installer (read from the
+# installer bundle, agent v5.5.0). Used to tell a healthy install from a stale one.
+readonly AGENT_INSTALL_DIR="/opt/liongard"
+readonly AGENT_BINARY_PATH="${AGENT_INSTALL_DIR}/LiongardAgent"
+readonly AGENT_CONFIG_PATH="${AGENT_INSTALL_DIR}/.config"
+readonly AGENT_CORE_SERVICE="liongard-agent"
+
 # ============================================================
 # INTERNAL STATE — do not edit below this line
 # ============================================================
@@ -177,6 +191,7 @@ _HTTP_CLIENT=""         # curl | wget
 _INSTALLER_PATH=""      # set by download_installer; avoids stdout-capture pollution
 _WORK_DIR=""            # private mktemp -d directory; removed on exit
 _WGET_CONFIG_FILE=""    # 0600 wgetrc holding the auth header; removed on exit
+_INSTALL_STATE=""       # Healthy | Stale | NotInstalled (set by get_install_state)
 
 # ============================================================
 # LOGGING
@@ -272,7 +287,6 @@ print_config_snapshot() {
     log_info "IncludeEnvironmentValue     : ${INCLUDE_ENVIRONMENT_VALUE}"
     log_info "EnableEnvironmentMatching   : ${ENABLE_ENVIRONMENT_MATCHING}"
     log_info "CreateEnvironmentIfMissing  : ${CREATE_ENVIRONMENT_IF_MISSING}"
-    log_info "EnablePreUninstall          : ${ENABLE_PRE_UNINSTALL}"
     log_info "RemoveAgentFromPlatform     : ${REMOVE_AGENT_FROM_PLATFORM}"
     log_info "LogDirectory                : ${LOG_DIRECTORY}"
     log_info "LinuxArchitecture           : ${LINUX_ARCHITECTURE}"
@@ -311,6 +325,9 @@ validate_config() {
     fi
     if [[ -n "${DOWNLOAD_DIRECTORY}" ]]; then
         log_warn "DOWNLOAD_DIRECTORY is deprecated and no longer used. The installer downloads to a private temporary directory, and the log goes to LOG_DIRECTORY [${LOG_DIRECTORY}]."
+    fi
+    if [[ -n "${ENABLE_PRE_UNINSTALL}" ]]; then
+        log_warn "ENABLE_PRE_UNINSTALL is deprecated and no longer used. A healthy agent is never removed (it's upgraded only when the installer is newer), and a stale install is always cleaned up before installing."
     fi
     if [[ "${MINIMUM_REMOTE_DELETION_SCORE}" != "50" ]]; then
         log_warn "MINIMUM_REMOTE_DELETION_SCORE is deprecated and ignored. Remote deletion now needs exactly one agent with the same environment and hostname."
@@ -943,6 +960,24 @@ get_agents_filtered() {
     return 0
 }
 
+# Stops the run before anything changes when the API token doesn't work, so a
+# bad token or an unreachable instance never leaves the machine without an agent.
+# With "warn" (a healthy install, which the script changes without the API) a
+# failure is logged and the run continues.
+check_api_access() {
+    local mode="${1:-}"
+    log_step "Checking access to the Liongard API..."
+    if ! _api_get "/environments" >/dev/null 2>&1; then
+        if [[ "${mode}" == "warn" ]]; then
+            log_warn "The Liongard API call failed. Check API_TOKEN_KEY, API_TOKEN_SECRET and HTTPS access to ${_INSTANCE_HOST}. A healthy agent doesn't need the API, so the run continues."
+            return 0
+        fi
+        log_error "The Liongard API call failed. Check API_TOKEN_KEY, API_TOKEN_SECRET and HTTPS access to ${_INSTANCE_HOST}. Nothing was changed. Aborting."
+        exit 4
+    fi
+    log_ok "Liongard API access confirmed."
+}
+
 # ============================================================
 # COLLISION DETECTION AND DEVICEID OVERRIDE
 #
@@ -1252,6 +1287,10 @@ is_agent_installed() {
             return 0
         fi
     done
+    if pgrep -f '^/opt/liongard/' &>/dev/null; then
+        log_info "A process is running from /opt/liongard."
+        return 0
+    fi
 
     # Installed package check.
     if _has_cmd dpkg && dpkg -l 2>/dev/null | grep -qi liongard; then return 0; fi
@@ -1265,6 +1304,7 @@ is_agent_installed() {
         /usr/local/bin/liongard-agent /usr/bin/liongard-agent \
         /usr/local/bin/roaragent      /usr/bin/roaragent \
         /usr/local/bin/liongardagent  /usr/bin/liongardagent \
+        "${AGENT_BINARY_PATH}" \
         /opt/liongard/liongard-agent  /opt/liongard/bin/liongard-agent \
         /opt/liongard-agent/liongard-agent \
         /usr/local/liongard/liongard-agent; do
@@ -1275,7 +1315,121 @@ is_agent_installed() {
 }
 
 # ============================================================
-# PRE-UNINSTALL
+# INSTALL STATE (Healthy / Stale / NotInstalled)
+# Healthy      = the liongard-agent systemd unit is registered AND the agent
+#                binary AND its config file exist. Running state isn't required.
+# NotInstalled = no agent signal (is_agent_installed) and no leftover files.
+# Stale        = anything else (orphaned unit, binary or folder without the rest).
+# ============================================================
+
+_core_unit_file() {
+    # Prints the path of the agent's systemd unit file, if one is registered.
+    local unit_dir
+    for unit_dir in /etc/systemd/system /lib/systemd/system /usr/lib/systemd/system; do
+        if [[ -f "${unit_dir}/${AGENT_CORE_SERVICE}.service" ]]; then
+            printf '%s' "${unit_dir}/${AGENT_CORE_SERVICE}.service"
+            return 0
+        fi
+    done
+    return 1
+}
+
+_find_install_leftovers() {
+    # Prints one leftover path per line: install folders and updater units that
+    # invoke_liongard_agent_uninstall removes. The agent identity folder
+    # (/etc/liongard-agent) is kept by design and is not a leftover.
+    local path unit_dir unit_name
+    for path in /opt/liongard /opt/liongard-agent /usr/local/liongard /etc/liongard; do
+        if [[ -d "${path}" ]]; then printf '%s\n' "${path}"; fi
+    done
+    for unit_dir in /etc/systemd/system /lib/systemd/system /usr/lib/systemd/system; do
+        for unit_name in liongard-agent-updater.timer liongard-agent-updater.service \
+                         liongard-updater.timer; do
+            if [[ -f "${unit_dir}/${unit_name}" || -L "${unit_dir}/${unit_name}" ]]; then
+                printf '%s\n' "${unit_dir}/${unit_name}"
+            fi
+        done
+    done
+    return 0
+}
+
+get_install_state() {
+    # Sets _INSTALL_STATE and logs the evidence it was based on.
+    log_step "Checking for an existing Liongard Agent install..."
+
+    local unit_file="" binary=false config=false detected=false leftover
+    local -a leftovers=()
+
+    unit_file="$(_core_unit_file)" || unit_file=""
+    [[ -x "${AGENT_BINARY_PATH}" ]] && binary=true
+    [[ -f "${AGENT_CONFIG_PATH}" ]] && config=true
+    _DETECTED_SVC=""
+    is_agent_installed && detected=true
+    mapfile -t leftovers < <(_find_install_leftovers)
+
+    log_info "  - Service unit '${AGENT_CORE_SERVICE}': ${unit_file:-not registered}"
+    log_info "  - Agent binary ${AGENT_BINARY_PATH}: ${binary}"
+    log_info "  - Agent config ${AGENT_CONFIG_PATH}: ${config}"
+    log_info "  - Agent service, process, package or binary detected: ${detected}${_DETECTED_SVC:+ (service ${_DETECTED_SVC})}"
+    # ${arr[@]+...} keeps set -u happy with an empty array on Bash 4.0-4.3.
+    for leftover in ${leftovers[@]+"${leftovers[@]}"}; do
+        log_info "  - Leftover present: ${leftover}"
+    done
+
+    if [[ -n "${unit_file}" && "${binary}" == true && "${config}" == true ]]; then
+        _INSTALL_STATE="Healthy"
+    elif [[ "${detected}" == false && "${#leftovers[@]}" -eq 0 ]]; then
+        _INSTALL_STATE="NotInstalled"
+    else
+        _INSTALL_STATE="Stale"
+    fi
+    log_info "Install state classification: ${_INSTALL_STATE}"
+}
+
+_is_version() {
+    [[ "$1" =~ ^[0-9]+(\.[0-9]+){1,3}$ ]]
+}
+
+_version_gt() {
+    # Returns 0 when dotted version $1 is strictly newer than $2.
+    local -a a b
+    local i x y
+    IFS=. read -r -a a <<< "$1"
+    IFS=. read -r -a b <<< "$2"
+    for (( i = 0; i < 4; i++ )); do
+        x="${a[i]:-0}"; y="${b[i]:-0}"
+        if (( 10#${x} > 10#${y} )); then return 0; fi
+        if (( 10#${x} < 10#${y} )); then return 1; fi
+    done
+    return 1
+}
+
+get_installed_agent_version() {
+    # Prints the AGENT_VERSION that the installer (and the agent's updater, which
+    # runs the installer) records in the agent config. The file also holds the
+    # agent's credentials, so only that one line is read and nothing else is logged.
+    local version
+    [[ -r "${AGENT_CONFIG_PATH}" ]] || return 1
+    version="$(grep -m1 '^AGENT_VERSION=' "${AGENT_CONFIG_PATH}" 2>/dev/null | cut -d= -f2- | tr -d '[:space:]')" || return 1
+    _is_version "${version}" || return 1
+    printf '%s' "${version}"
+}
+
+get_installer_agent_version() {
+    # Prints the version.txt bundled in a makeself (.run) installer, read with
+    # makeself's own --tar option, which only streams the archive (startup.sh is
+    # not run). Returns 1 for .deb/.rpm and for any .sh that isn't a makeself
+    # archive, because running an unknown .sh with --tar could start an install.
+    local pkg_file="$1" version
+    [[ "${_PKG_TYPE}" == "sh" ]] || return 1
+    [[ "$(sed -n 2p "${pkg_file}" 2>/dev/null)" == "# This script was generated using Makeself"* ]] || return 1
+    version="$(sh "${pkg_file}" --tar xOf ./version.txt 2>/dev/null | head -n 1 | tr -d '[:space:]')" || return 1
+    _is_version "${version}" || return 1
+    printf '%s' "${version}"
+}
+
+# ============================================================
+# STALE CLEANUP
 # ============================================================
 
 _stop_liongard_services() {
@@ -1341,20 +1495,28 @@ _remove_liongard_package() {
 }
 
 invoke_liongard_agent_uninstall() {
-    log_step "Pre-uninstall: removing existing Liongard Agent..."
+    log_step "Stale cleanup: removing the existing Liongard Agent and its leftovers..."
 
     _stop_liongard_services
     _remove_liongard_package
 
-    # Kill any lingering processes.
+    # Kill any lingering processes: by name, then anything running from
+    # /opt/liongard (the LiongardAgent binary and its node and prowl children),
+    # which nothing else stops once the service unit is gone.
     local proc_name
-    for proc_name in roaragent liongardagent; do
+    for proc_name in roaragent liongardagent LiongardAgent; do
         if pgrep -x "${proc_name}" &>/dev/null; then
             log_info "Terminating lingering process: ${proc_name}"
             pkill -x "${proc_name}" 2>/dev/null || true
             sleep 1
         fi
     done
+    if pgrep -f '^/opt/liongard/' &>/dev/null; then
+        log_info "Terminating processes running from /opt/liongard"
+        pkill -f '^/opt/liongard/' 2>/dev/null || true
+        sleep 2
+        pkill -9 -f '^/opt/liongard/' 2>/dev/null || true
+    fi
 
     # Remove stale, Liongard-specific systemd unit files.
     local svc_file
@@ -1379,16 +1541,22 @@ invoke_liongard_agent_uninstall() {
             systemctl stop    "${timer_name}.timer" 2>/dev/null || true
             systemctl disable "${timer_name}.timer" 2>/dev/null || true
         done
+        # The timer runs liongard-agent-updater.service; stop it in case an update is running.
+        systemctl stop    liongard-agent-updater.service 2>/dev/null || true
+        systemctl disable liongard-agent-updater.service 2>/dev/null || true
         local timer_file
         for timer_file in \
             /etc/systemd/system/liongard-agent-updater.timer \
+            /etc/systemd/system/liongard-agent-updater.service \
             /etc/systemd/system/liongard-updater.timer \
             /lib/systemd/system/liongard-agent-updater.timer \
+            /lib/systemd/system/liongard-agent-updater.service \
             /lib/systemd/system/liongard-updater.timer \
             /usr/lib/systemd/system/liongard-agent-updater.timer \
+            /usr/lib/systemd/system/liongard-agent-updater.service \
             /usr/lib/systemd/system/liongard-updater.timer; do
             if [[ -f "${timer_file}" || -L "${timer_file}" ]]; then
-                log_info "Removing updater timer unit: ${timer_file}"
+                log_info "Removing updater unit: ${timer_file}"
                 rm -f "${timer_file}" 2>/dev/null || true
             fi
         done
@@ -1443,7 +1611,7 @@ invoke_liongard_agent_uninstall() {
         fi
     done
 
-    log_ok "Pre-uninstall steps completed."
+    log_ok "Stale cleanup steps completed."
 }
 
 # ============================================================
@@ -1805,42 +1973,57 @@ main() {
     mapfile -t local_hostnames < <(get_local_hostnames)
     log_info "Local host identifiers: $(IFS=', '; printf '%s' "${local_hostnames[*]}")"
 
-    # ── Step 5: Pre-uninstall ──────────────────────────────────────────
-    local do_remote_deletion=false
+    # ── Step 5: Existing install (Healthy / Stale / NotInstalled) ──────
+    # Read-only. A healthy agent is never removed: it's upgraded in place only
+    # when both versions are readable and the installer is strictly newer.
+    # Otherwise the agent's own updater timer keeps it current and the script
+    # changes nothing. A stale install is removed in step 8, after the checks
+    # that can stop the run.
+    local upgrade_in_place=false
 
-    if [[ "${ENABLE_PRE_UNINSTALL}" == true ]]; then
-        log_step "Pre-uninstall is enabled..."
-        if is_agent_installed; then
-            invoke_liongard_agent_uninstall
+    get_install_state
 
-            if is_agent_installed; then
-                log_error "Liongard Agent is still detected after uninstall. Aborting."
-                exit 8
-            fi
-            log_ok "Existing Liongard Agent removed."
-            [[ "${REMOVE_AGENT_FROM_PLATFORM}" == true ]] && do_remote_deletion=true
-        else
-            log_info "No active Liongard Agent service/binary detected."
-            log_info "Running full artifact cleanup — orphaned install dirs and config files"
-            log_info "can cause the installer to detect a previous agent and refuse to install."
-            invoke_liongard_agent_uninstall
-        fi
+    # The token is checked before anything changes on this machine. A stale
+    # or missing agent stops here (exit 4) on a failure; a healthy agent is
+    # only upgraded or left alone, neither of which needs the API.
+    if [[ "${_INSTALL_STATE}" == "Healthy" ]]; then
+        check_api_access warn
     else
-        if is_agent_installed; then
-            log_info "Liongard Agent is already installed and EnablePreUninstall=false. Exiting (success)."
-            exit 0
-        fi
-        if [[ "${REMOVE_AGENT_FROM_PLATFORM}" == true ]]; then
-            log_warn "RemoveAgentFromPlatform=true is ignored because EnablePreUninstall=false."
-        fi
+        check_api_access
     fi
 
-    log_info "No Liongard Agent installation detected. Proceeding with fresh install..."
+    if [[ "${_INSTALL_STATE}" == "Healthy" ]]; then
+        local installed_version="" installer_version=""
+        installed_version="$(get_installed_agent_version)" || installed_version=""
+        if [[ -z "${installed_version}" ]]; then
+            log_info "A healthy Liongard Agent is installed, but its version can't be read from ${AGENT_CONFIG_PATH}. No changes made; the agent's updater keeps it current. Exiting (success)."
+            exit 0
+        fi
+        download_installer
+        installer_version="$(get_installer_agent_version "${_INSTALLER_PATH}")" || installer_version=""
+        if [[ -z "${installer_version}" ]]; then
+            log_info "A healthy Liongard Agent ${installed_version} is installed, but the installer's version can't be read. No changes made; the agent's updater keeps it current. Exiting (success)."
+            exit 0
+        fi
+        log_info "Installed agent version: ${installed_version} | Installer version: ${installer_version}"
+        if ! _version_gt "${installer_version}" "${installed_version}"; then
+            log_info "Liongard Agent ${installed_version} is already installed and the installer (${installer_version}) is not newer. No changes made. Exiting (success)."
+            exit 0
+        fi
+        log_info "Newer version available. Upgrading in place: ${installed_version} -> ${installer_version}. The agent keeps its registration and identity."
+        upgrade_in_place=true
+    fi
 
     # ── Step 6: Environment name resolution ────────────────────────────
-    # An environment that does not exist is left out (the install fails
-    # otherwise), or created when CREATE_ENVIRONMENT_IF_MISSING=true.
-    if [[ "${INCLUDE_ENVIRONMENT_VALUE}" == true ]]; then
+    # Runs before any removal, so an ambiguous name or a failed API call stops
+    # the run with nothing changed. An environment that does not exist is left
+    # out (the install fails otherwise), or created when
+    # CREATE_ENVIRONMENT_IF_MISSING=true. An in-place upgrade keeps the
+    # existing registration (the installer skips registration when the agent
+    # config exists), so steps 6, 7 and 10 don't apply to it.
+    if [[ "${upgrade_in_place}" == true ]]; then
+        log_info "Upgrading in place: environment matching and the collision check are skipped (the existing registration is kept)."
+    elif [[ "${INCLUDE_ENVIRONMENT_VALUE}" == true ]]; then
         if [[ "${ENABLE_ENVIRONMENT_MATCHING}" == true ]]; then
             local resolve_rc=0 env_norm
             env_norm="$(normalize_env_name "${ENVIRONMENT}")"
@@ -1889,7 +2072,9 @@ main() {
     local agents_json="[]"
     local api_ok=true
 
-    if ! agents_json="$(get_agents_filtered "${machine_id_condition}")"; then
+    if [[ "${upgrade_in_place}" == true ]]; then
+        api_ok=false
+    elif ! agents_json="$(get_agents_filtered "${machine_id_condition}")"; then
         api_ok=false
         log_warn "Liongard agent API lookup failed."
         if [[ "${API_FAILURE_BEHAVIOR}" == "conservative" ]]; then
@@ -1900,7 +2085,41 @@ main() {
         fi
     fi
 
-    # ── Step 8: Optional remote platform agent deletion ────────────────
+    # ── Step 8: Stale cleanup ──────────────────────────────────────────
+    # Leftovers are removed so the installer can't pick up an old config.
+    # Platform record deletion only follows a removed local agent.
+    local do_remote_deletion=false
+    case "${_INSTALL_STATE}" in
+        Stale)
+            local had_agent=false
+            is_agent_installed && had_agent=true
+            invoke_liongard_agent_uninstall
+
+            if is_agent_installed; then
+                log_error "Liongard Agent is still detected after stale cleanup. Aborting."
+                exit 8
+            fi
+            local -a remaining=()
+            mapfile -t remaining < <(_find_install_leftovers)
+            if [[ "${#remaining[@]}" -gt 0 ]]; then
+                log_warn "Stale cleanup left: $(IFS=', '; printf '%s' "${remaining[*]}"). Continuing with a fresh install."
+            fi
+            log_ok "Stale Liongard Agent install removed."
+            if [[ "${had_agent}" == true && "${REMOVE_AGENT_FROM_PLATFORM}" == true ]]; then
+                do_remote_deletion=true
+            fi
+            log_info "Proceeding with fresh install..."
+            ;;
+        NotInstalled)
+            log_info "No Liongard Agent installation detected. Proceeding with fresh install..."
+            ;;
+    esac
+
+    if [[ "${REMOVE_AGENT_FROM_PLATFORM}" == true && "${do_remote_deletion}" == false ]]; then
+        log_info "REMOVE_AGENT_FROM_PLATFORM=true is ignored: no local agent was removed in this run."
+    fi
+
+    # ── Step 9: Optional remote platform agent deletion ────────────────
     # Matches by environment and exact hostname only (see invoke_remote_agent_removal).
     if [[ "${do_remote_deletion}" == true ]]; then
         log_step "Attempting remote platform agent deletion..."
@@ -1909,7 +2128,7 @@ main() {
         invoke_remote_agent_removal "${deletion_hostnames[@]}"
     fi
 
-    # ── Step 9: Collision detection → DEVICEID override ────────────────
+    # ── Step 10: Collision detection → DEVICEID override ───────────────
     if [[ "${api_ok}" == true ]]; then
         resolve_device_guid_override "${local_machine_id}" "${agents_json}" "${local_hostnames[@]}"
     fi
@@ -1921,13 +2140,16 @@ main() {
         log_info "No DEVICEID override required."
     fi
 
-    # ── Step 10: Download installer ────────────────────────────────────
+    # ── Step 11: Download installer ────────────────────────────────────
     # download_installer writes to _INSTALLER_PATH (not stdout) to avoid
-    # log-line pollution when captured via $(...).
-    download_installer
+    # log-line pollution when captured via $(...). A Healthy install already
+    # downloaded it to read the installer version.
+    if [[ -z "${_INSTALLER_PATH}" ]]; then
+        download_installer
+    fi
     local installer_path="${_INSTALLER_PATH}"
 
-    # ── Step 11: Install ───────────────────────────────────────────────
+    # ── Step 12: Install ───────────────────────────────────────────────
     # Use || to capture the real exit code — avoid `if ! cmd` which inverts
     # $? through the logical-NOT operator, making it always 0 in the body.
     local install_exit=0
@@ -1940,7 +2162,7 @@ main() {
     # Short pause to allow the service to initialise before validation.
     sleep 3
 
-    # ── Step 12: Validate ──────────────────────────────────────────────
+    # ── Step 13: Validate ──────────────────────────────────────────────
     local validate_exit=0
     validate_installation || validate_exit=$?
     if [[ "${validate_exit}" -ne 0 ]]; then
