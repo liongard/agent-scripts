@@ -6,12 +6,12 @@
 
 | Script | What it does | Use it when |
 |---|---|---|
-| `LGAgentInstall-macOS.sh` | Downloads and checks the agent package for the Mac's CPU (or uses one your MDM staged), hands it your settings and installs it. | Installing the agent on a Mac with Intel or Apple Silicon. |
+| `LGAgentInstall-macOS.sh` | Downloads and checks the agent package for the Mac's CPU (or uses one your MDM staged), hands it your settings and installs it, or upgrades an older running agent. | Installing or upgrading the agent on a Mac with Intel or Apple Silicon. |
 | `LGAgentUninstall-macOS.sh` | Removes the agent from the Mac: both LaunchDaemons, processes, `/Library/Liongard`, the package receipts and leftover settings files in `/tmp`. No Liongard API calls and no settings to fill in. The agent's record stays on the platform. | Removing the agent from a Mac. |
 
 What the install script does, in order:
 
-1. **If the agent is already installed and running, it exits `0` without changes.** It logs the installed version and applies no settings, and it doesn't upgrade the agent.
+1. **If the agent is already installed and running,** it reads the installed version from `/Library/Liongard/.config.json` (`AGENT_VERSION`). If it can't read it, the script exits `0` without changes. Otherwise it continues with the steps below to get the package and compares versions before installing anything (see [Upgrades](#upgrades)).
 2. Picks the package for the Mac's CPU, using `sysctl -n hw.optional.arm64`, which is correct even under Rosetta:
    - Intel: `https://agents.static.liongard.com/LiongardAgent-lts.pkg`
    - Apple Silicon: `https://agents.static.liongard.com/LiongardAgent-lts-arm64.pkg`
@@ -19,7 +19,7 @@ What the install script does, in order:
    It downloads the package with retries, unless `PKG_PATH` points to one already on the Mac.
 3. Checks the package before installing. The download size must match the server's `Content-Length`, and the package must be at least 20 MB, signed with Liongard's Developer ID Installer certificate (Team ID `KU4C98N3LW`), and built for this Mac. SHA-256 checks will be added once checksum files are published ([#3](https://github.com/liongard/agent-scripts/issues/3)).
 4. Installs Rosetta 2 silently if the Intel package is used on Apple Silicon and Rosetta is missing.
-5. Hands your settings to the package (see [Logs and files](#logs-and-files)), runs `installer`, and confirms the agent is running. If registration fails because `ENVIRONMENT` doesn't exist in Liongard, it installs once more without it (see [Missing environment](#missing-environment)).
+5. Hands your settings to the package on a new install (an upgrade keeps the existing registration and hands over nothing; see [Logs and files](#logs-and-files)), runs `installer`, and confirms the agent is running. If registration fails because `ENVIRONMENT` doesn't exist in Liongard, it installs once more without it (see [Missing environment](#missing-environment)).
 
 What the uninstall script does, in order:
 
@@ -33,6 +33,17 @@ What the uninstall script does, in order:
 Tested on macOS 26.7.1 (Apple Silicon) with agent 5.5.0. Intel Macs haven't been tested yet.
 
 It never touches the agent identity `/etc/liongard-agent/.machine-guid`, so a reinstall re-attaches to the same platform record. Delete that folder by hand only if the Mac should register as a new agent, for example before capturing a golden image. Platform removal isn't included.
+
+## Upgrades
+
+When the agent is already running, the script downloads and checks the package as usual, then reads the agent version the package installs.
+
+- **The package is newer:** the script logs `Upgrading the Liongard Agent from <old> to <new>`, installs the package, sets `AGENT_VERSION` in `/Library/Liongard/.config.json` to the new version (as the agent's own updater does), restarts the agent and confirms it's running. The existing registration is kept: the package skips registration because the agent config exists, and the script doesn't write the settings handoff files, so `INSTANCE_URL`, the install token, `NAME`, `ENVIRONMENT` and `AGENT_DESCRIPTION` aren't used.
+- **The package is the same version or older, or its version can't be read:** the script exits `0` without changes. It never downgrades the agent.
+
+The installed version must be older than the package in both the agent config and, when the script can find it, the version built into `/Library/Liongard/LiongardAgent`. Rosetta 2 is installed only when an install or upgrade actually happens.
+
+If the agent is installed but not running, the script installs the package over the existing config, whatever its version, and the existing registration is kept.
 
 ## Requirements
 
@@ -79,7 +90,7 @@ The exact registration error for a missing environment isn't confirmed yet. The 
 
 - **Run as root.** For example: `sudo ./LGAgentInstall-macOS.sh` or `sudo ./LGAgentUninstall-macOS.sh`.
 - **Passing values:** the script reads its settings only from the Variables block, so fill them in there. To use your MDM's or RMM's variables, set them in the block, for example `ENVIRONMENT="$LIONGARD_ENVIRONMENT"` if your tool exports it as an environment variable. Native support for `LIONGARD_*` environment variables is planned in [#10](https://github.com/liongard/agent-scripts/issues/10).
-- **Timeouts:** allow several minutes for the download, the Rosetta install if it's needed, and the agent start.
+- **Timeouts:** allow several minutes for the download, the Rosetta install if it's needed, and the agent start. The package is downloaded on every run where the installed version can be read, including when the agent is already up to date, because its version is only known after the download.
 - **Check the exit code**, not just the tool's "completed" status. See [Exit codes](#exit-codes).
 
 ### Notes for specific tools
@@ -103,9 +114,9 @@ Current behavior. Standard exit codes across all scripts are planned in [#11](ht
 
 | Code | Meaning |
 |---|---|
-| `0` | The agent is installed and running, including when it already was. |
+| `0` | The agent is installed and running: newly installed, upgraded, or already running at the same or a newer version. |
 | `installer` exit code | `installer` failed. |
-| `1` | Any other failure: not root, a missing required value, a failed download or package check, or the agent not running after the install. |
+| `1` | Any other failure: not root, a missing required value, a failed download or package check, or the agent not running (or not restarting) after the install or upgrade. |
 
 ## Logs and files
 
@@ -125,6 +136,8 @@ Logs can contain sensitive details, so check them before you share them.
 | `INSTANCE_URL '<value>' contains a placeholder character` or `is not a Liongard instance` | Set `INSTANCE_URL` to your instance, for example `us1.app.liongard.com`. |
 | `<setting> is still set to a REPLACE_WITH_* placeholder` | Set a value for that optional setting or leave it blank. |
 | The script exits `0`, but the name, environment or description didn't change | Expected. Settings apply only to a new install. See [Settings](#settings). |
+| The script exits `0` with `already installed and running`, but didn't upgrade | The package isn't newer than the installed agent, or a version couldn't be read. The log line `Package version: ...` shows what was compared. See [Upgrades](#upgrades). |
+| `the upgrade was installed, but the agent could not be restarted` | Check `sudo launchctl print system/com.liongard.liongard-agent`, then restart it with `sudo launchctl kickstart -k system/com.liongard.liongard-agent`. |
 | The download or the size, signature or architecture check fails | Check HTTPS access to `agents.static.liongard.com`, or check the package at `PKG_PATH`. Don't install a package that fails the signature check. |
 | Rosetta 2 install fails on Apple Silicon | Leave `MAC_ARCHITECTURE=auto` to use the Apple Silicon package, which doesn't need Rosetta. |
 | `the installer exited with <code>` | Read `/tmp/liongard-agent-installer.log` and `/var/log/install.log`. |

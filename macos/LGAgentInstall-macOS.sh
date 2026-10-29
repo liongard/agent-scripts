@@ -7,7 +7,8 @@
 #   Installs the Liongard Agent and registers it with your Liongard instance.
 #   Set your values in the Variables block below. Exit codes, logs and troubleshooting are in
 #   the README under LINK.
-#   - Exits 0 without changes if the agent is already installed and running.
+#   - If the agent is already installed and running, upgrades it when the package is newer and
+#     otherwise exits 0 without changes. An upgrade keeps the existing registration.
 #   - Downloads the Intel or Apple Silicon package (or uses PKG_PATH) and checks its size and
 #     Liongard signature.
 #   - Installs Rosetta 2 only when the Intel package is used on Apple Silicon.
@@ -49,7 +50,8 @@
 #   REPLACE_WITH_.
 #
 # NAME, ENVIRONMENT and AGENT_DESCRIPTION only apply to a new install. The package skips
-# registration when /Library/Liongard/.config.json already exists.
+# registration when /Library/Liongard/.config.json already exists. An upgrade of a running agent
+# uses only MAC_ARCHITECTURE and PKG_PATH; it keeps the existing registration.
 #
 # MAC_ARCHITECTURE (optional): which package to install. "auto" (default) picks the Apple Silicon
 #   package on Apple Silicon and the Intel package on Intel Macs. "x64" or "arm64" forces one. The
@@ -83,6 +85,7 @@ DOWNLOAD_ATTEMPTS=3
 AGENT_PLIST=/Library/LaunchDaemons/com.liongard.liongard-agent.plist
 AGENT_SERVICE=system/com.liongard.liongard-agent
 AGENT_CONFIG=/Library/Liongard/.config.json
+AGENT_BINARY=/Library/Liongard/LiongardAgent
 
 # The .pkg reads these six fixed paths, so every run clears them (refusing symlinks and files
 # not owned by root), writes them root-only, and deletes them on exit.
@@ -130,8 +133,78 @@ installed_version() {
   echo "${v:-unknown}"
 }
 
+# Prints the version built into the installed agent binary, or nothing if it can't be found.
+# If more than one is found, prints the highest.
+binary_version() {
+  if [ -f "$AGENT_BINARY" ]
+  then
+    LC_ALL=C grep -a -o -E '[^A-Za-z]Version.default:"[0-9]+(\.[0-9]+)*"' "$AGENT_BINARY" 2>/dev/null |
+      sed -n 's/.*default:"\([0-9.]*\)"$/\1/p' | sort -t. -k1,1n -k2,2n -k3,3n -k4,4n | tail -1
+  fi
+}
+
+# Prints the agent version set in the package's postinstall script, or nothing. The version
+# fields in the Distribution and PackageInfo files aren't the agent version.
+package_version() {
+  local component
+  component=$(sed -n 's/.*<pkg-ref[^>]*>#\([A-Za-z0-9._-]*\.pkg\)<\/pkg-ref>.*/\1/p' "$WORK_DIR/Distribution" | head -1)
+  if [ -n "$component" ] && xar -xf "$PKG" -C "$WORK_DIR" "$component/Scripts" 2>/dev/null
+  then
+    tar -xOf "$WORK_DIR/$component/Scripts" ./postinstall 2>/dev/null |
+      sed -n 's/^VERSION="\([^"]*\)".*/\1/p' | head -1
+  fi
+}
+
+# True if $1 is a dotted version made only of numbers, for example 5.5.0.
+version_valid() {
+  [[ "$1" =~ ^[0-9]+(\.[0-9]+)*$ ]]
+}
+
+# True if version $1 is newer than version $2. Missing parts count as 0.
+version_newer() {
+  local -a a b
+  local i x y
+  IFS=. read -r -a a <<< "$1"
+  IFS=. read -r -a b <<< "$2"
+  for ((i = 0; i < ${#a[@]} || i < ${#b[@]}; i++))
+  do
+    x=$((10#${a[i]:-0}))
+    y=$((10#${b[i]:-0}))
+    if [ "$x" -gt "$y" ]
+    then
+      return 0
+    fi
+    if [ "$x" -lt "$y" ]
+    then
+      return 1
+    fi
+  done
+  return 1
+}
+
+# Sets AGENT_VERSION in the agent config to $1, as the agent's own updater does after an upgrade.
+# Only that value changes, and the file stays root-only.
+set_config_version() {
+  local tmp
+  tmp=$(mktemp "$AGENT_CONFIG.XXXXXXXX") || return 1
+  if sed 's/\("AGENT_VERSION"[[:space:]]*:[[:space:]]*"\)[^"]*"/\1'"$1"'"/' "$AGENT_CONFIG" > "$tmp" &&
+    chown root:wheel "$tmp" && chmod 600 "$tmp" && mv -f "$tmp" "$AGENT_CONFIG" &&
+    [ "$(installed_version)" = "$1" ]
+  then
+    return 0
+  fi
+  rm -f "$tmp"
+  return 1
+}
+
 agent_running() {
   [ -f "$AGENT_PLIST" ] && launchctl print "$AGENT_SERVICE" > /dev/null 2>&1
+}
+
+already_running_exit() {
+  log_info "The Liongard Agent is already installed and running (version $(installed_version))."
+  log_info "No registration values were applied (INSTANCE_URL, ACCESS_KEY_ID, ACCESS_KEY_SECRET, NAME, ENVIRONMENT, AGENT_DESCRIPTION)."
+  exit 0
 }
 
 if [ "$EUID" -ne 0 ]
@@ -142,11 +215,17 @@ fi
 
 umask 077
 
+# A running agent is upgraded only if its version can be read and the package turns out to be
+# newer. The package version is checked after the download.
+UPGRADE_FROM=""
 if agent_running
 then
-  log_info "The Liongard Agent is already installed and running (version $(installed_version))."
-  log_info "No registration values were applied (INSTANCE_URL, ACCESS_KEY_ID, ACCESS_KEY_SECRET, NAME, ENVIRONMENT, AGENT_DESCRIPTION)."
-  exit 0
+  if ! version_valid "$(installed_version)"
+  then
+    already_running_exit
+  fi
+  UPGRADE_FROM=$(installed_version)
+  log_info "The Liongard Agent is already installed and running (version $UPGRADE_FROM). Checking whether the package is newer."
 fi
 
 # Optional values default to blank, so a REPLACE_WITH_* value there is a mistake.
@@ -401,6 +480,22 @@ then
   log_error "could not read the package's Distribution file."
   exit 1
 fi
+
+# Upgrades only if the package is newer than the agent config's version and, when it can be read,
+# the version built into the agent binary. Otherwise nothing is changed.
+if [ -n "$UPGRADE_FROM" ]
+then
+  PKG_VERSION=$(package_version)
+  installed_binary_version=$(binary_version)
+  log_info "Package version: ${PKG_VERSION:-unknown}. Installed agent binary: ${installed_binary_version:-version not found}."
+  if ! version_valid "$PKG_VERSION" || ! version_newer "$PKG_VERSION" "$UPGRADE_FROM" ||
+    { [ -n "$installed_binary_version" ] && ! version_newer "$PKG_VERSION" "$installed_binary_version"; }
+  then
+    already_running_exit
+  fi
+  log_info "Upgrading the Liongard Agent from $UPGRADE_FROM to $PKG_VERSION. The existing registration is kept."
+fi
+
 host_architectures=$(sed -n 's/.*hostArchitectures="\([^"]*\)".*/\1/p' "$WORK_DIR/Distribution" | head -1)
 log_info "Package architecture: ${host_architectures:-not set}. This Mac: $HOST_ARCH."
 
@@ -434,6 +529,15 @@ then
   fi
 fi
 
+# Stops if the package's values file appeared during the run.
+lg_refuse_values_file() {
+  if [ -e "$LG_VALUES_FILE" ] || [ -L "$LG_VALUES_FILE" ]
+  then
+    log_error "$LG_VALUES_FILE appeared during the run. Refusing to continue."
+    exit 1
+  fi
+}
+
 # Writes the handoff files. $1 is the environment to hand over ("" leaves it out).
 lg_write_settings() {
   if [ -n "$INSTANCE_URL" ]
@@ -466,11 +570,7 @@ lg_write_settings() {
     lg_write "${AGENT_DESCRIPTION}" /tmp/liongard_description
   fi
 
-  if [ -e "$LG_VALUES_FILE" ] || [ -L "$LG_VALUES_FILE" ]
-  then
-    log_error "$LG_VALUES_FILE appeared during the run. Refusing to continue."
-    exit 1
-  fi
+  lg_refuse_values_file
 }
 
 # Runs installer and sets $status. LG_LOG_START is the package log's size before the run, so
@@ -491,7 +591,13 @@ lg_missing_environment_line() {
     | cut -c 1-300
 }
 
-lg_write_settings "$ENVIRONMENT"
+# An upgrade keeps the existing registration, so it doesn't write the handoff files.
+if [ -z "$UPGRADE_FROM" ]
+then
+  lg_write_settings "$ENVIRONMENT"
+else
+  lg_refuse_values_file
+fi
 
 had_config=0
 if [ -f "$AGENT_CONFIG" ]
@@ -507,7 +613,7 @@ lg_run_installer
 # A failed registration removes /Library/Liongard (so no agent config is left) and the handoff
 # files, and the package registers again on the next run. So when the package log says the
 # environment does not exist, it's safe to install once more without it.
-if [ "$status" -ne 0 ] && [ -n "$ENVIRONMENT" ] && [ "$had_config" = "0" ] && [ ! -e "$AGENT_CONFIG" ]
+if [ "$status" -ne 0 ] && [ -z "$UPGRADE_FROM" ] && [ -n "$ENVIRONMENT" ] && [ "$had_config" = "0" ] && [ ! -e "$AGENT_CONFIG" ]
 then
   missing_line=$(lg_missing_environment_line)
   if [ -n "$missing_line" ]
@@ -532,6 +638,22 @@ then
     log_error "the retry without environment '$ENVIRONMENT' failed too."
   fi
   exit "$status"
+fi
+
+# The package leaves a running agent on the old binary and doesn't change AGENT_VERSION, so an
+# upgrade records the new version and restarts the agent, as the agent's own updater does.
+if [ -n "$UPGRADE_FROM" ]
+then
+  if ! set_config_version "$PKG_VERSION"
+  then
+    log_error "could not set AGENT_VERSION to $PKG_VERSION in $AGENT_CONFIG. The next run will install the package again."
+  fi
+  log_info "Restarting the agent."
+  if ! launchctl kickstart -k "$AGENT_SERVICE"
+  then
+    log_error "the upgrade was installed, but the agent could not be restarted ($AGENT_SERVICE)."
+    exit 1
+  fi
 fi
 
 tries=0
