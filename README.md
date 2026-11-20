@@ -33,8 +33,11 @@ Keep tokens in your RMM's or MDM's secure variables or script fields. Don't save
 
 ## Get the scripts
 
-- **Download:** open the script in its folder on GitHub and download it, or copy its contents.
+- **Release (recommended):** download the script from the [latest release](https://github.com/liongard/agent-scripts/releases/latest). Each release attaches every script and a `SHA256SUMS` file.
+- **From the folder:** open the script in its folder on GitHub and download it, or copy its contents. This is the current `main`, which can be newer than the latest release.
 - **Raw link:** `https://raw.githubusercontent.com/liongard/agent-scripts/main/<folder>/<script>`, for example `https://raw.githubusercontent.com/liongard/agent-scripts/main/windows/LGAgentInstall-MSI-Simple.ps1`.
+
+To check a release download, put the script and `SHA256SUMS` in the same folder and run `sha256sum -c --ignore-missing SHA256SUMS` (Linux) or `shasum -a 256 -c --ignore-missing SHA256SUMS` (macOS). On Windows, run `(Get-FileHash .\<script>.ps1 -Algorithm SHA256).Hash` in PowerShell and compare the result with the script's line in `SHA256SUMS`.
 
 Paste the whole file into your RMM or MDM, and change only the configuration block at the top. Each script's header explains what it does and links to its platform README.
 

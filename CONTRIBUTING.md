@@ -28,8 +28,8 @@ Changes that only touch comments or docs don't need a version bump.
 
 ## Review model
 
-- Every pull request needs one approval from a code owner. [CODEOWNERS](.github/CODEOWNERS) lists them.
-- These CI checks must pass before a pull request can merge: `tests`, `gitleaks` and `shared-blocks` (all in [lint.yml](.github/workflows/lint.yml)).
+- Changes to `main` go through a pull request. A review from a code owner ([CODEOWNERS](.github/CODEOWNERS)) is requested automatically but isn't required to merge.
+- The `tests` and `shared-blocks` CI checks must pass before a pull request can merge (both in [lint.yml](.github/workflows/lint.yml)). `gitleaks` also runs; it becomes a required check once it's blocking.
 - The PSScriptAnalyzer and ShellCheck jobs are report-only for now. They become required checks once the lint jobs are blocking.
 
 ## Security

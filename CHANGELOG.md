@@ -6,6 +6,14 @@ All notable changes to these scripts are documented here.
 
 ### All scripts
 
+- Docs: the README's "Get the scripts" section now points to the release downloads and explains how to check them against `SHA256SUMS`. CONTRIBUTING.md and CODEOWNERS no longer say a code-owner approval is required; a pull request still needs the `tests` and `shared-blocks` checks to pass.
+
+## 1.0.0 (2026-11-20)
+
+First public release. The scripts and a `SHA256SUMS` file are attached to the [v1.0.0 release](https://github.com/liongard/agent-scripts/releases/tag/v1.0.0).
+
+### All scripts
+
 - CI: a new blocking `shared-blocks` job runs `tests/Test-SharedBlocks.ps1`, which fails if a copy of the deploy-folder or install-state shared block differs from the others, is missing or duplicated, or is in an unexpected Windows script, or if an expected script is not there (#13).
 - Missing environment (#9): when the environment doesn't exist in Liongard, the install scripts now install the agent without one and log a WARN instead of failing. The Advanced scripts and Linux check through the API (an ambiguous name still stops the install) and can create the environment with the new opt-in `$CreateEnvironmentIfMissing` / `CREATE_ENVIRONMENT_IF_MISSING`; the Simple, Clean install and macOS scripts (and the Advanced scripts when the API lookup fails) retry the install once without the environment when the installer log says it doesn't exist.
 - Docs: CODEOWNERS names the code owners for every path (David Chapman and Mark Selyukov), CONTRIBUTING.md has a "Review model" section (one code-owner approval; required `tests`, `gitleaks` and `shared-blocks` checks), and the README no longer carries the internal DRAFT banner (#18).
