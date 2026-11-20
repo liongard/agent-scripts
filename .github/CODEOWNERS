@@ -1,5 +1,5 @@
 # Code owners for liongard/agent-scripts.
-# Every pull request needs one approval from a code owner (see CONTRIBUTING.md).
+# Code owners are requested as reviewers automatically; their approval isn't required to merge (see CONTRIBUTING.md).
 #
 # When a dev team exists in the liongard GitHub org, it can replace or join
 # the individual owners below.
