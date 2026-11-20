@@ -26,6 +26,12 @@ If a change affects what a script does on an endpoint:
 
 Changes that only touch comments or docs don't need a version bump.
 
+## Review model
+
+- Every pull request needs one approval from a code owner. [CODEOWNERS](.github/CODEOWNERS) lists them.
+- These CI checks must pass before a pull request can merge: `tests`, `gitleaks` and `shared-blocks` (all in [lint.yml](.github/workflows/lint.yml)).
+- The PSScriptAnalyzer and ShellCheck jobs are report-only for now. They become required checks once the lint jobs are blocking.
+
 ## Security
 
 Report vulnerabilities privately to security.ops@liongard.com. See [SECURITY.md](SECURITY.md).
